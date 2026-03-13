@@ -1,0 +1,15 @@
+[package]
+name = "retina-kernel"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+retina-traits = { path = "../retina-traits" }
+retina-types = { path = "../retina-types" }
+serde_json.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+retina-test-utils = { path = "../retina-test-utils" }

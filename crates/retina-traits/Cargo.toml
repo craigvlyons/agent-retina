@@ -1,0 +1,9 @@
+[package]
+name = "retina-traits"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+retina-types = { path = "../retina-types" }
+serde_json.workspace = true

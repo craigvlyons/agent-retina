@@ -1,0 +1,32 @@
+# Build
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Runtime data
+.retina
+.fastembed_cache
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log
+*.tmp
+*.wasm
+
+# Secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~

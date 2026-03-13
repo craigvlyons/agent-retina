@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/retina-cli",
+    "crates/retina-kernel",
+    "crates/retina-llm-claude",
+    "crates/retina-memory-sqlite",
+    "crates/retina-shell-cli",
+    "crates/retina-test-utils",
+    "crates/retina-traits",
+    "crates/retina-types",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+blake3 = "1.5"
+chrono = { version = "0.4.40", features = ["serde"] }
+clap = { version = "4.5.38", features = ["derive"] }
+dirs = "6.0"
+dotenvy = "0.15.7"
+fastembed = "4.9"
+reqwest = { version = "0.12.15", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+refinery = { version = "0.8.16", features = ["rusqlite"] }
+rusqlite = { version = "0.32.1", features = ["bundled", "backup", "blob", "functions", "load_extension", "serde_json", "modern_sqlite"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+sqlite-vec = "0.1.6"
+thiserror = "2.0.12"
+toml = "0.8.20"
+uuid = { version = "1.16.0", features = ["serde", "v4"] }
+tempfile = "3.19.1"
