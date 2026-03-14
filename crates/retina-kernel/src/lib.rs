@@ -126,12 +126,22 @@ impl Kernel {
                 &task,
                 &intent,
                 next_reflex_action.take(),
-                state.last_result_json.clone(),
+                &state,
                 state.step_index + 1,
                 config.max_steps,
             )?;
             let outcome = self.execute_action(&task, &mut intent, &step, true)?;
-            state.record_step(&step, &outcome)?;
+            let progress = state.record_step(&step, &outcome)?;
+
+            if progress.repeated_without_progress {
+                return self.reflect_or_fail(
+                    &task,
+                    &mut intent,
+                    &step.action,
+                    "repeated the same step without discovering new information".to_string(),
+                    true,
+                );
+            }
 
             if step.task_complete || matches!(outcome, Outcome::Failure(_) | Outcome::Blocked(_)) {
                 return Ok(outcome);
@@ -155,7 +165,7 @@ impl Kernel {
         task: &Task,
         intent: &Intent,
         reflex_action: Option<Action>,
-        last_result: Option<String>,
+        state: &TaskLoopState,
         current_step: usize,
         max_steps: usize,
     ) -> Result<StepDecision> {
@@ -173,7 +183,14 @@ impl Kernel {
             });
         }
 
-        let context = self.assemble_context(task, last_result, current_step, max_steps)?;
+        let context = self.assemble_context(
+            task,
+            state.last_result_json.clone(),
+            state.last_result_summary.clone(),
+            state.recent_steps.clone(),
+            current_step,
+            max_steps,
+        )?;
         let response = self.reasoner.reason(&ReasonRequest {
             tools: context.tools.clone(),
             context,
@@ -190,7 +207,12 @@ impl Kernel {
             Some(intent),
             Some(&response.action),
             TimelineEventType::ReasonerCalled,
-            json!({ "reasoning": response.reasoning, "tokens": response.tokens_used, "task_complete": response.task_complete }),
+            json!({
+                "action": action_label(&response.action),
+                "reasoning": response.reasoning,
+                "tokens": response.tokens_used,
+                "task_complete": response.task_complete
+            }),
         ))?;
         Ok(StepDecision {
             action: response.action,
@@ -282,7 +304,8 @@ impl Kernel {
             .with_delta(delta.summary.clone()),
         )?;
 
-        let experience_id = self.record_experience(task, intent, &action, &result, &delta)?;
+        let utility = action_utility(&action, &result, &delta);
+        let experience_id = self.record_experience(task, intent, &action, &result, &delta, utility)?;
         self.emit_event(EventSpec::new(
             task,
             Some(intent),
@@ -290,16 +313,29 @@ impl Kernel {
             TimelineEventType::ExperiencePersisted,
             json!({ "experience_id": experience_id }),
         ))?;
-        self.memory
-            .update_utility(experience_id.clone(), delta.utility_score())?;
+        self.memory.update_utility(experience_id.clone(), utility)?;
         self.emit_event(EventSpec::new(
             task,
             Some(intent),
             Some(&action),
             TimelineEventType::UtilityScored,
-            json!({ "experience_id": experience_id, "utility": delta.utility_score() }),
+            json!({ "experience_id": experience_id, "utility": utility }),
         ))?;
-        self.promote_reflex_if_ready(task, &action, &delta)?;
+        let consolidation = self.memory.consolidate(&ConsolidationConfig::default())?;
+        self.emit_event(EventSpec::new(
+            task,
+            Some(intent),
+            Some(&action),
+            TimelineEventType::ConsolidationCompleted,
+            json!({
+                "merged_knowledge": consolidation.merged_knowledge,
+                "promoted_rules": consolidation.promoted_rules,
+                "compacted_events": consolidation.compacted_events
+            }),
+        ))?;
+        if consolidation.promoted_rules > 0 {
+            self.reflex_engine.sync(self.memory.active_rules()?);
+        }
 
         if let Some(reason) = action_failure_reason(&result, &delta, &action) {
             self.circuit_breaker.record_failure(intent);
@@ -313,13 +349,15 @@ impl Kernel {
             TimelineEventType::TaskStepCompleted,
             json!({ "result": "step_completed" }),
         ))?;
-        self.emit_event(EventSpec::new(
-            task,
-            Some(intent),
-            Some(&action),
-            TimelineEventType::TaskCompleted,
-            json!({ "outcome": "success" }),
-        ))?;
+        if step.task_complete {
+            self.emit_event(EventSpec::new(
+                task,
+                Some(intent),
+                Some(&action),
+                TimelineEventType::TaskCompleted,
+                json!({ "outcome": "success" }),
+            ))?;
+        }
         Ok(Outcome::Success(result))
     }
 
@@ -339,7 +377,14 @@ impl Kernel {
             json!({ "reason": reason }),
         ))?;
 
-        let reflection_context = self.assemble_context(task, Some(reason.clone()), 1, 1)?;
+        let reflection_context = self.assemble_context(
+            task,
+            Some(reason.clone()),
+            Some(reason.clone()),
+            vec![format!("failed action: {}", action_label(action))],
+            1,
+            1,
+        )?;
         let reflection = self.reasoner.reflect(&ReasonRequest {
             tools: reflection_context.tools.clone(),
             context: reflection_context,
@@ -356,7 +401,12 @@ impl Kernel {
             Some(intent),
             Some(&reflection.action),
             TimelineEventType::ReflectionCompleted,
-            json!({ "reasoning": reflection.reasoning, "retry": allow_retry, "task_complete": reflection.task_complete }),
+            json!({
+                "action": action_label(&reflection.action),
+                "reasoning": reflection.reasoning,
+                "retry": allow_retry,
+                "task_complete": reflection.task_complete
+            }),
         ))?;
 
         if allow_retry && should_retry(action, &reflection.action) {
@@ -384,6 +434,7 @@ impl Kernel {
         action: &Action,
         result: &ActionResult,
         delta: &StateDelta,
+        utility: f64,
     ) -> Result<ExperienceId> {
         let experience = Experience {
             id: None,
@@ -392,11 +443,15 @@ impl Kernel {
             intent_id: intent.id.clone(),
             action_summary: action_label(action),
             outcome: format!("{:?}", delta.kind),
-            utility: delta.utility_score(),
+            utility,
             created_at: Utc::now(),
             metadata: json!({
+                "task": task.description,
+                "action": action,
+                "delta_kind": delta.kind,
                 "delta": delta.summary,
                 "result": result,
+                "utility": utility,
             }),
         };
         self.memory.record_experience(&experience)
@@ -406,6 +461,8 @@ impl Kernel {
         &self,
         task: &Task,
         last_result: Option<String>,
+        last_result_summary: Option<String>,
+        recent_steps: Vec<String>,
         current_step: usize,
         max_steps: usize,
     ) -> Result<AssembledContext> {
@@ -444,6 +501,8 @@ impl Kernel {
                 )
                 .collect(),
             last_result,
+            last_result_summary,
+            recent_steps,
             current_step,
             max_steps,
         })
@@ -454,52 +513,10 @@ impl Kernel {
             .shell
             .request_input("Press Enter to continue to the next step or type /stop to cancel")?;
         let normalized = input.trim().to_lowercase();
-        Ok(matches!(normalized.as_str(), "/stop" | "stop" | "/cancel" | "cancel"))
-    }
-
-    fn promote_reflex_if_ready(
-        &self,
-        task: &Task,
-        action: &Action,
-        delta: &StateDelta,
-    ) -> Result<()> {
-        if !matches!(delta.kind, StateDeltaKind::ChangedAsExpected) {
-            return Ok(());
-        }
-        if matches!(
-            action,
-            Action::Respond { .. }
-                | Action::RecordNote { .. }
-                | Action::InspectWorkingDirectory { .. }
-        ) {
-            return Ok(());
-        }
-
-        let action_summary = action_label(action);
-        let successful_repeats = self
-            .memory
-            .recall_experiences(&task.description, 10)?
-            .into_iter()
-            .filter(|experience| {
-                experience.action_summary == action_summary && experience.utility > 0.0
-            })
-            .count();
-        if successful_repeats < 2 {
-            return Ok(());
-        }
-
-        let rule = ReflexiveRule {
-            id: None,
-            name: format!("promoted:{}", task.description),
-            condition: RuleCondition::TaskContains(task.description.clone()),
-            action: RuleAction::UseAction(action.clone()),
-            confidence: 0.6,
-            active: true,
-            last_fired: None,
-        };
-        let _ = self.memory.store_rule(&rule)?;
-        self.reflex_engine.promote(rule);
-        Ok(())
+        Ok(matches!(
+            normalized.as_str(),
+            "/stop" | "stop" | "/cancel" | "cancel"
+        ))
     }
 
     fn emit_event(&self, spec: EventSpec<'_>) -> Result<()> {
@@ -531,6 +548,9 @@ struct StepDecision {
 struct TaskLoopState {
     step_index: usize,
     last_result_json: Option<String>,
+    last_result_summary: Option<String>,
+    recent_steps: Vec<String>,
+    seen_signatures: HashMap<String, usize>,
 }
 
 impl TaskLoopState {
@@ -538,22 +558,63 @@ impl TaskLoopState {
         Self {
             step_index: 0,
             last_result_json: None,
+            last_result_summary: None,
+            recent_steps: Vec::new(),
+            seen_signatures: HashMap::new(),
         }
     }
 
-    fn record_step(&mut self, step: &StepDecision, outcome: &Outcome) -> Result<()> {
+    fn record_step(&mut self, step: &StepDecision, outcome: &Outcome) -> Result<StepProgress> {
         self.step_index += 1;
+        let mut repeated_without_progress = false;
         self.last_result_json = match outcome {
             Outcome::Success(result) if !matches!(step.action, Action::Respond { .. }) => {
+                let summary = summarize_action_result(result);
+                self.last_result_summary = Some(summary.clone());
+                self.recent_steps
+                    .push(format!("step {}: {} -> {}", self.step_index, action_label(&step.action), summary));
+                trim_recent_steps(&mut self.recent_steps);
+                if let Some(signature) = repeated_step_signature(&step.action, result) {
+                    let count = self.seen_signatures.entry(signature).or_insert(0);
+                    *count += 1;
+                    repeated_without_progress = *count > 1;
+                }
                 Some(
                     serde_json::to_string(result)
                         .map_err(|error| KernelError::Reasoning(error.to_string()))?,
                 )
             }
-            _ => None,
+            Outcome::Success(_) => {
+                self.last_result_summary = Some("responded to operator".to_string());
+                self.recent_steps.push(format!(
+                    "step {}: {} -> responded to operator",
+                    self.step_index,
+                    action_label(&step.action)
+                ));
+                trim_recent_steps(&mut self.recent_steps);
+                None
+            }
+            Outcome::Failure(reason) | Outcome::Blocked(reason) => {
+                self.last_result_summary = Some(reason.clone());
+                self.recent_steps.push(format!(
+                    "step {}: {} -> {}",
+                    self.step_index,
+                    action_label(&step.action),
+                    reason
+                ));
+                trim_recent_steps(&mut self.recent_steps);
+                None
+            }
         };
-        Ok(())
+        Ok(StepProgress {
+            repeated_without_progress,
+        })
     }
+}
+
+#[derive(Default)]
+struct StepProgress {
+    repeated_without_progress: bool,
 }
 
 struct EventSpec<'a> {
@@ -651,6 +712,10 @@ impl ReflexEngine {
             rules.push(rule);
         }
     }
+
+    pub fn sync(&self, rules: Vec<ReflexiveRule>) {
+        *self.rules.lock().expect("reflex engine mutex poisoned") = rules;
+    }
 }
 
 fn rule_action(rule: &ReflexiveRule) -> Option<Action> {
@@ -745,6 +810,158 @@ fn action_failure_reason(
     None
 }
 
+fn action_utility(action: &Action, result: &ActionResult, delta: &StateDelta) -> f64 {
+    if action.expects_change() {
+        return delta.utility_score();
+    }
+
+    match result {
+        ActionResult::Command(command) => {
+            if command.success {
+                0.6
+            } else {
+                -1.0
+            }
+        }
+        ActionResult::Inspection(state) => {
+            if state.files.is_empty() {
+                0.25
+            } else {
+                0.45
+            }
+        }
+        ActionResult::DirectoryListing { entries, .. } => {
+            if entries.is_empty() {
+                0.15
+            } else {
+                0.55
+            }
+        }
+        ActionResult::FileMatches { matches, .. } => {
+            if matches.is_empty() {
+                0.1
+            } else {
+                0.6
+            }
+        }
+        ActionResult::FileRead {
+            content, truncated, ..
+        }
+        | ActionResult::DocumentText {
+            content, truncated, ..
+        } => {
+            if content.trim().is_empty() {
+                0.05
+            } else if *truncated {
+                0.65
+            } else {
+                0.85
+            }
+        }
+        ActionResult::TextSearch { matches, .. } => {
+            if matches.is_empty() {
+                0.1
+            } else {
+                0.65
+            }
+        }
+        ActionResult::FileWrite { .. } => 1.0,
+        ActionResult::NoteRecorded { .. } => 0.3,
+        ActionResult::Response { message } => {
+            if message.trim().is_empty() {
+                0.0
+            } else {
+                0.25
+            }
+        }
+    }
+}
+
+fn summarize_action_result(result: &ActionResult) -> String {
+    match result {
+        ActionResult::Command(command) => format!(
+            "command {} with exit {:?}",
+            if command.success { "succeeded" } else { "failed" },
+            command.exit_code
+        ),
+        ActionResult::Inspection(world) => format!("inspected {} path(s)", world.files.len()),
+        ActionResult::DirectoryListing { root, entries } => format!(
+            "listed {} entr{} under {}",
+            entries.len(),
+            if entries.len() == 1 { "y" } else { "ies" },
+            root.display()
+        ),
+        ActionResult::FileMatches {
+            pattern, matches, ..
+        } => format!(
+            "found {} match{} for {}",
+            matches.len(),
+            if matches.len() == 1 { "" } else { "es" },
+            pattern
+        ),
+        ActionResult::FileRead {
+            path,
+            content,
+            truncated,
+        } => format!(
+            "read {} ({} chars{})",
+            path.display(),
+            content.chars().count(),
+            if *truncated { ", truncated" } else { "" }
+        ),
+        ActionResult::DocumentText {
+            path,
+            content,
+            truncated,
+            format,
+        } => format!(
+            "extracted {} text from {} ({} chars{})",
+            format,
+            path.display(),
+            content.chars().count(),
+            if *truncated { ", truncated" } else { "" }
+        ),
+        ActionResult::TextSearch { query, matches, .. } => format!(
+            "found {} text match{} for {}",
+            matches.len(),
+            if matches.len() == 1 { "" } else { "es" },
+            query
+        ),
+        ActionResult::FileWrite {
+            path,
+            bytes_written,
+            appended,
+        } => format!(
+            "{} {} ({} bytes)",
+            if *appended { "appended to" } else { "wrote" },
+            path.display(),
+            bytes_written
+        ),
+        ActionResult::NoteRecorded { note } => format!("recorded note: {}", note),
+        ActionResult::Response { message } => format!("responded: {}", message),
+    }
+}
+
+fn repeated_step_signature(action: &Action, result: &ActionResult) -> Option<String> {
+    if matches!(action, Action::Respond { .. } | Action::RecordNote { .. }) {
+        return None;
+    }
+
+    Some(format!(
+        "{}::{}",
+        action_label(action),
+        summarize_action_result(result)
+    ))
+}
+
+fn trim_recent_steps(recent_steps: &mut Vec<String>) {
+    const MAX_RECENT_STEPS: usize = 6;
+    if recent_steps.len() > MAX_RECENT_STEPS {
+        let excess = recent_steps.len() - MAX_RECENT_STEPS;
+        recent_steps.drain(0..excess);
+    }
+}
+
 fn should_retry(previous: &Action, next: &Action) -> bool {
     action_label(previous) != action_label(next) && !matches!(next, Action::Respond { .. })
 }
@@ -778,7 +995,13 @@ fn default_tool_descriptors(capabilities: ShellCapabilities) -> Vec<ToolDescript
     if capabilities.can_read_files {
         tools.push(ToolDescriptor {
             name: "read_file".to_string(),
-            description: "Read file contents with truncation protection.".to_string(),
+            description: "Read text-like files such as markdown, code, config, and plaintext with truncation protection.".to_string(),
+        });
+    }
+    if capabilities.can_extract_documents {
+        tools.push(ToolDescriptor {
+            name: "extract_document_text".to_string(),
+            description: "Extract readable text from documents such as PDFs when raw file reads would be binary or unhelpful.".to_string(),
         });
     }
     if capabilities.can_write_files {
@@ -813,6 +1036,9 @@ fn action_label(action: &Action) -> String {
         }
         Action::SearchText { root, query, .. } => format!("search_text:{}:{query}", root.display()),
         Action::ReadFile { path, .. } => format!("read_file:{}", path.display()),
+        Action::ExtractDocumentText { path, .. } => {
+            format!("extract_document_text:{}", path.display())
+        }
         Action::WriteFile { path, .. } => format!("write_file:{}", path.display()),
         Action::AppendFile { path, .. } => format!("append_file:{}", path.display()),
         Action::RecordNote { note, .. } => format!("record_note:{note}"),
@@ -905,7 +1131,141 @@ mod tests {
         let _ = kernel
             .execute_task(Task::new(AgentId::new(), task))
             .unwrap();
+        let _ = kernel
+            .execute_task(Task::new(AgentId::new(), task))
+            .unwrap();
 
         assert!(memory.rule_count() >= 1);
+    }
+
+    #[test]
+    fn successful_read_steps_get_positive_utility() {
+        let memory = MockMemory::default();
+        let kernel = Kernel::new(
+            Box::new(MockShell::default()),
+            Box::new(MockReasoner::for_action(Action::ReadFile {
+                id: ActionId::new(),
+                path: "startup.md".into(),
+                max_bytes: None,
+            })),
+            Box::new(memory.clone()),
+        )
+        .unwrap();
+
+        let _ = kernel
+            .execute_task(Task::new(AgentId::new(), "read startup.md"))
+            .unwrap();
+
+        let experiences = memory.experiences();
+        assert_eq!(experiences.len(), 1);
+        assert!(experiences[0].utility > 0.0);
+    }
+
+    #[test]
+    fn multi_step_task_continues_until_terminal_step() {
+        let kernel = Kernel::new(
+            Box::new(MockShell::default()),
+            Box::new(MockReasoner::sequence(vec![
+                ReasonResponse {
+                    action: Action::FindFiles {
+                        id: ActionId::new(),
+                        root: ".".into(),
+                        pattern: "startup.md".to_string(),
+                        max_results: 5,
+                    },
+                    task_complete: false,
+                    reasoning: Some("find it first".to_string()),
+                    tokens_used: TokenUsage::default(),
+                },
+                ReasonResponse {
+                    action: Action::ReadFile {
+                        id: ActionId::new(),
+                        path: "startup.md".into(),
+                        max_bytes: None,
+                    },
+                    task_complete: true,
+                    reasoning: Some("now read it".to_string()),
+                    tokens_used: TokenUsage::default(),
+                },
+            ])),
+            Box::new(MockMemory::default()),
+        )
+        .unwrap();
+
+        let outcome = kernel
+            .execute_task(Task::new(AgentId::new(), "find startup.md and read it"))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::Success(ActionResult::FileRead { .. })
+        ));
+    }
+
+    #[test]
+    fn repeated_identical_step_without_progress_fails_honestly() {
+        let repeated_action = Action::FindFiles {
+            id: ActionId::new(),
+            root: ".".into(),
+            pattern: "startup.md".to_string(),
+            max_results: 5,
+        };
+        let kernel = Kernel::new(
+            Box::new(MockShell::default()),
+            Box::new(MockReasoner::sequence(vec![
+                ReasonResponse {
+                    action: repeated_action.clone(),
+                    task_complete: false,
+                    reasoning: Some("find it first".to_string()),
+                    tokens_used: TokenUsage::default(),
+                },
+                ReasonResponse {
+                    action: repeated_action.clone(),
+                    task_complete: false,
+                    reasoning: Some("trying the same thing again".to_string()),
+                    tokens_used: TokenUsage::default(),
+                },
+            ])),
+            Box::new(MockMemory::default()),
+        )
+        .unwrap();
+
+        let outcome = kernel
+            .execute_task(Task::new(AgentId::new(), "find startup.md and read it"))
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::Failure(reason) if reason.contains("repeated the same step")
+        ));
+    }
+
+    #[test]
+    fn interactive_stop_cancels_continuation() {
+        let kernel = Kernel::new(
+            Box::new(MockShell::default().with_inputs(vec!["/stop".to_string()])),
+            Box::new(MockReasoner::for_response(ReasonResponse {
+                action: Action::FindFiles {
+                    id: ActionId::new(),
+                    root: ".".into(),
+                    pattern: "startup.md".to_string(),
+                    max_results: 5,
+                },
+                task_complete: false,
+                reasoning: Some("find it first".to_string()),
+                tokens_used: TokenUsage::default(),
+            })),
+            Box::new(MockMemory::default()),
+        )
+        .unwrap();
+
+        let outcome = kernel
+            .execute_task_with_config(
+                Task::new(AgentId::new(), "find startup.md and read it"),
+                ExecutionConfig {
+                    max_steps: 3,
+                    pause_before_continuation: true,
+                },
+            )
+            .unwrap();
+        assert!(matches!(outcome, Outcome::Blocked(reason) if reason.contains("cancelled")));
     }
 }

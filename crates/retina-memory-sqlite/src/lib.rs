@@ -1,4 +1,12 @@
+mod consolidation;
+mod retrieval;
+
 use chrono::{DateTime, Utc};
+use consolidation::{
+    build_experience_patterns, knowledge_content, metadata_key, metadata_success_count,
+    pattern_metadata, rule_matches_pattern, rule_name, should_promote_rule,
+};
+use retrieval::{rank_experiences, rerank_knowledge};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use refinery::embed_migrations;
 use retina_traits::Memory;
@@ -82,14 +90,18 @@ impl SqliteMemory {
     pub fn save_manifest(&self, manifest: &AgentManifest) -> Result<()> {
         self.with_conn(|conn| {
             conn.execute(
-                "INSERT OR REPLACE INTO agent_manifest (agent_id, domain, status, description, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT OR REPLACE INTO agent_manifest
+                 (agent_id, domain, status, description, created_at, parent_agent_id, capabilities_json, authority_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     manifest.agent_id.0,
                     manifest.domain,
                     serde_json::to_string(&manifest.status).map_err(to_storage)?,
                     manifest.description,
                     manifest.created_at.to_rfc3339(),
+                    manifest.parent_agent_id.as_ref().map(|value| value.0.clone()),
+                    serde_json::to_string(&manifest.capabilities).map_err(to_storage)?,
+                    serde_json::to_string(&manifest.authority).map_err(to_storage)?,
                 ],
             )
             .map_err(to_storage)?;
@@ -100,17 +112,25 @@ impl SqliteMemory {
     pub fn load_manifest(&self, agent_id: &AgentId) -> Result<Option<AgentManifest>> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT domain, status, description, created_at FROM agent_manifest WHERE agent_id = ?1",
+                "SELECT domain, status, description, created_at, parent_agent_id, capabilities_json, authority_json
+                 FROM agent_manifest WHERE agent_id = ?1",
                 params![agent_id.0],
                 |row| {
                     let status_json: String = row.get(1)?;
                     let created_at: String = row.get(3)?;
+                    let capabilities_json: String = row.get(5)?;
+                    let authority_json: String = row.get(6)?;
                     Ok(AgentManifest {
                         agent_id: agent_id.clone(),
                         domain: row.get(0)?,
                         status: serde_json::from_str(&status_json).unwrap_or(AgentStatus::Spawned),
                         description: row.get(2)?,
                         created_at: parse_datetime(&created_at),
+                        parent_agent_id: row.get::<_, Option<String>>(4)?.map(AgentId),
+                        capabilities: serde_json::from_str(&capabilities_json)
+                            .unwrap_or_else(|_| Vec::new()),
+                        authority: serde_json::from_str(&authority_json)
+                            .unwrap_or_else(|_| AgentAuthority::default()),
                     })
                 },
             )
@@ -191,41 +211,8 @@ impl Memory for SqliteMemory {
     }
 
     fn store_knowledge(&self, node: &KnowledgeNode) -> Result<KnowledgeId> {
-        let id = node.id.clone().unwrap_or_default();
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO knowledge (id, category, content, confidence, created_at, updated_at, metadata)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    id.0,
-                    node.category,
-                    node.content,
-                    node.confidence,
-                    node.created_at.to_rfc3339(),
-                    node.updated_at.to_rfc3339(),
-                    serde_json::to_string(&node.metadata).map_err(to_storage)?,
-                ],
-            )
-            .map_err(to_storage)?;
-            conn.execute(
-                "INSERT OR IGNORE INTO knowledge_id_map (knowledge_id) VALUES (?1)",
-                params![id.0],
-            )
-            .map_err(to_storage)?;
-            let rowid: i64 = conn
-                .query_row(
-                    "SELECT rowid FROM knowledge_id_map WHERE knowledge_id = ?1",
-                    params![id.0],
-                    |row| row.get(0),
-                )
-                .map_err(to_storage)?;
-            let embedding = self.embed_text(&node.content);
-            let vector_json = embedding_json(&embedding);
-            let _ = conn.execute(
-                "INSERT OR REPLACE INTO knowledge_vec (rowid, embedding) VALUES (?1, vec_f32(?2))",
-                params![rowid, vector_json],
-            );
-            Ok(id)
+            persist_knowledge(conn, &self.embedder, node)
         })
     }
 
@@ -241,23 +228,8 @@ impl Memory for SqliteMemory {
     }
 
     fn store_rule(&self, rule: &ReflexiveRule) -> Result<RuleId> {
-        let id = rule.id.clone().unwrap_or_default();
         self.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO reflexive_rules (id, name, condition_json, action_json, confidence, active, last_fired)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    id.0,
-                    rule.name,
-                    serde_json::to_string(&rule.condition).map_err(to_storage)?,
-                    serde_json::to_string(&rule.action).map_err(to_storage)?,
-                    rule.confidence,
-                    if rule.active { 1 } else { 0 },
-                    rule.last_fired.map(|value| value.to_rfc3339()),
-                ],
-            )
-            .map_err(to_storage)?;
-            Ok(id)
+            persist_rule(conn, rule)
         })
     }
 
@@ -287,20 +259,21 @@ impl Memory for SqliteMemory {
 
     fn recall_experiences(&self, query: &str, limit: usize) -> Result<Vec<Experience>> {
         self.with_conn(|conn| {
-            let pattern = format!("%{}%", query);
             let mut stmt = conn
                 .prepare(
                     "SELECT id, session_id, task_id, intent_id, action_summary, outcome, utility, created_at, metadata
                      FROM experiences
-                     WHERE action_summary LIKE ?1 OR outcome LIKE ?1 OR metadata LIKE ?1
-                     ORDER BY utility DESC, created_at DESC
-                     LIMIT ?2",
+                     ORDER BY created_at DESC
+                     LIMIT ?1",
                 )
                 .map_err(to_storage)?;
             let rows = stmt
-                .query_map(params![pattern, limit as i64], row_to_experience)
+                .query_map(params![(limit.max(8) * 8) as i64], row_to_experience)
                 .map_err(to_storage)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>().map_err(to_storage)
+            let experiences = rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(to_storage)?;
+            Ok(rank_experiences(query, experiences, limit))
         })
     }
 
@@ -389,7 +362,7 @@ impl Memory for SqliteMemory {
                     .map_err(to_storage)?;
                 output.push(node);
             }
-            Ok(output)
+            Ok(rerank_knowledge(query, output, limit))
         })
     }
 
@@ -522,6 +495,107 @@ impl Memory for SqliteMemory {
 
     fn consolidate(&self, config: &ConsolidationConfig) -> Result<ConsolidationReport> {
         self.with_conn(|conn| {
+            let experiences = load_recent_experiences(conn, 256)?;
+            let patterns = build_experience_patterns(&experiences, config);
+            let mut knowledge = load_knowledge_nodes(conn)?;
+            let mut rules = load_rules(conn, false)?;
+            let mut report = ConsolidationReport::default();
+
+            for pattern in patterns {
+                let metadata = pattern_metadata(&pattern);
+                let confidence = pattern.confidence;
+                let existing_knowledge = knowledge
+                    .iter()
+                    .find(|node| metadata_key(&node.metadata) == Some(pattern.key.as_str()))
+                    .cloned();
+                let should_update_knowledge = existing_knowledge
+                    .as_ref()
+                    .map(|node| {
+                        metadata_success_count(&node.metadata) < pattern.success_count
+                            || node.confidence + 0.05 < confidence
+                    })
+                    .unwrap_or(true);
+
+                if should_update_knowledge {
+                    if let Some(existing) = existing_knowledge {
+                        if let Some(id) = existing.id.clone() {
+                            conn.execute(
+                                "UPDATE knowledge
+                                 SET content = ?2, confidence = ?3, metadata = ?4, updated_at = ?5
+                                 WHERE id = ?1",
+                                params![
+                                    id.0,
+                                    knowledge_content(&pattern),
+                                    confidence.max(existing.confidence),
+                                    serde_json::to_string(&metadata).map_err(to_storage)?,
+                                    Utc::now().to_rfc3339(),
+                                ],
+                            )
+                            .map_err(to_storage)?;
+                        }
+                    } else {
+                        let node = KnowledgeNode {
+                            id: None,
+                            category: "pattern".to_string(),
+                            content: knowledge_content(&pattern),
+                            confidence,
+                            created_at: Utc::now(),
+                            updated_at: Utc::now(),
+                            metadata: metadata.clone(),
+                        };
+                        let id = persist_knowledge(conn, &self.embedder, &node)?;
+                        let mut stored = node;
+                        stored.id = Some(id);
+                        knowledge.push(stored);
+                    }
+                    report.merged_knowledge += 1;
+                }
+
+                let existing_rule = rules
+                    .iter()
+                    .find(|rule| rule_matches_pattern(rule, &pattern))
+                    .cloned();
+                let desired_active = should_promote_rule(&pattern, config);
+                let should_update_rule = existing_rule
+                    .as_ref()
+                    .map(|rule| {
+                        rule.active != desired_active
+                            || (desired_active && rule.confidence + 0.05 < confidence)
+                            || (!desired_active && rule.confidence > confidence + 0.05)
+                    })
+                    .unwrap_or(desired_active);
+                if should_update_rule {
+                    let rule = ReflexiveRule {
+                        id: existing_rule.as_ref().and_then(|value| value.id.clone()),
+                        name: rule_name(&pattern),
+                        condition: RuleCondition::TaskContains(pattern.task_text.clone()),
+                        action: RuleAction::UseAction(pattern.action.clone()),
+                        confidence,
+                        active: desired_active,
+                        last_fired: None,
+                    };
+                    let id = persist_rule(conn, &rule)?;
+                    if let Some(existing_rule) = existing_rule {
+                        if let Some(position) =
+                            rules.iter().position(|item| item.name == existing_rule.name)
+                        {
+                            rules[position] = ReflexiveRule {
+                                id: Some(id),
+                                ..rule
+                            };
+                        }
+                    } else {
+                        rules.push(ReflexiveRule {
+                            id: Some(id),
+                            ..rule
+                        });
+                    }
+                    if desired_active {
+                        report.promoted_rules += 1;
+                    }
+                }
+            }
+
             if config.max_recent_states > 0 {
                 let threshold: Option<String> = conn
                     .query_row(
@@ -535,14 +609,12 @@ impl Memory for SqliteMemory {
                     let compacted = conn
                         .execute("DELETE FROM timeline_events WHERE timestamp < ?1", params![threshold])
                         .map_err(to_storage)?;
-                    return Ok(ConsolidationReport {
-                        merged_knowledge: 0,
-                        promoted_rules: 0,
-                        compacted_events: compacted,
-                    });
+                    conn.execute("DELETE FROM state_log WHERE timestamp < ?1", params![threshold])
+                        .map_err(to_storage)?;
+                    report.compacted_events = compacted;
                 }
             }
-            Ok(ConsolidationReport::default())
+            Ok(report)
         })
     }
 
@@ -603,6 +675,108 @@ fn sanitize_fts_query(query: &str) -> Option<String> {
     }
 }
 
+fn persist_knowledge(
+    conn: &Connection,
+    embedder: &Embedder,
+    node: &KnowledgeNode,
+) -> Result<KnowledgeId> {
+    let id = node.id.clone().unwrap_or_default();
+    conn.execute(
+        "INSERT OR REPLACE INTO knowledge (id, category, content, confidence, created_at, updated_at, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id.0,
+            node.category,
+            node.content,
+            node.confidence,
+            node.created_at.to_rfc3339(),
+            node.updated_at.to_rfc3339(),
+            serde_json::to_string(&node.metadata).map_err(to_storage)?,
+        ],
+    )
+    .map_err(to_storage)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO knowledge_id_map (knowledge_id) VALUES (?1)",
+        params![id.0],
+    )
+    .map_err(to_storage)?;
+    let rowid: i64 = conn
+        .query_row(
+            "SELECT rowid FROM knowledge_id_map WHERE knowledge_id = ?1",
+            params![id.0],
+            |row| row.get(0),
+        )
+        .map_err(to_storage)?;
+    let embedding = embedder.embed(&node.content);
+    let vector_json = embedding_json(&embedding);
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO knowledge_vec (rowid, embedding) VALUES (?1, vec_f32(?2))",
+        params![rowid, vector_json],
+    );
+    Ok(id)
+}
+
+fn persist_rule(conn: &Connection, rule: &ReflexiveRule) -> Result<RuleId> {
+    let id = rule.id.clone().unwrap_or_default();
+    conn.execute(
+        "INSERT OR REPLACE INTO reflexive_rules (id, name, condition_json, action_json, confidence, active, last_fired)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            id.0,
+            rule.name,
+            serde_json::to_string(&rule.condition).map_err(to_storage)?,
+            serde_json::to_string(&rule.action).map_err(to_storage)?,
+            rule.confidence,
+            if rule.active { 1 } else { 0 },
+            rule.last_fired.map(|value| value.to_rfc3339()),
+        ],
+    )
+    .map_err(to_storage)?;
+    Ok(id)
+}
+
+fn load_recent_experiences(conn: &Connection, limit: usize) -> Result<Vec<Experience>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, task_id, intent_id, action_summary, outcome, utility, created_at, metadata
+             FROM experiences
+             ORDER BY created_at DESC
+             LIMIT ?1",
+        )
+        .map_err(to_storage)?;
+    let rows = stmt
+        .query_map(params![limit as i64], row_to_experience)
+        .map_err(to_storage)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(to_storage)
+}
+
+fn load_knowledge_nodes(conn: &Connection) -> Result<Vec<KnowledgeNode>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, category, content, confidence, created_at, updated_at, metadata
+             FROM knowledge",
+        )
+        .map_err(to_storage)?;
+    let rows = stmt.query_map([], row_to_knowledge).map_err(to_storage)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(to_storage)
+}
+
+fn load_rules(conn: &Connection, active_only: bool) -> Result<Vec<ReflexiveRule>> {
+    let sql = if active_only {
+        "SELECT id, name, condition_json, action_json, confidence, active, last_fired
+         FROM reflexive_rules WHERE active = 1"
+    } else {
+        "SELECT id, name, condition_json, action_json, confidence, active, last_fired
+         FROM reflexive_rules"
+    };
+    let mut stmt = conn.prepare(sql).map_err(to_storage)?;
+    let rows = stmt.query_map([], row_to_rule).map_err(to_storage)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(to_storage)
+}
+
 fn row_to_experience(row: &rusqlite::Row<'_>) -> rusqlite::Result<Experience> {
     let metadata: String = row.get(8)?;
     let created_at: String = row.get(7)?;
@@ -631,6 +805,22 @@ fn row_to_knowledge(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeNode> 
         created_at: parse_datetime(&created_at),
         updated_at: parse_datetime(&updated_at),
         metadata: serde_json::from_str(&metadata).unwrap_or_else(|_| json!({})),
+    })
+}
+
+fn row_to_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReflexiveRule> {
+    let condition_json: String = row.get(2)?;
+    let action_json: String = row.get(3)?;
+    let last_fired: Option<String> = row.get(6)?;
+    Ok(ReflexiveRule {
+        id: Some(RuleId(row.get(0)?)),
+        name: row.get(1)?,
+        condition: serde_json::from_str(&condition_json).unwrap_or(RuleCondition::Always),
+        action: serde_json::from_str(&action_json)
+            .unwrap_or(RuleAction::AddNote("invalid".to_string())),
+        confidence: row.get(4)?,
+        active: row.get::<_, i64>(5)? == 1,
+        last_fired: last_fired.as_deref().map(parse_datetime),
     })
 }
 
@@ -701,6 +891,9 @@ struct ManifestFile {
     status: String,
     description: String,
     created_at: String,
+    parent_agent_id: Option<String>,
+    capabilities: Vec<String>,
+    authority: AgentAuthority,
 }
 
 pub fn write_manifest(path: PathBuf, manifest: &AgentManifest) -> Result<()> {
@@ -714,6 +907,9 @@ pub fn write_manifest(path: PathBuf, manifest: &AgentManifest) -> Result<()> {
         status: format!("{:?}", manifest.status),
         description: manifest.description.clone(),
         created_at: manifest.created_at.to_rfc3339(),
+        parent_agent_id: manifest.parent_agent_id.as_ref().map(|value| value.0.clone()),
+        capabilities: manifest.capabilities.clone(),
+        authority: manifest.authority.clone(),
     };
     std::fs::write(path, toml::to_string_pretty(&file).map_err(to_storage)?)
         .map_err(|error| KernelError::Storage(error.to_string()))
@@ -825,6 +1021,36 @@ mod tests {
     }
 
     #[test]
+    fn similar_task_phrasing_reuses_prior_experience() {
+        let memory = SqliteMemory::open_in_memory().unwrap();
+        memory
+            .record_experience(&Experience {
+                id: None,
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                intent_id: IntentId::new(),
+                action_summary: "read_file:/Users/macc/Desktop/resume/Craig Lyons resume.md".to_string(),
+                outcome: "success".to_string(),
+                utility: 0.8,
+                created_at: Utc::now(),
+                metadata: json!({
+                    "task": "read the craig lyons resume markdown file and summarize it",
+                    "action": Action::ReadFile {
+                        id: ActionId::new(),
+                        path: "/Users/macc/Desktop/resume/Craig Lyons resume.md".into(),
+                        max_bytes: None,
+                    }
+                }),
+            })
+            .unwrap();
+
+        let recalled = memory
+            .recall_experiences("find craig lyons resume.md and tell me about it", 5)
+            .unwrap();
+        assert_eq!(recalled.len(), 1);
+    }
+
+    #[test]
     fn backup_succeeds() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("agent.db");
@@ -848,5 +1074,100 @@ mod tests {
         memory.append_timeline_event(&event).unwrap();
         memory.backup(&backup).unwrap();
         assert!(backup.exists());
+    }
+
+    #[test]
+    fn consolidation_promotes_repeated_success_into_knowledge_and_rule() {
+        let memory = SqliteMemory::open_in_memory().unwrap();
+        let action = Action::ReadFile {
+            id: ActionId::new(),
+            path: "startup.md".into(),
+            max_bytes: None,
+        };
+
+        for _ in 0..3 {
+            memory
+                .record_experience(&Experience {
+                    id: None,
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    intent_id: IntentId::new(),
+                    action_summary: "read_file:startup.md".to_string(),
+                    outcome: "ChangedAsExpected".to_string(),
+                    utility: 1.0,
+                    created_at: Utc::now(),
+                    metadata: json!({
+                        "task": "read startup.md",
+                        "action": action.clone(),
+                    }),
+                })
+                .unwrap();
+        }
+
+        let report = memory.consolidate(&ConsolidationConfig::default()).unwrap();
+        assert!(report.merged_knowledge >= 1);
+        assert!(report.promoted_rules >= 1);
+        assert!(!memory.active_rules().unwrap().is_empty());
+        assert!(
+            memory
+                .recall_knowledge("prefer read_file", 5)
+                .unwrap()
+                .iter()
+                .any(|node| node.category == "pattern")
+        );
+    }
+
+    #[test]
+    fn consolidation_can_deactivate_rule_after_later_failures() {
+        let memory = SqliteMemory::open_in_memory().unwrap();
+        let action = Action::ReadFile {
+            id: ActionId::new(),
+            path: "startup.md".into(),
+            max_bytes: None,
+        };
+
+        for _ in 0..3 {
+            memory
+                .record_experience(&Experience {
+                    id: None,
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    intent_id: IntentId::new(),
+                    action_summary: "read_file:startup.md".to_string(),
+                    outcome: "success".to_string(),
+                    utility: 0.9,
+                    created_at: Utc::now(),
+                    metadata: json!({
+                        "task": "read startup.md",
+                        "action": action.clone(),
+                    }),
+                })
+                .unwrap();
+        }
+
+        memory.consolidate(&ConsolidationConfig::default()).unwrap();
+        assert_eq!(memory.active_rules().unwrap().len(), 1);
+
+        for _ in 0..4 {
+            memory
+                .record_experience(&Experience {
+                    id: None,
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    intent_id: IntentId::new(),
+                    action_summary: "read_file:startup.md".to_string(),
+                    outcome: "failure".to_string(),
+                    utility: -0.8,
+                    created_at: Utc::now(),
+                    metadata: json!({
+                        "task": "open startup.md",
+                        "action": action.clone(),
+                    }),
+                })
+                .unwrap();
+        }
+
+        memory.consolidate(&ConsolidationConfig::default()).unwrap();
+        assert!(memory.active_rules().unwrap().is_empty());
     }
 }

@@ -1,5 +1,6 @@
 use retina_memory_sqlite::MemoryStats;
 use retina_types::*;
+use serde_json::Value;
 
 pub fn render_action_result(result: &ActionResult) -> String {
     match result {
@@ -27,7 +28,7 @@ pub fn render_action_result(result: &ActionResult) -> String {
             pattern,
             matches,
         } => format!(
-            "Files matching '{pattern}' under {}\n{}",
+            "Paths matching '{pattern}' under {}\n{}",
             root.display(),
             if matches.is_empty() {
                 "(no matches)".to_string()
@@ -45,6 +46,21 @@ pub fn render_action_result(result: &ActionResult) -> String {
             truncated,
         } => format!(
             "Read file {}\n{}\n{}",
+            path.display(),
+            content,
+            if *truncated {
+                "\n[output truncated]"
+            } else {
+                ""
+            }
+        ),
+        ActionResult::DocumentText {
+            path,
+            content,
+            truncated,
+            format,
+        } => format!(
+            "Extracted {format} text from {}\n{}\n{}",
             path.display(),
             content,
             if *truncated {
@@ -112,6 +128,109 @@ pub fn render_timeline_event(event: &TimelineEvent) -> String {
             .map(|summary| format!(" delta={summary}"))
             .unwrap_or_default()
     )
+}
+
+pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
+    if debug {
+        return render_timeline_event(event);
+    }
+
+    let line = match event.event_type {
+        TimelineEventType::TaskReceived => {
+            event.payload_json.get("task").and_then(Value::as_str).map(|task| {
+                format!("task: {task}")
+            })
+        }
+        TimelineEventType::ReasonerCalled => {
+            if let Some(action) = event.payload_json.get("action").and_then(Value::as_str) {
+                Some(format!("plan: {}", humanize_action_label(action)))
+            } else {
+                event.payload_json
+                    .get("reasoning")
+                    .and_then(Value::as_str)
+                    .map(|reasoning| format!("thinking: {reasoning}"))
+            }
+        }
+        TimelineEventType::ReflexSelected => event
+            .payload_json
+            .get("action")
+            .and_then(Value::as_str)
+            .map(|action| format!("reflex: {}", humanize_action_label(action))),
+        TimelineEventType::ActionDispatched => event
+            .payload_json
+            .get("action")
+            .and_then(Value::as_str)
+            .map(|action| format!("action: {}", humanize_action_label(action))),
+        TimelineEventType::ReflectionRequested => event
+            .payload_json
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|reason| format!("reflection: {reason}")),
+        TimelineEventType::TaskFailed => event
+            .payload_json
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|reason| format!("failed: {reason}")),
+        TimelineEventType::TaskCancelled => event
+            .payload_json
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|reason| format!("cancelled: {reason}")),
+        TimelineEventType::TaskCompleted => Some("done".to_string()),
+        _ => None,
+    };
+
+    line.map(|line| format!("{line}\n")).unwrap_or_default()
+}
+
+fn humanize_action_label(label: &str) -> String {
+    if let Some(value) = label.strip_prefix("run_command:") {
+        return format!("run command `{value}`");
+    }
+    if let Some(value) = label.strip_prefix("read_file:") {
+        return format!("read file {}", value);
+    }
+    if let Some(value) = label.strip_prefix("extract_document_text:") {
+        return format!("extract text from {}", value);
+    }
+    if let Some(value) = label.strip_prefix("write_file:") {
+        return format!("write file {}", value);
+    }
+    if let Some(value) = label.strip_prefix("append_file:") {
+        return format!("append file {}", value);
+    }
+    if let Some(value) = label.strip_prefix("inspect_path:") {
+        return format!("inspect path {}", value);
+    }
+    if let Some(value) = label.strip_prefix("record_note:") {
+        return format!("record note {}", value);
+    }
+    if let Some(value) = label.strip_prefix("respond:") {
+        return format!("respond {}", value);
+    }
+    if let Some(value) = label.strip_prefix("find_files:") {
+        let mut parts = value.splitn(2, ':');
+        let root = parts.next().unwrap_or(".");
+        let pattern = parts.next().unwrap_or("*");
+        return format!("find `{pattern}` under {root}");
+    }
+    if let Some(value) = label.strip_prefix("search_text:") {
+        let mut parts = value.splitn(2, ':');
+        let root = parts.next().unwrap_or(".");
+        let query = parts.next().unwrap_or_default();
+        return format!("search `{query}` under {root}");
+    }
+    if let Some(value) = label.strip_prefix("list_directory:") {
+        let mut parts = value.splitn(2, ":recursive=");
+        let path = parts.next().unwrap_or(".");
+        let recursive = parts.next().unwrap_or("false");
+        return if recursive == "true" {
+            format!("list directory {} recursively", path)
+        } else {
+            format!("list directory {}", path)
+        };
+    }
+    label.replace('_', " ")
 }
 
 pub fn render_memory_inspection(knowledge: &[KnowledgeNode], experiences: &[Experience]) -> String {

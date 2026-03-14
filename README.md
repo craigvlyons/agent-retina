@@ -16,12 +16,13 @@ Build from these docs in this order:
 
 1. `README.md`
 2. `docs/v1_plan.md`
-3. `docs/roadmap.md`
-4. `docs/architecture.md`
-5. `docs/trait_contracts.md`
-6. `docs/research_overview.md`
-7. `docs/research_memory.md`
-8. `docs/research_memory_v2.md`
+3. `docs/plans/research-aligned-execution-plan.md`
+4. `docs/roadmap.md`
+5. `docs/architecture.md`
+6. `docs/trait_contracts.md`
+7. `docs/research_overview.md`
+8. `docs/research_memory.md`
+9. `docs/research_memory_v2.md`
 
 If an older doc disagrees with these, the list above wins.
 
@@ -31,6 +32,7 @@ Retina has completed the first solid chamber of v1:
 - Rust workspace and private local runtime
 - stable shared types and 5 trait boundaries
 - kernel execute loop with timeline logging
+- bounded multi-step execution in the kernel
 - CLI shell with read, search, write, approval, and command execution
 - SQLite memory with experiences, knowledge, rules, and tool registry
 - Claude-backed reasoner with local planner fallback
@@ -52,6 +54,9 @@ Retina is not yet the full colony:
 - Memory is pull-based and should keep prompts small.
 - Every meaningful action must be captured in the observation timeline.
 - Expansion should be additive. We do not want future specialist support to require major refactors of the kernel.
+- If implementation intent is unclear, consult the canonical research stack before adding or refactoring behavior.
+- Do not hide real agent failures behind broad fallback behavior. If the agent cannot plan, act, or verify correctly, that gap should be visible in the timeline and operator surface so the system can improve honestly.
+- Do not cover up or withhold signals the agent needs in order to learn. The harness should expose constraints, errors, state mismatches, and missing capability edges clearly so the agent or operator can respond.
 
 ## Anthill Direction
 

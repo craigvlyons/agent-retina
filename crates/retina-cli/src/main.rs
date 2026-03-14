@@ -46,7 +46,7 @@ mod tests {
         unsafe {
             env::set_var("RETINA_HOME", dir.path());
         }
-        app::run_task("inspect working directory".to_string()).unwrap();
+        app::run_task("what can you do".to_string()).unwrap();
         let memory = SqliteMemory::open(dir.path().join("root").join("agent.db")).unwrap();
         assert!(!memory.recent_states(10).unwrap().is_empty());
     }

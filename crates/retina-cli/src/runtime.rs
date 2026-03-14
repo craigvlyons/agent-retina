@@ -35,13 +35,7 @@ pub fn init_runtime() -> Result<()> {
 
     let db_path = root.join("agent.db");
     let memory = open_memory(&db_path)?;
-    let manifest = AgentManifest {
-        agent_id: AgentId("root".to_string()),
-        domain: "orchestrator".to_string(),
-        status: AgentStatus::Idle,
-        description: "Retina root agent running in independent v1 mode.".to_string(),
-        created_at: Utc::now(),
-    };
+    let manifest = root_manifest()?;
     memory.save_manifest(&manifest)?;
     write_manifest(root.join("manifest.toml"), &manifest)?;
     println!("Initialized Retina runtime at {}", home.display());
@@ -65,4 +59,33 @@ pub fn retina_home() -> Result<PathBuf> {
 
 pub fn root_db_path() -> Result<PathBuf> {
     Ok(retina_home()?.join("root").join("agent.db"))
+}
+
+pub fn root_agent_id() -> AgentId {
+    AgentId("root".to_string())
+}
+
+pub fn root_manifest() -> Result<AgentManifest> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        KernelError::Configuration("could not determine home directory".to_string())
+    })?;
+    Ok(AgentManifest {
+        agent_id: root_agent_id(),
+        domain: "orchestrator".to_string(),
+        status: AgentStatus::Idle,
+        description: "Retina root agent running in independent v1 mode.".to_string(),
+        created_at: Utc::now(),
+        parent_agent_id: None,
+        capabilities: vec![
+            "cli".to_string(),
+            "filesystem".to_string(),
+            "search".to_string(),
+            "command".to_string(),
+            "memory".to_string(),
+        ],
+        authority: AgentAuthority {
+            accessible_roots: vec![home],
+            ..AgentAuthority::default()
+        },
+    })
 }

@@ -1,6 +1,6 @@
 mod planner;
 
-use planner::{fallback_response, plan_task, reflect_task};
+use planner::plan_task;
 use reqwest::blocking::Client;
 use retina_traits::Reasoner;
 use retina_types::*;
@@ -19,7 +19,7 @@ impl ClaudeReasoner {
         Self {
             client: Client::new(),
             model_id: env::var("RETINA_CLAUDE_MODEL")
-                .unwrap_or_else(|_| "claude-3-5-sonnet-latest".to_string()),
+                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
             api_key: env::var("ANTHROPIC_API_KEY").ok(),
         }
     }
@@ -50,12 +50,15 @@ impl ClaudeReasoner {
             .json(&payload)
             .send()
             .map_err(|error| KernelError::Reasoning(error.to_string()))?;
-        let response = response
-            .error_for_status()
+        let status = response.status();
+        let body_text = response
+            .text()
             .map_err(|error| KernelError::Reasoning(error.to_string()))?;
-        let body: ClaudeResponse = response
-            .json()
-            .map_err(|error| KernelError::Reasoning(error.to_string()))?;
+        if !status.is_success() {
+            return Err(map_claude_error(status.as_u16(), &body_text, &self.model_id));
+        }
+        let body: ClaudeResponse =
+            serde_json::from_str(&body_text).map_err(|error| KernelError::Reasoning(error.to_string()))?;
         let text = body
             .content
             .iter()
@@ -72,6 +75,31 @@ impl ClaudeReasoner {
     }
 }
 
+fn map_claude_error(status: u16, body: &str, model_id: &str) -> KernelError {
+    if let Ok(payload) = serde_json::from_str::<ClaudeErrorResponse>(body) {
+        if payload.error.error_type == "not_found_error"
+            && payload
+                .error
+                .message
+                .to_lowercase()
+                .contains("model:")
+        {
+            return KernelError::Reasoning(format!(
+                "Anthropic model '{model_id}' was not found. Set RETINA_CLAUDE_MODEL to a supported model, for example 'claude-sonnet-4-20250514'."
+            ));
+        }
+        return KernelError::Reasoning(format!(
+            "Anthropic API error (status {status}): {}",
+            payload.error.message
+        ));
+    }
+
+    KernelError::Reasoning(format!(
+        "Anthropic API error (status {status}): {}",
+        body.trim()
+    ))
+}
+
 impl Default for ClaudeReasoner {
     fn default() -> Self {
         Self::new()
@@ -80,21 +108,18 @@ impl Default for ClaudeReasoner {
 
 impl Reasoner for ClaudeReasoner {
     fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
-        if let Some(response) = plan_task(&request.context.task, request.context.last_result.as_deref()) {
+        if let Some(response) = plan_task(
+            &request.context.task,
+            request.context.last_result.as_deref(),
+        ) {
             return Ok(response);
         }
 
         self.call_claude(request, false)
-            .or_else(|_| Ok(fallback_response(&request.context.task)))
     }
 
     fn reflect(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
-        self.call_claude(request, true).or_else(|_| {
-            Ok(reflect_task(
-                &request.context.task,
-                request.context.last_result.as_deref(),
-            ))
-        })
+        self.call_claude(request, true)
     }
 
     fn capabilities(&self) -> ReasonerCapabilities {
@@ -109,6 +134,17 @@ impl Reasoner for ClaudeReasoner {
 }
 
 fn build_prompt(request: &ReasonRequest, reflection: bool) -> String {
+    let constraints = if request.constraints.is_empty() {
+        "none".to_string()
+    } else {
+        request
+            .constraints
+            .iter()
+            .map(|constraint| format!("- {constraint}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     format!(
         "You are the Retina agent reasoner.\n\
 Reflection mode: {reflection}.\n\
@@ -125,6 +161,7 @@ Choose exactly one action and return strict JSON with these fields:\n\
 - max_entries\n\
 - max_results\n\
 - max_bytes\n\
+- max_chars\n\
 - overwrite\n\
 - require_approval\n\
 - expect_change\n\
@@ -140,16 +177,37 @@ Supported action types:\n\
 - find_files\n\
 - search_text\n\
 - read_file\n\
+- extract_document_text\n\
 - write_file\n\
 - append_file\n\
 - record_note\n\
 - respond\n\
 \n\
+Planning rules:\n\
+- The harness is your body. Explore through shell actions instead of guessing.\n\
+- Use the smallest useful next step.\n\
+- Prefer structured filesystem actions over shell commands when possible.\n\
+- Prefer readable text sources such as .md, .txt, code, and config files when multiple candidates could answer the task.\n\
+- Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
+- If the user asks a question about content, gather the evidence first and then finish with respond once you can answer directly.\n\
+- If the last result already gave enough evidence, do not repeat the same exploratory step.\n\
+- If a request needs discovery first, choose the exploratory action and set task_complete=false.\n\
+- Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
+\n\
+Constraints:\n\
+{}\n\
+\n\
 Prefer structured filesystem actions over shell commands when possible.\n\
 Only use run_command for an explicit shell command or when no structured action fits.\n\
 Write and append actions should normally set require_approval=true.\n\
+You are allowed to explore the workspace in bounded steps.\n\
+Use find_files, list_directory, search_text, and read_file to discover what you need before acting.\n\
+Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
+If a request needs discovery first, choose the exploratory action and set task_complete=false.\n\
+Path hints like Desktop, Documents, Downloads, and ~/ refer to locations under the user's home directory.\n\
 \n\
 Context:\n{}",
+        constraints,
         request.context.render()
     )
 }
@@ -165,12 +223,41 @@ fn extract_json_blob(text: &str) -> Result<String> {
             .join("\n");
         return Ok(body.trim().to_string());
     }
-    Ok(trimmed.to_string())
+
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return Ok(trimmed.to_string());
+    }
+
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if start < end {
+            let candidate = trimmed[start..=end].trim();
+            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                return Ok(candidate.to_string());
+            }
+        }
+    }
+
+    Err(KernelError::Reasoning(format!(
+        "Claude did not return parseable JSON. Raw response: {}",
+        trimmed
+    )))
 }
 
 #[derive(Debug, Deserialize)]
 struct ClaudeResponse {
     content: Vec<ClaudeContentBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeErrorResponse {
+    error: ClaudeErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeErrorBody {
+    #[serde(rename = "type")]
+    error_type: String,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -195,6 +282,7 @@ struct ClaudeAction {
     max_entries: Option<usize>,
     max_results: Option<usize>,
     max_bytes: Option<usize>,
+    max_chars: Option<usize>,
     overwrite: Option<bool>,
     require_approval: Option<bool>,
     expect_change: Option<bool>,
@@ -247,6 +335,11 @@ impl ClaudeAction {
                 path: self.path.unwrap_or_else(|| ".".to_string()).into(),
                 max_bytes: self.max_bytes,
             },
+            "extract_document_text" => Action::ExtractDocumentText {
+                id: ActionId::new(),
+                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
+                max_chars: self.max_chars,
+            },
             "write_file" => Action::WriteFile {
                 id: ActionId::new(),
                 path: self
@@ -296,5 +389,28 @@ mod tests {
         let body =
             extract_json_blob("```json\n{\"type\":\"respond\",\"message\":\"hi\"}\n```").unwrap();
         assert_eq!(body, "{\"type\":\"respond\",\"message\":\"hi\"}");
+    }
+
+    #[test]
+    fn anthropic_not_found_model_error_is_mapped_clearly() {
+        let error = map_claude_error(
+            404,
+            r#"{"type":"error","error":{"type":"not_found_error","message":"model: bad-model"},"request_id":"req_test"}"#,
+            "bad-model",
+        );
+        let KernelError::Reasoning(message) = error else {
+            panic!("expected reasoning error");
+        };
+        assert!(message.contains("RETINA_CLAUDE_MODEL"));
+        assert!(message.contains("bad-model"));
+    }
+
+    #[test]
+    fn json_blob_is_extracted_from_prefixed_text() {
+        let body = extract_json_blob(
+            "Here is the JSON you requested:\n{\n  \"type\":\"respond\",\n  \"message\":\"hi\"\n}",
+        )
+        .unwrap();
+        assert_eq!(body, "{\n  \"type\":\"respond\",\n  \"message\":\"hi\"\n}");
     }
 }

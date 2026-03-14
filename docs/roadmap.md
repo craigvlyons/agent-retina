@@ -102,7 +102,7 @@ Outcome:
 
 ## Current Position
 
-Retina is between Phase 1 and Phase 2.
+Retina is between Phase 2 and Phase 3.
 
 Done:
 - workspace and private runtime
@@ -114,12 +114,13 @@ Done:
 - Claude-backed reasoner
 - timeline persistence
 - first learning and reflex promotion path
+- first specialist-ready authority seam via manifest-scoped shell policy
 
 Still needed before we leave the first chamber:
 - better multi-step execution
 - better autonomy for real work
-- operator stop controls
-- stronger consolidation and reuse of learned behavior
+- stronger repeated-task reuse
+- richer scoped specialist lifecycle and routing seams before real spawning
 
 ## Build Sequence
 
@@ -134,6 +135,7 @@ Finish the first worker:
 ### Next
 
 Add specialist growth paths:
+- keep authority and manifest scope explicit
 - code specialist
 - browser specialist
 - research specialist

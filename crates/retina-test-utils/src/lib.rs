@@ -2,6 +2,7 @@ use chrono::Utc;
 use retina_traits::{Memory, Reasoner, Shell};
 use retina_types::*;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -102,8 +103,78 @@ impl Memory for MockMemory {
         Ok(())
     }
 
-    fn consolidate(&self, _config: &ConsolidationConfig) -> Result<ConsolidationReport> {
-        Ok(ConsolidationReport::default())
+    fn consolidate(&self, config: &ConsolidationConfig) -> Result<ConsolidationReport> {
+        let experiences = self.experiences.lock().unwrap().clone();
+        let mut grouped: HashMap<(String, String), (Action, usize, f64)> = HashMap::new();
+
+        for experience in experiences {
+            if experience.utility < config.min_success_utility {
+                continue;
+            }
+            let Some(task) = experience
+                .metadata
+                .get("task")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(action) = experience
+                .metadata
+                .get("action")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Action>(value).ok())
+            else {
+                continue;
+            };
+            if matches!(
+                action,
+                Action::Respond { .. }
+                    | Action::RecordNote { .. }
+                    | Action::InspectWorkingDirectory { .. }
+            ) {
+                continue;
+            }
+
+            let key = (task.to_lowercase(), experience.action_summary.clone());
+            let entry = grouped.entry(key).or_insert((action, 0, 0.0));
+            entry.1 += 1;
+            entry.2 += experience.utility;
+        }
+
+        let mut promoted = 0;
+        let mut rules = self.rules.lock().unwrap();
+        for ((task, action_summary), (action, count, utility_total)) in grouped {
+            if count < config.min_successful_repeats {
+                continue;
+            }
+            let confidence =
+                ((utility_total / count as f64).clamp(0.0, 1.0) * 0.65) + (0.35 * 0.75);
+            if confidence < config.min_rule_confidence {
+                continue;
+            }
+            let name = format!("consolidated:{}:{}", task, action_summary);
+            let exists = rules.iter().any(|rule| rule.name == name);
+            if !exists {
+                rules.push(ReflexiveRule {
+                    id: Some(RuleId::new()),
+                    name,
+                    condition: RuleCondition::TaskContains(task),
+                    action: RuleAction::UseAction(action),
+                    confidence,
+                    active: true,
+                    last_fired: None,
+                });
+                promoted += 1;
+            }
+        }
+
+        Ok(ConsolidationReport {
+            merged_knowledge: 0,
+            promoted_rules: promoted,
+            compacted_events: 0,
+        })
     }
 
     fn backup(&self, _path: &Path) -> Result<()> {
@@ -114,6 +185,10 @@ impl Memory for MockMemory {
 impl MockMemory {
     pub fn rule_count(&self) -> usize {
         self.rules.lock().unwrap().len()
+    }
+
+    pub fn experiences(&self) -> Vec<Experience> {
+        self.experiences.lock().unwrap().clone()
     }
 }
 
@@ -290,6 +365,16 @@ impl Shell for MockShell {
                 content: "mock-content".to_string(),
                 truncated: false,
             }),
+            Action::ExtractDocumentText { path, .. } => Ok(ActionResult::DocumentText {
+                path: path.clone(),
+                content: "mock-document-content".to_string(),
+                truncated: false,
+                format: path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("document")
+                    .to_string(),
+            }),
             Action::WriteFile { path, content, .. } => Ok(ActionResult::FileWrite {
                 path: path.clone(),
                 bytes_written: content.len(),
@@ -323,6 +408,7 @@ impl Shell for MockShell {
             can_read_files: true,
             can_write_files: true,
             can_search_files: true,
+            can_extract_documents: true,
             can_write_notes: true,
             can_respond_text: true,
         }

@@ -165,6 +165,11 @@ pub enum Action {
         path: PathBuf,
         max_bytes: Option<usize>,
     },
+    ExtractDocumentText {
+        id: ActionId,
+        path: PathBuf,
+        max_chars: Option<usize>,
+    },
     WriteFile {
         id: ActionId,
         path: PathBuf,
@@ -198,6 +203,7 @@ impl Action {
             | Self::FindFiles { id, .. }
             | Self::SearchText { id, .. }
             | Self::ReadFile { id, .. }
+            | Self::ExtractDocumentText { id, .. }
             | Self::WriteFile { id, .. }
             | Self::AppendFile { id, .. }
             | Self::RecordNote { id, .. }
@@ -215,6 +221,7 @@ impl Action {
             | Self::FindFiles { .. }
             | Self::SearchText { .. }
             | Self::ReadFile { .. }
+            | Self::ExtractDocumentText { .. }
             | Self::RecordNote { .. }
             | Self::Respond { .. } => false,
         }
@@ -257,6 +264,7 @@ impl Action {
                 include_last_command: false,
             },
             Self::ReadFile { path, .. }
+            | Self::ExtractDocumentText { path, .. }
             | Self::WriteFile { path, .. }
             | Self::AppendFile { path, .. } => HashScope {
                 tracked_paths: vec![TrackedPath {
@@ -352,6 +360,12 @@ pub enum ActionResult {
         path: PathBuf,
         content: String,
         truncated: bool,
+    },
+    DocumentText {
+        path: PathBuf,
+        content: String,
+        truncated: bool,
+        format: String,
     },
     TextSearch {
         root: PathBuf,
@@ -520,6 +534,7 @@ pub enum TimelineEventType {
     StateDeltaComputed,
     ExperiencePersisted,
     UtilityScored,
+    ConsolidationCompleted,
     ReflectionRequested,
     ReflectionCompleted,
     TaskStepCompleted,
@@ -547,6 +562,8 @@ pub struct AssembledContext {
     pub tools: Vec<ToolDescriptor>,
     pub memory_slice: Vec<String>,
     pub last_result: Option<String>,
+    pub last_result_summary: Option<String>,
+    pub recent_steps: Vec<String>,
     pub current_step: usize,
     pub max_steps: usize,
 }
@@ -560,14 +577,23 @@ impl AssembledContext {
             .collect::<Vec<_>>()
             .join("\n");
         let memory = self.memory_slice.join("\n");
+        let recent_steps = if self.recent_steps.is_empty() {
+            "none".to_string()
+        } else {
+            self.recent_steps.join("\n")
+        };
         format!(
-            "Identity:\n{}\n\nTask:\n{}\n\nStep:\n{} / {}\n\nTools:\n{}\n\nMemory:\n{}\n\nLast result:\n{}",
+            "Identity:\n{}\n\nTask:\n{}\n\nStep:\n{} / {}\n\nTools:\n{}\n\nMemory:\n{}\n\nRecent steps:\n{}\n\nLast result summary:\n{}\n\nLast result:\n{}",
             self.identity,
             self.task,
             self.current_step,
             self.max_steps,
             tools,
             memory,
+            recent_steps,
+            self.last_result_summary
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
             self.last_result
                 .clone()
                 .unwrap_or_else(|| "none".to_string())
@@ -618,6 +644,7 @@ pub struct ShellCapabilities {
     pub can_read_files: bool,
     pub can_write_files: bool,
     pub can_search_files: bool,
+    pub can_extract_documents: bool,
     pub can_write_notes: bool,
     pub can_respond_text: bool,
 }
@@ -643,6 +670,9 @@ pub struct AgentManifest {
     pub status: AgentStatus,
     pub description: String,
     pub created_at: DateTime<Utc>,
+    pub parent_agent_id: Option<AgentId>,
+    pub capabilities: Vec<String>,
+    pub authority: AgentAuthority,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -651,6 +681,31 @@ pub enum AgentStatus {
     Running,
     Idle,
     Archived,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentAuthority {
+    pub allow_command_execution: bool,
+    pub allow_file_reads: bool,
+    pub allow_file_writes: bool,
+    pub allow_file_search: bool,
+    pub allow_notes: bool,
+    pub allow_text_responses: bool,
+    pub accessible_roots: Vec<PathBuf>,
+}
+
+impl Default for AgentAuthority {
+    fn default() -> Self {
+        Self {
+            allow_command_execution: true,
+            allow_file_reads: true,
+            allow_file_writes: true,
+            allow_file_search: true,
+            allow_notes: true,
+            allow_text_responses: true,
+            accessible_roots: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -666,9 +721,23 @@ pub struct RuleUpdate {
     pub last_fired: Option<DateTime<Utc>>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsolidationConfig {
     pub max_recent_states: usize,
+    pub min_successful_repeats: usize,
+    pub min_success_utility: f64,
+    pub min_rule_confidence: f64,
+}
+
+impl Default for ConsolidationConfig {
+    fn default() -> Self {
+        Self {
+            max_recent_states: 0,
+            min_successful_repeats: 3,
+            min_success_utility: 0.5,
+            min_rule_confidence: 0.8,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
