@@ -1,3 +1,4 @@
+use crate::controller::WorkerOverview;
 use retina_memory_sqlite::MemoryStats;
 use retina_types::*;
 use serde_json::Value;
@@ -267,13 +268,21 @@ fn humanize_action_label(label: &str) -> String {
 pub fn render_memory_inspection(knowledge: &[KnowledgeNode], experiences: &[Experience]) -> String {
     let mut output = String::from("Knowledge:\n");
     for item in knowledge {
-        output.push_str(&format!("- [{}] {}\n", item.category, item.content));
+        output.push_str(&format!(
+            "- [{}] {} (confidence {:.2})\n",
+            item.category, item.content, item.confidence
+        ));
     }
     output.push_str("\nExperiences:\n");
     for item in experiences {
+        let task = item
+            .metadata
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("(unknown task)");
         output.push_str(&format!(
-            "- {} => {} ({:.2})\n",
-            item.action_summary, item.outcome, item.utility
+            "- task={} | {} => {} ({:.2})\n",
+            task, item.action_summary, item.outcome, item.utility
         ));
     }
     output
@@ -312,6 +321,94 @@ pub fn render_agent_registry(registry: &AgentRegistrySnapshot) -> String {
         }
     }
     output
+}
+
+pub fn render_cleanup_report(
+    report: &ConsolidationReport,
+    keep_events: usize,
+    stale_knowledge_days: u64,
+    optimize: bool,
+) -> String {
+    format!(
+        "cleanup complete\nkeep_events: {}\nstale_knowledge_days: {}\noptimize: {}\nmerged_knowledge: {}\npromoted_rules: {}\ncompacted_events: {}\ndecayed_knowledge: {}\noptimized: {}\n",
+        keep_events,
+        stale_knowledge_days,
+        optimize,
+        report.merged_knowledge,
+        report.promoted_rules,
+        report.compacted_events,
+        report.decayed_knowledge,
+        report.optimized
+    )
+}
+
+pub fn render_worker_overview(overview: &WorkerOverview) -> String {
+    let authority_roots = if overview.manifest.authority.accessible_roots.is_empty() {
+        "(unscoped)".to_string()
+    } else {
+        overview
+            .manifest
+            .authority
+            .accessible_roots
+            .iter()
+            .take(4)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let active_rule_preview = if overview.active_rules.is_empty() {
+        "(none)".to_string()
+    } else {
+        overview
+            .active_rules
+            .iter()
+            .take(5)
+            .map(|rule| format!("{} ({:.2})", rule.name, rule.confidence))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    format!(
+        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
+        overview.manifest.agent_id.0,
+        overview.manifest.domain,
+        overview.manifest.status,
+        overview.manifest.lifecycle.phase,
+        overview
+            .manifest
+            .lifecycle
+            .status_reason
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        overview
+            .manifest
+            .lifecycle
+            .last_active_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "never".to_string()),
+        overview.db_path.display(),
+        overview.db_size_bytes as f64 / (1024.0 * 1024.0),
+        overview.stats.timeline_events,
+        overview.stats.experiences,
+        overview.stats.knowledge,
+        overview.stats.rules,
+        overview.stats.tools,
+        overview.terminal_tasks.completed,
+        overview.terminal_tasks.failed,
+        overview.terminal_tasks.cancelled,
+        overview.terminal_tasks.blocked,
+        overview.manifest.budget.max_steps_per_task,
+        overview.manifest.budget.max_reasoner_calls_per_task,
+        overview.manifest.budget.max_tokens_per_task,
+        overview
+            .manifest
+            .budget
+            .idle_archive_after_hours
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        authority_roots,
+        active_rule_preview
+    )
 }
 
 pub fn render_stats(stats: &MemoryStats) -> String {

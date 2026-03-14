@@ -80,7 +80,7 @@ fn plan_follow_up_action(task: &str, last_result: Option<&str>) -> Option<Action
     let lower = task.to_lowercase();
 
     match result {
-        ActionResult::FileMatches { matches, .. } if task_requires_find_follow_up(task) => {
+        ActionResult::FileMatches { matches, .. } if task_requires_content_follow_up(task) => {
             let path = pick_preferred_path(&matches)?;
             if mentions_directory_contents(task) {
                 Some(Action::ListDirectory {
@@ -89,14 +89,18 @@ fn plan_follow_up_action(task: &str, last_result: Option<&str>) -> Option<Action
                     recursive: false,
                     max_entries: 100,
                 })
-            } else if lower.contains("read") || lower.contains("open") {
-                Some(content_action_for_path(path))
             } else if lower.contains("inspect") {
                 Some(Action::InspectPath {
                     id: ActionId::new(),
                     path,
                     include_content: true,
                 })
+            } else if asks_for_content_answer(task)
+                || lower.contains("read")
+                || lower.contains("open")
+                || lower.contains("summarize")
+            {
+                Some(content_action_for_path(path))
             } else {
                 None
             }
@@ -114,7 +118,7 @@ fn plan_follow_up_action(task: &str, last_result: Option<&str>) -> Option<Action
     }
 }
 
-fn task_requires_find_follow_up(task: &str) -> bool {
+fn task_requires_content_follow_up(task: &str) -> bool {
     let lower = task.to_lowercase();
     (lower.contains("find") || lower.contains("locate"))
         && (lower.contains(" and read")
@@ -123,6 +127,8 @@ fn task_requires_find_follow_up(task: &str) -> bool {
             || lower.contains(" then open")
             || lower.contains(" and inspect")
             || lower.contains(" then inspect")
+            || asks_for_content_answer(task)
+            || lower.contains("summarize")
             || mentions_directory_contents(&lower))
 }
 
@@ -138,8 +144,33 @@ fn task_requires_search_follow_up(task: &str) -> bool {
 fn pick_preferred_path(paths: &[PathBuf]) -> Option<PathBuf> {
     paths
         .iter()
-        .min_by_key(|path| path.components().count())
+        .min_by_key(|path| {
+            (
+                readability_rank(path),
+                path.components().count(),
+                path.to_string_lossy().len(),
+            )
+        })
         .cloned()
+}
+
+fn readability_rank(path: &PathBuf) -> usize {
+    if path.is_dir() {
+        return 0;
+    }
+    match path.extension().and_then(|value| value.to_str()) {
+        Some(ext)
+            if matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "md" | "txt" | "rs" | "toml" | "json" | "yaml" | "yml" | "js" | "ts" | "tsx"
+            ) =>
+        {
+            0
+        }
+        Some("pdf") => 1,
+        Some(_) => 2,
+        None => 1,
+    }
 }
 
 fn mentions_directory_contents(task: &str) -> bool {
@@ -150,6 +181,26 @@ fn mentions_directory_contents(task: &str) -> bool {
         || lower.contains("list the files")
         || lower.contains("what is in")
         || lower.contains("what's in")
+}
+
+fn asks_for_content_answer(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    [
+        "tell me",
+        "summarize",
+        "what is",
+        "what's",
+        "which",
+        "who",
+        "where",
+        "when",
+        "last job",
+        "latest role",
+        "most recent",
+        "current position",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 fn content_action_for_path(path: PathBuf) -> Action {
@@ -243,5 +294,22 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn plans_follow_up_read_for_content_question_after_find() {
+        let previous = serde_json::to_string(&ActionResult::FileMatches {
+            root: "Desktop/resume".into(),
+            pattern: "Craig Lyons resume.md".to_string(),
+            matches: vec!["Desktop/resume/Craig Lyons resume.md".into()],
+        })
+        .unwrap();
+        let response = plan_task(
+            "find the craig lyons resume.md file and tell me what my last job was",
+            Some(&previous),
+        )
+        .unwrap();
+        assert!(matches!(response.action, Action::ReadFile { .. }));
+        assert!(response.task_complete);
     }
 }

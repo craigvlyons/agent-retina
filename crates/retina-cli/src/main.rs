@@ -2,6 +2,7 @@ mod app;
 mod chat;
 mod cli;
 mod controller;
+mod maintenance;
 mod output;
 mod runtime;
 

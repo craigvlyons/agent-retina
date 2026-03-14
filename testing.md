@@ -119,7 +119,9 @@ While using `retina chat`:
 
 Outside chat:
 
+- `cargo run -p retina-cli -- inspect overview` shows one worker-health view with lifecycle, storage, budgets, and recent task outcomes
 - `cargo run -p retina-cli -- inspect agents` shows the current registry and manifest lifecycle state
+- `cargo run -p retina-cli -- cleanup --keep-events 2000 --stale-knowledge-days 30` runs the current explicit memory cleanup pass
 
 ## Suggested Testing Order
 

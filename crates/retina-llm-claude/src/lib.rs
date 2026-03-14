@@ -189,6 +189,9 @@ Planning rules:\n\
 - Prefer structured filesystem actions over shell commands when possible.\n\
 - Prefer readable text sources such as .md, .txt, code, and config files when multiple candidates could answer the task.\n\
 - Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
+- When a prior result already includes likely candidate paths, choose the best next read or document extraction step instead of searching again.\n\
+- When the last result already contains enough evidence to answer the user, respond directly instead of repeating exploration.\n\
+- If multiple files match, prefer the shallowest and most human-readable candidate unless the task explicitly asks for another one.\n\
 - If the user asks a question about content, gather the evidence first and then finish with respond once you can answer directly.\n\
 - If the last result already gave enough evidence, do not repeat the same exploratory step.\n\
 - If a request needs discovery first, choose the exploratory action and set task_complete=false.\n\

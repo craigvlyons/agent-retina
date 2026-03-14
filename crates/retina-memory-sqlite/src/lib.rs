@@ -685,12 +685,42 @@ impl Memory for SqliteMemory {
                     .map_err(to_storage)?;
                 if let Some(threshold) = threshold {
                     let compacted = conn
-                        .execute("DELETE FROM timeline_events WHERE timestamp < ?1", params![threshold])
+                        .execute(
+                            "DELETE FROM timeline_events WHERE timestamp <= ?1",
+                            params![threshold],
+                        )
                         .map_err(to_storage)?;
-                    conn.execute("DELETE FROM state_log WHERE timestamp < ?1", params![threshold])
+                    conn.execute(
+                        "DELETE FROM state_log WHERE timestamp <= ?1",
+                        params![threshold],
+                    )
                         .map_err(to_storage)?;
                     report.compacted_events = compacted;
                 }
+            }
+
+            if let Some(days) = config.stale_knowledge_days {
+                let threshold = Utc::now() - chrono::Duration::days(days as i64);
+                let decayed = conn
+                    .execute(
+                        "UPDATE knowledge
+                         SET confidence = CASE
+                                WHEN confidence > 0.10 THEN MAX(confidence * 0.9, 0.10)
+                                ELSE confidence
+                             END,
+                             updated_at = ?2
+                         WHERE updated_at < ?1",
+                        params![threshold.to_rfc3339(), Utc::now().to_rfc3339()],
+                    )
+                    .map_err(to_storage)?;
+                report.decayed_knowledge = decayed;
+            }
+
+            if config.optimize_after_cleanup {
+                conn.execute("INSERT INTO knowledge_fts(knowledge_fts) VALUES('optimize')", [])
+                    .map_err(to_storage)?;
+                conn.execute_batch("PRAGMA optimize;").map_err(to_storage)?;
+                report.optimized = true;
             }
             Ok(report)
         })
@@ -1209,6 +1239,85 @@ mod tests {
         assert_eq!(registry.active_agents.len(), 1);
         assert_eq!(registry.archived_agents.len(), 1);
         assert_eq!(registry.archived_agents[0].domain, "research");
+    }
+
+    #[test]
+    fn consolidation_can_decay_stale_knowledge_and_trim_old_timeline() {
+        let memory = SqliteMemory::open_in_memory().unwrap();
+        let stale_time = Utc::now() - chrono::Duration::days(45);
+        let recent_time = Utc::now();
+
+        memory
+            .append_timeline_event(&TimelineEvent {
+                event_id: EventId::new(),
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                agent_id: AgentId::new(),
+                timestamp: stale_time,
+                event_type: TimelineEventType::TaskReceived,
+                intent_id: None,
+                action_id: None,
+                pre_state_hash: None,
+                post_state_hash: None,
+                delta_summary: None,
+                duration_ms: None,
+                payload_json: json!({}),
+            })
+            .unwrap();
+        memory
+            .append_timeline_event(&TimelineEvent {
+                event_id: EventId::new(),
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                agent_id: AgentId::new(),
+                timestamp: recent_time,
+                event_type: TimelineEventType::TaskCompleted,
+                intent_id: None,
+                action_id: None,
+                pre_state_hash: None,
+                post_state_hash: None,
+                delta_summary: None,
+                duration_ms: None,
+                payload_json: json!({}),
+            })
+            .unwrap();
+
+        let stale = KnowledgeNode {
+            id: None,
+            category: "lesson".to_string(),
+            content: "Old lesson".to_string(),
+            confidence: 0.9,
+            created_at: stale_time,
+            updated_at: stale_time,
+            metadata: json!({}),
+        };
+        let knowledge_id = memory.store_knowledge(&stale).unwrap();
+
+        let report = memory
+            .consolidate(&ConsolidationConfig {
+                max_recent_states: 1,
+                stale_knowledge_days: Some(30),
+                optimize_after_cleanup: true,
+                ..ConsolidationConfig::default()
+            })
+            .unwrap();
+
+        assert_eq!(report.compacted_events, 1);
+        assert_eq!(report.decayed_knowledge, 1);
+        assert!(report.optimized);
+        assert_eq!(memory.recent_states(10).unwrap().len(), 1);
+
+        let confidence: f64 = memory
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT confidence FROM knowledge WHERE id = ?1",
+                    params![knowledge_id.0],
+                    |row| row.get(0),
+                )
+                .map_err(to_storage)
+            })
+            .unwrap();
+        assert!(confidence < 0.9);
     }
 
     #[test]

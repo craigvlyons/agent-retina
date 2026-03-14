@@ -6,6 +6,8 @@ use retina_memory_sqlite::{MemoryStats, SqliteMemory};
 use retina_shell_cli::{CliShell, ScopedShell};
 use retina_traits::{Memory, Shell};
 use retina_types::*;
+use std::panic::{self, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 use std::thread;
 
@@ -89,18 +91,9 @@ impl AgentController {
         config: ExecutionConfig,
     ) -> Result<Outcome> {
         let task = Task::new(root_agent_id(), task_description.into());
-        update_root_manifest_state(
-            AgentStatus::Running,
-            AgentLifecyclePhase::Busy,
-            Some("executing task"),
-        )?;
-        let outcome = self.kernel.execute_task_with_config(task, config);
-        update_root_manifest_state(
-            AgentStatus::Idle,
-            AgentLifecyclePhase::CoolingDown,
-            Some("waiting for next task"),
-        )?;
-        outcome
+        self.execute_with_root_state(task, move |kernel, task| {
+            kernel.execute_task_with_config(task, config)
+        })
     }
 
     pub fn spawn_task(
@@ -121,7 +114,7 @@ impl AgentController {
                 AgentLifecyclePhase::Busy,
                 Some("executing task"),
             );
-            let outcome = kernel.execute_task_with_config(task_for_thread, config);
+            let outcome = run_task_catching_panics(&kernel, task_for_thread, config);
             let _ = update_root_manifest_state(
                 AgentStatus::Idle,
                 AgentLifecyclePhase::CoolingDown,
@@ -145,6 +138,22 @@ impl RunningTask {
 
 pub struct InspectController {
     memory: SqliteMemory,
+}
+
+pub struct WorkerOverview {
+    pub manifest: AgentManifest,
+    pub stats: MemoryStats,
+    pub db_path: PathBuf,
+    pub db_size_bytes: u64,
+    pub terminal_tasks: TerminalTaskStats,
+    pub active_rules: Vec<ReflexiveRule>,
+}
+
+pub struct TerminalTaskStats {
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub blocked: usize,
 }
 
 impl InspectController {
@@ -173,6 +182,33 @@ impl InspectController {
         self.memory.stats()
     }
 
+    pub fn worker_overview(&self) -> Result<WorkerOverview> {
+        let db_path = root_db_path()?;
+        let manifest = self
+            .memory
+            .load_manifest(&root_agent_id())?
+            .unwrap_or(root_manifest()?);
+        let stats = self.memory.stats()?;
+        let terminal_tasks = summarize_terminal_tasks(&self.memory.recent_states(200)?);
+        let active_rules = self.memory.active_rules()?;
+        let db_size_bytes = std::fs::metadata(&db_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+
+        Ok(WorkerOverview {
+            manifest,
+            stats,
+            db_path,
+            db_size_bytes,
+            terminal_tasks,
+            active_rules,
+        })
+    }
+
+    pub fn cleanup_memory(&self, config: ConsolidationConfig) -> Result<ConsolidationReport> {
+        self.memory.consolidate(&config)
+    }
+
     pub fn agent_registry(&self) -> Result<AgentRegistrySnapshot> {
         self.memory.agent_registry()
     }
@@ -180,6 +216,44 @@ impl InspectController {
     pub fn append_timeline_event(&self, event: &TimelineEvent) -> Result<()> {
         self.memory.append_timeline_event(event)
     }
+}
+
+impl AgentController {
+    fn execute_with_root_state(
+        &self,
+        task: Task,
+        run: impl FnOnce(&Kernel, Task) -> Result<Outcome>,
+    ) -> Result<Outcome> {
+        update_root_manifest_state(
+            AgentStatus::Running,
+            AgentLifecyclePhase::Busy,
+            Some("executing task"),
+        )?;
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&self.kernel, task)))
+            .unwrap_or_else(|panic_payload| Err(task_panic_error(panic_payload)));
+        let reset_result = update_root_manifest_state(
+            AgentStatus::Idle,
+            AgentLifecyclePhase::CoolingDown,
+            Some("waiting for next task"),
+        );
+        match (outcome, reset_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(primary), Err(_secondary)) => Err(primary),
+        }
+    }
+}
+
+fn run_task_catching_panics(
+    kernel: &Kernel,
+    task: Task,
+    config: ExecutionConfig,
+) -> Result<Outcome> {
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        kernel.execute_task_with_config(task, config)
+    }))
+    .unwrap_or_else(|panic_payload| Err(task_panic_error(panic_payload)))
 }
 
 fn update_root_manifest_state(
@@ -199,4 +273,51 @@ fn update_root_manifest_state(
 fn write_root_manifest_file(manifest: &AgentManifest) -> Result<()> {
     let path = retina_home()?.join("root").join("manifest.toml");
     retina_memory_sqlite::write_manifest(path, manifest)
+}
+
+fn task_panic_error(panic_payload: Box<dyn std::any::Any + Send>) -> KernelError {
+    let message = if let Some(text) = panic_payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = panic_payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic payload".to_string()
+    };
+    KernelError::Execution(format!("task execution panicked: {message}"))
+}
+
+fn summarize_terminal_tasks(events: &[TimelineEvent]) -> TerminalTaskStats {
+    let mut stats = TerminalTaskStats {
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        blocked: 0,
+    };
+
+    for event in events {
+        match event.event_type {
+            TimelineEventType::TaskCompleted => stats.completed += 1,
+            TimelineEventType::TaskFailed => stats.failed += 1,
+            TimelineEventType::TaskCancelled => stats.cancelled += 1,
+            _ => {
+                if matches!(event.event_type, TimelineEventType::TaskStepCompleted) {
+                    continue;
+                }
+                if let TimelineEventType::TaskFailed = event.event_type {
+                    continue;
+                }
+                if event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    .map(|reason| reason.contains("blocked"))
+                    .unwrap_or(false)
+                {
+                    stats.blocked += 1;
+                }
+            }
+        }
+    }
+
+    stats
 }

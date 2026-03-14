@@ -900,6 +900,8 @@ pub struct ConsolidationConfig {
     pub min_successful_repeats: usize,
     pub min_success_utility: f64,
     pub min_rule_confidence: f64,
+    pub stale_knowledge_days: Option<u64>,
+    pub optimize_after_cleanup: bool,
 }
 
 impl Default for ConsolidationConfig {
@@ -909,6 +911,8 @@ impl Default for ConsolidationConfig {
             min_successful_repeats: 3,
             min_success_utility: 0.5,
             min_rule_confidence: 0.8,
+            stale_knowledge_days: None,
+            optimize_after_cleanup: false,
         }
     }
 }
@@ -918,6 +922,8 @@ pub struct ConsolidationReport {
     pub merged_knowledge: usize,
     pub promoted_rules: usize,
     pub compacted_events: usize,
+    pub decayed_knowledge: usize,
+    pub optimized: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -614,16 +614,25 @@ impl Kernel {
             memory_slice: experiences
                 .into_iter()
                 .map(|experience| {
+                    let prior_task = experience
+                        .metadata
+                        .get("task")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
                     format!(
-                        "experience: {} ({})",
-                        experience.action_summary, experience.outcome
+                        "experience: task={} action={} outcome={} utility={:.2}",
+                        prior_task,
+                        experience.action_summary,
+                        experience.outcome,
+                        experience.utility
                     )
                 })
-                .chain(
-                    knowledge
-                        .into_iter()
-                        .map(|item| format!("knowledge: {}", item.content)),
-                )
+                .chain(knowledge.into_iter().map(|item| {
+                    format!(
+                        "knowledge: {} (confidence {:.2})",
+                        item.content, item.confidence
+                    )
+                }))
                 .collect(),
             last_result,
             last_result_summary,
@@ -741,7 +750,7 @@ impl TaskLoopState {
                     repeated_without_progress = *count > 1;
                 }
                 Some(
-                    serde_json::to_string(result)
+                    compact_action_result_for_context(result)
                         .map_err(|error| KernelError::Reasoning(error.to_string()))?,
                 )
             }
@@ -1045,28 +1054,31 @@ fn summarize_action_result(result: &ActionResult) -> String {
         ),
         ActionResult::Inspection(world) => format!("inspected {} path(s)", world.files.len()),
         ActionResult::DirectoryListing { root, entries } => format!(
-            "listed {} entr{} under {}",
+            "listed {} entr{} under {} [{}]",
             entries.len(),
             if entries.len() == 1 { "y" } else { "ies" },
-            root.display()
+            root.display(),
+            preview_paths(entries.iter().map(|entry| entry.path.clone()).collect())
         ),
         ActionResult::FileMatches {
             pattern, matches, ..
         } => format!(
-            "found {} match{} for {}",
+            "found {} match{} for {} [{}]",
             matches.len(),
             if matches.len() == 1 { "" } else { "es" },
-            pattern
+            pattern,
+            preview_paths(matches.clone())
         ),
         ActionResult::FileRead {
             path,
             content,
             truncated,
         } => format!(
-            "read {} ({} chars{})",
+            "read {} ({} chars{}): {}",
             path.display(),
             content.chars().count(),
-            if *truncated { ", truncated" } else { "" }
+            if *truncated { ", truncated" } else { "" },
+            preview_text(content, 120)
         ),
         ActionResult::DocumentText {
             path,
@@ -1074,17 +1086,19 @@ fn summarize_action_result(result: &ActionResult) -> String {
             truncated,
             format,
         } => format!(
-            "extracted {} text from {} ({} chars{})",
+            "extracted {} text from {} ({} chars{}): {}",
             format,
             path.display(),
             content.chars().count(),
-            if *truncated { ", truncated" } else { "" }
+            if *truncated { ", truncated" } else { "" },
+            preview_text(content, 120)
         ),
         ActionResult::TextSearch { query, matches, .. } => format!(
-            "found {} text match{} for {}",
+            "found {} text match{} for {} [{}]",
             matches.len(),
             if matches.len() == 1 { "" } else { "es" },
-            query
+            query,
+            preview_search_matches(matches)
         ),
         ActionResult::FileWrite {
             path,
@@ -1099,6 +1113,156 @@ fn summarize_action_result(result: &ActionResult) -> String {
         ActionResult::NoteRecorded { note } => format!("recorded note: {}", note),
         ActionResult::Response { message } => format!("responded: {}", message),
     }
+}
+
+fn compact_action_result_for_context(result: &ActionResult) -> serde_json::Result<String> {
+    let compact = match result {
+        ActionResult::Command(command) => serde_json::json!({
+            "type": "command",
+            "command": command.command,
+            "cwd": command.cwd,
+            "success": command.success,
+            "exit_code": command.exit_code,
+            "cancelled": command.cancelled,
+            "termination": command.termination,
+            "stdout": preview_text(&command.stdout, 2000),
+            "stderr": preview_text(&command.stderr, 1000),
+        }),
+        ActionResult::Inspection(world) => serde_json::json!({
+            "type": "inspection",
+            "cwd": world.cwd,
+            "paths": world
+                .files
+                .iter()
+                .take(8)
+                .map(|path| path.path.display().to_string())
+                .collect::<Vec<_>>(),
+        }),
+        ActionResult::DirectoryListing { root, entries } => serde_json::json!({
+            "type": "directory_listing",
+            "root": root,
+            "count": entries.len(),
+            "entries": entries
+                .iter()
+                .take(12)
+                .map(|entry| serde_json::json!({
+                    "path": entry.path,
+                    "is_dir": entry.is_dir
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        ActionResult::FileMatches {
+            root,
+            pattern,
+            matches,
+        } => serde_json::json!({
+            "type": "file_matches",
+            "root": root,
+            "pattern": pattern,
+            "count": matches.len(),
+            "matches": matches.iter().take(12).collect::<Vec<_>>(),
+        }),
+        ActionResult::FileRead {
+            path,
+            content,
+            truncated,
+        } => serde_json::json!({
+            "type": "file_read",
+            "path": path,
+            "truncated": truncated,
+            "content": preview_text(content, 8000),
+        }),
+        ActionResult::DocumentText {
+            path,
+            content,
+            truncated,
+            format,
+        } => serde_json::json!({
+            "type": "document_text",
+            "path": path,
+            "format": format,
+            "truncated": truncated,
+            "content": preview_text(content, 8000),
+        }),
+        ActionResult::TextSearch {
+            root,
+            query,
+            matches,
+        } => serde_json::json!({
+            "type": "text_search",
+            "root": root,
+            "query": query,
+            "count": matches.len(),
+            "matches": matches
+                .iter()
+                .take(8)
+                .map(|item| serde_json::json!({
+                    "path": item.path,
+                    "line_number": item.line_number,
+                    "line": preview_text(&item.line, 180),
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        ActionResult::FileWrite {
+            path,
+            bytes_written,
+            appended,
+        } => serde_json::json!({
+            "type": "file_write",
+            "path": path,
+            "bytes_written": bytes_written,
+            "appended": appended,
+        }),
+        ActionResult::NoteRecorded { note } => serde_json::json!({
+            "type": "note",
+            "note": preview_text(note, 200),
+        }),
+        ActionResult::Response { message } => serde_json::json!({
+            "type": "response",
+            "message": preview_text(message, 200),
+        }),
+    };
+    serde_json::to_string(&compact)
+}
+
+fn preview_paths(paths: Vec<std::path::PathBuf>) -> String {
+    let preview = paths
+        .into_iter()
+        .take(3)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
+    if preview.is_empty() {
+        return "no examples".to_string();
+    }
+    preview.join(", ")
+}
+
+fn preview_search_matches(matches: &[SearchMatch]) -> String {
+    let preview = matches
+        .iter()
+        .take(3)
+        .map(|item| {
+            format!(
+                "{}:{} {}",
+                item.path.display(),
+                item.line_number,
+                preview_text(&item.line, 60)
+            )
+        })
+        .collect::<Vec<_>>();
+    if preview.is_empty() {
+        return "no examples".to_string();
+    }
+    preview.join(" | ")
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = normalized.chars().take(max_chars).collect::<String>();
+    if normalized.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn repeated_step_signature(action: &Action, result: &ActionResult) -> Option<String> {

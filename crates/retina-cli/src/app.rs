@@ -1,9 +1,10 @@
 use crate::chat::ChatSession;
 use crate::cli::{Cli, Commands, InspectCommands};
 use crate::controller::{AgentController, InspectController};
+use crate::maintenance::run_cleanup;
 use crate::output::{
-    render_action_result, render_agent_registry, render_memory_inspection, render_stats,
-    render_timeline,
+    render_action_result, render_agent_registry, render_cleanup_report, render_memory_inspection,
+    render_stats, render_timeline, render_worker_overview,
 };
 use crate::runtime::init_runtime;
 use clap::Parser;
@@ -14,6 +15,11 @@ pub fn run() -> Result<()> {
     match cli.command {
         Commands::Init => init_runtime(),
         Commands::Run { task } => run_task(task),
+        Commands::Cleanup {
+            keep_events,
+            stale_knowledge_days,
+            optimize,
+        } => cleanup(keep_events, stale_knowledge_days, optimize),
         Commands::Chat => chat(),
         Commands::Inspect { command } => inspect(command),
         Commands::Stats => stats(),
@@ -38,12 +44,25 @@ pub fn chat() -> Result<()> {
     session.run()
 }
 
+pub fn cleanup(keep_events: usize, stale_knowledge_days: u64, optimize: bool) -> Result<()> {
+    let report = run_cleanup(keep_events, stale_knowledge_days, optimize)?;
+    print!(
+        "{}",
+        render_cleanup_report(&report, keep_events, stale_knowledge_days, optimize)
+    );
+    Ok(())
+}
+
 pub fn inspect(command: InspectCommands) -> Result<()> {
     let inspector = InspectController::new()?;
     match command {
         InspectCommands::Timeline => {
             let events = inspector.recent_timeline(50)?;
             print!("{}", render_timeline(&events));
+        }
+        InspectCommands::Overview => {
+            let overview = inspector.worker_overview()?;
+            print!("{}", render_worker_overview(&overview));
         }
         InspectCommands::Agents => {
             let registry = inspector.agent_registry()?;
