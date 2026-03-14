@@ -7,6 +7,7 @@ pub struct TaskState {
     pub goal: TaskGoal,
     pub shape: TaskShape,
     pub progress: TaskProgress,
+    pub output_artifact: Option<OutputArtifactState>,
     pub frontier: TaskFrontier,
     pub recent_actions: Vec<RecentActionSummary>,
     pub working_sources: Vec<WorkingSource>,
@@ -28,6 +29,11 @@ impl TaskState {
         let verified = render_list(&self.progress.verified_facts);
         let open_questions = render_list(&self.frontier.open_questions);
         let blockers = render_list(&self.frontier.blockers);
+        let output_artifact = self
+            .output_artifact
+            .as_ref()
+            .map(OutputArtifactState::render)
+            .unwrap_or_else(|| "none".to_string());
         let next_action = self
             .frontier
             .next_action_hint
@@ -76,7 +82,7 @@ impl TaskState {
             .unwrap_or_else(|| "none".to_string());
 
         format!(
-            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nTask shape:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- completed:\n{}\n- verified_facts:\n{}\n- required_inputs_satisfied: {} / {}\n- output_written: {}\n- output_verified: {}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
+            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nTask shape:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- completed:\n{}\n- verified_facts:\n{}\n- required_inputs_satisfied: {} / {}\n- output_written: {}\n- output_verified: {}\n\nOutput artifact:\n{}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
             self.goal.objective,
             success_criteria,
             constraints,
@@ -90,6 +96,7 @@ impl TaskState {
             self.progress.required_inputs,
             self.progress.output_written,
             self.progress.output_verified,
+            output_artifact,
             next_action,
             open_questions,
             blockers,
@@ -186,6 +193,7 @@ impl RequiredInput {
 pub struct RequestedOutput {
     pub locator_hint: String,
     pub kind: String,
+    pub intent: OutputIntent,
     pub exists: bool,
     pub verified: bool,
 }
@@ -193,9 +201,32 @@ pub struct RequestedOutput {
 impl RequestedOutput {
     pub fn render(&self) -> String {
         format!(
-            "  - {} [{}|exists={}|verified={}]",
-            self.locator_hint, self.kind, self.exists, self.verified
+            "  - {} [{}|intent={}|exists={}|verified={}]",
+            self.locator_hint, self.kind, self.intent, self.exists, self.verified
         )
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OutputIntent {
+    #[default]
+    Unknown,
+    Create,
+    Modify,
+    Append,
+    Overwrite,
+}
+
+impl Display for OutputIntent {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::Unknown => "unknown",
+            Self::Create => "create",
+            Self::Modify => "modify",
+            Self::Append => "append",
+            Self::Overwrite => "overwrite",
+        };
+        f.write_str(label)
     }
 }
 
@@ -211,6 +242,41 @@ pub struct TaskProgress {
     pub satisfied_inputs: usize,
     pub output_written: bool,
     pub output_verified: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputArtifactState {
+    pub locator_hint: String,
+    pub kind: String,
+    pub intent: OutputIntent,
+    pub exists: bool,
+    pub current_content_ingested: bool,
+    pub written_this_run: bool,
+    pub verified: bool,
+    pub last_write_step: Option<usize>,
+    pub last_write_action: Option<String>,
+}
+
+impl OutputArtifactState {
+    pub fn render(&self) -> String {
+        format!(
+            "- {} [{}|intent={}|exists={}|current_content_ingested={}|written_this_run={}|verified={}|last_write_step={}|last_write_action={}]",
+            self.locator_hint,
+            self.kind,
+            self.intent,
+            self.exists,
+            self.current_content_ingested,
+            self.written_this_run,
+            self.verified,
+            self.last_write_step
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            self.last_write_action
+                .clone()
+                .unwrap_or_else(|| "none".to_string())
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -261,6 +327,7 @@ pub struct WorkingSource {
     pub evidence_refs: Vec<String>,
     pub page_reference: Option<String>,
     pub extraction_method: Option<String>,
+    pub structured_summary: Option<StructuredSourceSummary>,
 }
 
 impl WorkingSource {
@@ -275,9 +342,35 @@ impl WorkingSource {
             .as_ref()
             .map(|value| format!(" via {value}"))
             .unwrap_or_default();
+        let structured = self
+            .structured_summary
+            .as_ref()
+            .map(|value| format!(" {}", value.render()))
+            .unwrap_or_default();
         format!(
-            "- {} [{}|{}] {}{}{}",
-            self.locator, self.kind, self.role, self.status, scope, method
+            "- {} [{}|{}] {}{}{}{}",
+            self.locator, self.kind, self.role, self.status, scope, method, structured
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StructuredSourceSummary {
+    pub headers: Vec<String>,
+    pub sample_rows: usize,
+    pub total_rows: usize,
+}
+
+impl StructuredSourceSummary {
+    pub fn render(&self) -> String {
+        let headers = if self.headers.is_empty() {
+            "headers=none".to_string()
+        } else {
+            format!("headers={}", self.headers.join(", "))
+        };
+        format!(
+            "[{}; sample_rows={}; total_rows={}]",
+            headers, self.sample_rows, self.total_rows
         )
     }
 }

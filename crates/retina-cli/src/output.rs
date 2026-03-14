@@ -65,6 +65,39 @@ pub fn render_action_result(result: &ActionResult) -> String {
                 ""
             }
         ),
+        ActionResult::StructuredData {
+            path,
+            format,
+            headers,
+            rows,
+            total_rows,
+            truncated,
+            extraction_method,
+        } => format!(
+            "Ingested {format} structured data from {}\nmethod: {} | total_rows: {} | sample_rows: {}{}\nheaders: {}\n{}",
+            path.display(),
+            extraction_method,
+            total_rows,
+            rows.len(),
+            if *truncated {
+                " [sample truncated]"
+            } else {
+                ""
+            },
+            if headers.is_empty() {
+                "(none)".to_string()
+            } else {
+                headers.join(", ")
+            },
+            if rows.is_empty() {
+                "(no sample rows)".to_string()
+            } else {
+                rows.iter()
+                    .map(|row| format!("- row {}: {}", row.row_number, row.values.join(" | ")))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        ),
         ActionResult::DocumentText {
             path,
             content,
@@ -116,13 +149,21 @@ pub fn render_action_result(result: &ActionResult) -> String {
         ActionResult::FileWrite {
             path,
             bytes_written,
+            created,
+            overwritten,
             appended,
-        } => format!(
-            "{} {} byte(s) {}",
-            if *appended { "Appended" } else { "Wrote" },
-            bytes_written,
-            path.display()
-        ),
+        } => {
+            let verb = if *appended {
+                if *created { "Created and appended" } else { "Appended" }
+            } else if *overwritten {
+                "Overwrote"
+            } else if *created {
+                "Created"
+            } else {
+                "Wrote"
+            };
+            format!("{verb} {} byte(s) {}", bytes_written, path.display())
+        }
         ActionResult::NoteRecorded { note } => format!("Recorded note: {note}"),
         ActionResult::Response { message } => message.clone(),
     }
@@ -173,6 +214,28 @@ pub fn render_task_state(task_state: &TaskState) -> String {
             )
         })
         .unwrap_or_else(|| "(none)".to_string());
+    let output_artifact = task_state
+        .output_artifact
+        .as_ref()
+        .map(|artifact| {
+            format!(
+                "{} [{}|exists={}|written_this_run={}|verified={}|last_write_step={}|last_write_action={}]",
+                artifact.locator_hint,
+                artifact.kind,
+                artifact.exists,
+                artifact.written_this_run,
+                artifact.verified,
+                artifact
+                    .last_write_step
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                artifact
+                    .last_write_action
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string())
+            )
+        })
+        .unwrap_or_else(|| "(none)".to_string());
     let open_questions = if task_state.frontier.open_questions.is_empty() {
         "(none)".to_string()
     } else {
@@ -200,8 +263,13 @@ pub fn render_task_state(task_state: &TaskState) -> String {
                     .as_ref()
                     .map(|value| format!(" method={value}"))
                     .unwrap_or_default();
+                let structured = source
+                    .structured_summary
+                    .as_ref()
+                    .map(|value| format!(" {}", value.render()))
+                    .unwrap_or_default();
                 format!(
-                    "- {} [{}|{}|{}{}] step={} why={}{}",
+                    "- {} [{}|{}|{}{}] step={} why={}{}{}",
                     source.locator,
                     source.kind,
                     source.role,
@@ -209,7 +277,8 @@ pub fn render_task_state(task_state: &TaskState) -> String {
                     page_scope,
                     source.last_used_step,
                     source.why_it_matters,
-                    method
+                    method,
+                    structured
                 )
             })
             .collect::<Vec<_>>()
@@ -254,7 +323,7 @@ pub fn render_task_state(task_state: &TaskState) -> String {
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "goal: {}\nkind: {}\nphase: {}\nstep: {} / {}\nrequired_inputs: {} / {}\noutput_written: {}\noutput_verified: {}\noutput_target: {}\nnext: {}\nopen_questions:\n{}\nblockers:\n{}\n\nrequired_source_set:\n{}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
+        "goal: {}\nkind: {}\nphase: {}\nstep: {} / {}\nrequired_inputs: {} / {}\noutput_written: {}\noutput_verified: {}\noutput_target: {}\noutput_artifact: {}\nnext: {}\nopen_questions:\n{}\nblockers:\n{}\n\nrequired_source_set:\n{}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
         task_state.goal.objective,
         task_state.shape.kind,
         task_state.progress.current_phase,
@@ -265,6 +334,7 @@ pub fn render_task_state(task_state: &TaskState) -> String {
         task_state.progress.output_written,
         task_state.progress.output_verified,
         requested_output,
+        output_artifact,
         task_state
             .frontier
             .next_action_hint
@@ -663,6 +733,7 @@ mod tests {
                 output_written: false,
                 output_verified: false,
             },
+            output_artifact: None,
             shape: TaskShape {
                 kind: TaskKind::Output,
                 required_inputs: vec![],
@@ -685,6 +756,7 @@ mod tests {
                 evidence_refs: vec![],
                 page_reference: None,
                 extraction_method: None,
+                structured_summary: None,
             }],
             artifact_references: vec![],
             avoid: vec![],

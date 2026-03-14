@@ -25,7 +25,7 @@ pub fn plan_task(task: &str, last_result: Option<&str>) -> Option<ReasonResponse
 }
 
 pub fn capability_message() -> String {
-    "I can explore and act through the CLI shell: inspect paths, list directories, find files, search text, read files, extract text from documents, create or modify files, record notes, and run shell commands when they help complete the task. For concrete work, I should reason about the task and choose the next action through the kernel.".to_string()
+    "I can explore and act through the CLI shell: inspect paths, list directories, find files, search text, read files, ingest structured local data, extract text from documents, create or modify files, record notes, and run shell commands when they help complete the task. For concrete work, I should reason about the task and choose the next action through the kernel.".to_string()
 }
 
 fn with_reasoning(action: Action, task_complete: bool, reasoning: &str) -> ReasonResponse {
@@ -81,8 +81,8 @@ fn plan_follow_up_action(task: &str, last_result: Option<&str>) -> Option<Action
 
     match result {
         ActionResult::FileMatches { matches, .. } if task_requires_content_follow_up(task) => {
-            let path = pick_preferred_path(&matches)?;
-            if mentions_directory_contents(task) {
+            let path = pick_preferred_path(task, &matches)?;
+            if mentions_directory_contents(task) && matched_path_looks_like_directory(&path) {
                 Some(Action::ListDirectory {
                     id: ActionId::new(),
                     path,
@@ -96,6 +96,7 @@ fn plan_follow_up_action(task: &str, last_result: Option<&str>) -> Option<Action
                     include_content: true,
                 })
             } else if asks_for_content_answer(task)
+                || task_mentions_document_page(task)
                 || lower.contains("read")
                 || lower.contains("open")
                 || lower.contains("summarize")
@@ -107,6 +108,7 @@ fn plan_follow_up_action(task: &str, last_result: Option<&str>) -> Option<Action
         }
         ActionResult::TextSearch { matches, .. } if task_requires_search_follow_up(task) => {
             let path = pick_preferred_path(
+                task,
                 &matches
                     .into_iter()
                     .map(|item| item.path)
@@ -129,6 +131,7 @@ fn task_requires_content_follow_up(task: &str) -> bool {
             || lower.contains(" then inspect")
             || asks_for_content_answer(task)
             || lower.contains("summarize")
+            || task_mentions_document_page(task)
             || mentions_directory_contents(&lower))
 }
 
@@ -141,17 +144,50 @@ fn task_requires_search_follow_up(task: &str) -> bool {
             || lower.contains(" then open"))
 }
 
-fn pick_preferred_path(paths: &[PathBuf]) -> Option<PathBuf> {
+fn pick_preferred_path(task: &str, paths: &[PathBuf]) -> Option<PathBuf> {
     paths
         .iter()
         .min_by_key(|path| {
             (
-                readability_rank(path),
+                task_path_rank(task, path),
                 path.components().count(),
                 path.to_string_lossy().len(),
             )
         })
         .cloned()
+}
+
+fn task_path_rank(task: &str, path: &Path) -> usize {
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    let wants_structured = task_mentions_structured_data(task);
+    let wants_document_pages = task_mentions_document_page(task);
+
+    if path.is_dir() {
+        return if mentions_directory_contents(task) {
+            0
+        } else {
+            3
+        };
+    }
+
+    if wants_structured && matches!(extension.as_deref(), Some("csv" | "tsv")) {
+        return 0;
+    }
+    if wants_structured {
+        return 2;
+    }
+
+    if wants_document_pages && matches!(extension.as_deref(), Some("pdf")) {
+        return 0;
+    }
+    if wants_document_pages {
+        return 2;
+    }
+
+    readability_rank(path)
 }
 
 fn readability_rank(path: &Path) -> usize {
@@ -173,6 +209,28 @@ fn readability_rank(path: &Path) -> usize {
     }
 }
 
+fn task_mentions_structured_data(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    [
+        "csv",
+        "tsv",
+        "table",
+        "rows",
+        "columns",
+        "headers",
+        "spreadsheet",
+        "data",
+        "records",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn task_mentions_document_page(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    lower.contains("page ") || lower.contains("pages ")
+}
+
 fn mentions_directory_contents(task: &str) -> bool {
     let lower = task.to_lowercase();
     lower.contains("what files are there")
@@ -181,6 +239,10 @@ fn mentions_directory_contents(task: &str) -> bool {
         || lower.contains("list the files")
         || lower.contains("what is in")
         || lower.contains("what's in")
+}
+
+fn matched_path_looks_like_directory(path: &Path) -> bool {
+    path.is_dir() || path.extension().is_none()
 }
 
 fn asks_for_content_answer(task: &str) -> bool {
@@ -204,12 +266,17 @@ fn asks_for_content_answer(task: &str) -> bool {
 }
 
 fn content_action_for_path(task: &str, path: PathBuf) -> Action {
-    if path
+    let extension = path
         .extension()
         .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("pdf"))
-        .unwrap_or(false)
-    {
+        .map(|value| value.to_ascii_lowercase());
+    if matches!(extension.as_deref(), Some("csv" | "tsv")) {
+        Action::IngestStructuredData {
+            id: ActionId::new(),
+            path,
+            max_rows: Some(25),
+        }
+    } else if matches!(extension.as_deref(), Some("pdf")) {
         let (page_start, page_end) = requested_page_range(task);
         Action::ExtractDocumentText {
             id: ActionId::new(),
@@ -311,6 +378,69 @@ mod tests {
             response.action,
             Action::ExtractDocumentText { .. }
         ));
+    }
+
+    #[test]
+    fn plans_follow_up_structured_ingest_after_csv_find() {
+        let previous = to_json(&ActionResult::FileMatches {
+            root: ".".into(),
+            pattern: "people.csv".to_string(),
+            matches: vec!["people.csv".into()],
+        });
+        let response = must(
+            plan_task("find the csv and tell me what is in it", Some(&previous)),
+            "expected structured ingest plan",
+        );
+        assert!(matches!(
+            response.action,
+            Action::IngestStructuredData { .. }
+        ));
+    }
+
+    #[test]
+    fn prefers_structured_candidate_for_data_question() {
+        let previous = to_json(&ActionResult::FileMatches {
+            root: ".".into(),
+            pattern: "people".to_string(),
+            matches: vec!["people.md".into(), "people.csv".into()],
+        });
+        let response = must(
+            plan_task(
+                "find the people data and tell me what rows are in it",
+                Some(&previous),
+            ),
+            "expected structured candidate preference",
+        );
+        match response.action {
+            Action::IngestStructuredData { path, .. } => assert!(path.ends_with("people.csv")),
+            _ => panic!("expected structured ingest"),
+        }
+    }
+
+    #[test]
+    fn prefers_pdf_candidate_for_page_specific_question() {
+        let previous = to_json(&ActionResult::FileMatches {
+            root: ".".into(),
+            pattern: "dominican".to_string(),
+            matches: vec!["dominican.txt".into(), "dominican_Med.pdf".into()],
+        });
+        let response = must(
+            plan_task("find dominican and use page 2 from it", Some(&previous)),
+            "expected pdf candidate preference",
+        );
+        match response.action {
+            Action::ExtractDocumentText {
+                path,
+                page_start,
+                page_end,
+                ..
+            } => {
+                assert!(path.ends_with("dominican_Med.pdf"));
+                assert_eq!(page_start, Some(2));
+                assert_eq!(page_end, Some(2));
+            }
+            _ => panic!("expected document extraction"),
+        }
     }
 
     #[test]

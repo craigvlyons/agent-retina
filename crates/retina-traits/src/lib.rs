@@ -1,3 +1,5 @@
+// File boundary: keep lib.rs limited to public trait surfaces and top-level API
+// wiring. Move helper implementations and feature-specific logic into modules.
 use retina_types::*;
 use serde_json::Value;
 use std::path::Path;

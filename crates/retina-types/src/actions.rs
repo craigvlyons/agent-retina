@@ -44,6 +44,11 @@ pub enum Action {
         path: PathBuf,
         max_bytes: Option<usize>,
     },
+    IngestStructuredData {
+        id: ActionId,
+        path: PathBuf,
+        max_rows: Option<usize>,
+    },
     ExtractDocumentText {
         id: ActionId,
         path: PathBuf,
@@ -82,6 +87,7 @@ impl Action {
             | Self::FindFiles { id, .. }
             | Self::SearchText { id, .. }
             | Self::ReadFile { id, .. }
+            | Self::IngestStructuredData { id, .. }
             | Self::ExtractDocumentText { id, .. }
             | Self::WriteFile { id, .. }
             | Self::AppendFile { id, .. }
@@ -100,6 +106,7 @@ impl Action {
             | Self::FindFiles { .. }
             | Self::SearchText { .. }
             | Self::ReadFile { .. }
+            | Self::IngestStructuredData { .. }
             | Self::ExtractDocumentText { .. }
             | Self::RecordNote { .. }
             | Self::Respond { .. } => false,
@@ -143,6 +150,7 @@ impl Action {
                 include_last_command: false,
             },
             Self::ReadFile { path, .. }
+            | Self::IngestStructuredData { path, .. }
             | Self::ExtractDocumentText { path, .. }
             | Self::WriteFile { path, .. }
             | Self::AppendFile { path, .. } => HashScope {
@@ -271,6 +279,13 @@ pub struct CommandResult {
     pub duration_ms: u64,
     pub cancelled: bool,
     pub termination: Option<String>,
+    pub observed_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StructuredDataRow {
+    pub row_number: usize,
+    pub values: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -291,6 +306,15 @@ pub enum ActionResult {
         content: String,
         truncated: bool,
     },
+    StructuredData {
+        path: PathBuf,
+        format: String,
+        headers: Vec<String>,
+        rows: Vec<StructuredDataRow>,
+        total_rows: usize,
+        truncated: bool,
+        extraction_method: String,
+    },
     DocumentText {
         path: PathBuf,
         content: String,
@@ -308,6 +332,8 @@ pub enum ActionResult {
     FileWrite {
         path: PathBuf,
         bytes_written: usize,
+        created: bool,
+        overwritten: bool,
         appended: bool,
     },
     NoteRecorded {
@@ -368,6 +394,7 @@ pub enum StateDeltaKind {
     Error,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Outcome {
     Success(ActionResult),

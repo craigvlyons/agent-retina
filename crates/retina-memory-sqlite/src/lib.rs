@@ -1,3 +1,5 @@
+// File boundary: keep lib.rs focused on top-level storage wiring and trait
+// implementation entry points. Move new helpers and feature logic into modules.
 mod consolidation;
 mod embedder;
 mod manifest;

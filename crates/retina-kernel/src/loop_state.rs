@@ -381,6 +381,9 @@ pub(crate) fn action_label(action: &Action) -> String {
         }
         Action::SearchText { root, query, .. } => format!("search_text:{}:{query}", root.display()),
         Action::ReadFile { path, .. } => format!("read_file:{}", path.display()),
+        Action::IngestStructuredData { path, .. } => {
+            format!("ingest_structured_data:{}", path.display())
+        }
         Action::ExtractDocumentText {
             path,
             page_start,

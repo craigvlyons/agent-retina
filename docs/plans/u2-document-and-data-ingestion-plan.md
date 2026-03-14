@@ -19,16 +19,28 @@ Implemented:
 - the kernel now preserves that metadata in compact result state, artifact references, summaries, and working-source fidelity
 - operator output now shows page-scoped extraction and extraction method details instead of flattening all document ingestion into one generic line
 - the narrow PDF follow-up helper can carry explicit page hints when the task asks for a specific page
+- `ingest_structured_data` now supports CSV/TSV-style local data ingestion
+- structured local sources now preserve:
+  - headers
+  - sample rows
+  - total row count
+  - extraction method
+- mixed-source task state now preserves combined `.txt + .pdf + .csv` evidence
+- mixed-source candidate preference now covers:
+  - `.md` vs `.csv` when the task asks about rows/data
+  - `.txt` vs `.pdf` when the task asks for a specific page
 - regression coverage exists for:
   - full PDF extraction
   - page-specific PDF extraction
+  - CSV/TSV ingestion
   - task-state / CLI output compatibility with richer source metadata
+  - mixed-source working-source fidelity
+  - mixed-source candidate preference
 
 Still left in this plan:
-- explicit CSV and simple structured-data ingestion
-- better file-type-aware source selection across mixed source candidates
-- richer working-source fidelity for structured local data, not just document pages
-- broader mixed-source acceptance tests such as `.txt` + `.pdf` + `.csv`
+- broaden file-type-aware source selection beyond the current CSV/TSV and page-specific PDF cases
+- preserve richer structured-source evidence if real tasks require row/column-specific follow-up later
+- add more end-to-end mixed-source synthesis tasks, not just ingestion/selection coverage
 
 ## Research Basis
 
@@ -127,6 +139,13 @@ The worker should be able to:
 V1 does not need full spreadsheet intelligence.
 It does need useful row/column-aware ingestion.
 
+Status:
+- implemented for CSV/TSV-style local files with:
+  - headers
+  - sample rows
+  - row counts
+  - extraction metadata
+
 ### Phase U2.4: file-type aware source selection
 
 Improve how the worker chooses between candidate sources.
@@ -140,6 +159,17 @@ The worker should be able to choose:
 
 This is selection quality, not hardcoded task routing.
 
+Status:
+- partially implemented:
+  - matched CSV/TSV candidates now prefer structured ingestion over plain text reads
+  - PDFs still prefer page-aware document extraction when requested
+  - mixed candidate preference tests now cover:
+    - `.md` vs `.csv` when the task asks about rows/data
+    - `.txt` vs `.pdf` when the task asks for a specific page
+Still left:
+- broaden mixed-source selection to more combinations such as `.json` vs `.txt`, `.md` vs `.pdf`, and config/code vs prose when task intent is clearer than the extension alone
+- improve selection from the live task state, not only deterministic follow-up from a prior result
+
 ### Phase U2.5: working-source fidelity
 
 Working sources should preserve:
@@ -151,6 +181,17 @@ Working sources should preserve:
 - why the source matters for the task
 
 This keeps compaction and resumption faithful to the real inputs.
+
+Status:
+- partially implemented:
+  - structured local sources now preserve:
+    - headers
+    - sample row count
+    - total row count
+  - mixed-source task-state tests now verify combined `.txt + .pdf + .csv` working-source fidelity
+Still left:
+- preserve richer structured evidence references only if row/column-specific follow-up proves necessary in real tasks
+- improve operator-facing review of mixed-source provenance when several local inputs are combined
 
 ## Implementation Tasks
 
@@ -170,6 +211,7 @@ This keeps compaction and resumption faithful to the real inputs.
 - A task asking for text from a PDF page does not read raw PDF bytes.
 - The worker can inspect a CSV and use it as evidence for a synthesis task.
 - Working sources clearly show page-level and extraction-method details.
+- Working sources preserve mixed `.txt + .pdf + .csv` evidence together without losing page or structured-source fidelity.
 - The shell surfaces unsupported document cases honestly instead of pretending to succeed.
 
 ## Do Not Drift Into
@@ -183,3 +225,10 @@ This keeps compaction and resumption faithful to the real inputs.
 ## Done Condition
 
 This plan is done when the worker can treat local documents and simple data files as first-class inputs for real tasks, including page-specific PDF extraction and CSV ingestion, while keeping evidence exact and compact context small.
+
+## Resume Point
+
+If we come back to `u2`, start with:
+- end-to-end mixed-source synthesis tasks that ingest `.txt + .pdf + .csv` and then answer or produce an output artifact
+- broader file-type-aware source selection beyond the current CSV/TSV and page-specific PDF cases
+- richer structured evidence references only if real tasks show row/column follow-up is actually needed

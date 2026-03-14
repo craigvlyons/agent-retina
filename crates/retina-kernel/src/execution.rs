@@ -12,6 +12,90 @@ use retina_types::*;
 use serde_json::json;
 
 impl Kernel {
+    fn build_output_artifact_state(
+        &self,
+        shape: &TaskShape,
+        state: &TaskLoopState,
+    ) -> Option<OutputArtifactState> {
+        let output = shape.requested_output.as_ref()?;
+        let normalized_hint = output.locator_hint.to_lowercase();
+        let current_content_ingested = state.working_sources.iter().any(|source| {
+            source.locator.to_lowercase().contains(&normalized_hint)
+                && matches!(
+                    source.status.as_str(),
+                    "read" | "excerpted" | "ingested" | "matched_text"
+                )
+        }) || state.artifact_references.iter().any(|artifact| {
+            artifact.locator.to_lowercase().contains(&normalized_hint)
+                && matches!(
+                    artifact.status.as_str(),
+                    "read" | "structured_read" | "extracted" | "searched"
+                )
+        }) || state.recent_action_summaries.iter().any(|summary| {
+            summary
+                .artifact_refs
+                .iter()
+                .any(|artifact| artifact.locator.to_lowercase().contains(&normalized_hint))
+                && matches!(
+                    summary.action.as_str(),
+                    action if action.starts_with("read_file:")
+                        || action.starts_with("extract_document_text:")
+                        || action.starts_with("ingest_structured_data:")
+                        || action.starts_with("search_text:")
+                )
+        });
+
+        let generated_source = state
+            .working_sources
+            .iter()
+            .filter(|source| {
+                source.role == "generated"
+                    && source.locator.to_lowercase().contains(&normalized_hint)
+            })
+            .max_by_key(|source| source.last_used_step);
+
+        let last_write_action = state
+            .recent_action_summaries
+            .iter()
+            .rev()
+            .find(|summary| {
+                matches!(
+                    summary.action.as_str(),
+                    action if action.starts_with("write_file:") || action.starts_with("append_file:")
+                ) && summary.artifact_refs.iter().any(|artifact| {
+                    artifact.locator.to_lowercase().contains(&normalized_hint)
+                })
+            })
+            .map(|summary| summary.action.clone());
+
+        let last_write_step = generated_source
+            .map(|source| source.last_used_step)
+            .or_else(|| {
+                state
+                    .recent_action_summaries
+                    .iter()
+                    .rev()
+                    .find(|summary| {
+                        summary.artifact_refs.iter().any(|artifact| {
+                            artifact.locator.to_lowercase().contains(&normalized_hint)
+                        })
+                    })
+                    .map(|summary| summary.step)
+            });
+
+        Some(OutputArtifactState {
+            locator_hint: output.locator_hint.clone(),
+            kind: output.kind.clone(),
+            intent: output.intent.clone(),
+            exists: output.exists,
+            current_content_ingested,
+            written_this_run: generated_source.is_some(),
+            verified: output.verified,
+            last_write_step,
+            last_write_action,
+        })
+    }
+
     pub(crate) fn select_action(
         &self,
         selection: StepSelectionContext<'_>,
@@ -161,7 +245,7 @@ impl Kernel {
             return Ok(outcome);
         }
 
-        let result = match self.shell.execute_controlled(&action, control) {
+        let mut result = match self.shell.execute_controlled(&action, control) {
             Ok(result) => result,
             Err(error) => {
                 self.circuit_breaker.record_failure(intent);
@@ -221,6 +305,11 @@ impl Kernel {
         )?;
 
         let delta = self.shell.compare_state(&pre, &post, Some(&action))?;
+        if let ActionResult::Command(command) = &mut result {
+            if !delta.changed_paths.is_empty() {
+                command.observed_paths = delta.changed_paths.clone();
+            }
+        }
         self.emit_event(
             EventSpec::new(
                 task,
@@ -493,6 +582,7 @@ impl Kernel {
         let shape = infer_task_shape(&task.description, state);
         let (open_questions, blockers, next_action_hint) =
             build_task_frontier(&shape, last_result_summary.clone(), state);
+        let output_artifact = self.build_output_artifact_state(&shape, state);
         TaskState {
             goal: TaskGoal {
                 objective: task.description.clone(),
@@ -512,17 +602,16 @@ impl Kernel {
                     .iter()
                     .filter(|input| required_input_is_satisfied(input))
                     .count(),
-                output_written: shape
-                    .requested_output
+                output_written: output_artifact
                     .as_ref()
-                    .map(|output| output.exists)
+                    .map(|artifact| artifact.written_this_run)
                     .unwrap_or(false),
-                output_verified: shape
-                    .requested_output
+                output_verified: output_artifact
                     .as_ref()
-                    .map(|output| output.verified)
+                    .map(|artifact| artifact.verified)
                     .unwrap_or(false),
             },
+            output_artifact,
             frontier: TaskFrontier {
                 next_action_hint,
                 open_questions,

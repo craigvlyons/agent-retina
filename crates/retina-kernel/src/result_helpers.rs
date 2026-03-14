@@ -5,13 +5,21 @@ use std::path::{Path, PathBuf};
 pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
     match result {
         ActionResult::Command(command) => format!(
-            "command {} with exit {:?}",
+            "command {} with exit {:?}{}",
             if command.success {
                 "succeeded"
             } else {
                 "failed"
             },
-            command.exit_code
+            command.exit_code,
+            if command.observed_paths.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (changed: {})",
+                    preview_paths(command.observed_paths.clone())
+                )
+            }
         ),
         ActionResult::Inspection(world) => format!("inspected {} path(s)", world.files.len()),
         ActionResult::DirectoryListing { root, entries } => format!(
@@ -40,6 +48,25 @@ pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
             content.chars().count(),
             if *truncated { ", truncated" } else { "" },
             preview_text(content, 120)
+        ),
+        ActionResult::StructuredData {
+            path,
+            format,
+            headers,
+            rows,
+            total_rows,
+            truncated,
+            extraction_method,
+        } => format!(
+            "ingested {} structured data from {} via {} (headers={}, sample_rows={} of {}{}): {}",
+            format,
+            path.display(),
+            extraction_method,
+            headers.join(", "),
+            rows.len(),
+            total_rows,
+            if *truncated { ", truncated" } else { "" },
+            preview_structured_rows(rows, 2)
         ),
         ActionResult::DocumentText {
             path,
@@ -73,13 +100,21 @@ pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
         ActionResult::FileWrite {
             path,
             bytes_written,
+            created,
+            overwritten,
             appended,
-        } => format!(
-            "{} {} ({} bytes)",
-            if *appended { "appended to" } else { "wrote" },
-            path.display(),
-            bytes_written
-        ),
+        } => {
+            let verb = if *appended {
+                if *created { "created and appended to" } else { "appended to" }
+            } else if *overwritten {
+                "overwrote"
+            } else if *created {
+                "created"
+            } else {
+                "wrote"
+            };
+            format!("{verb} {} ({} bytes)", path.display(), bytes_written)
+        }
         ActionResult::NoteRecorded { note } => format!("recorded note: {}", note),
         ActionResult::Response { message } => format!("responded: {}", message),
     }
@@ -97,6 +132,7 @@ pub(crate) fn compact_action_result_for_context(
             "exit_code": command.exit_code,
             "cancelled": command.cancelled,
             "termination": command.termination,
+            "observed_paths": command.observed_paths,
             "stdout": preview_text(&command.stdout, 2000),
             "stderr": preview_text(&command.stderr, 1000),
         }),
@@ -144,6 +180,24 @@ pub(crate) fn compact_action_result_for_context(
             "truncated": truncated,
             "content": preview_text(content, 8000),
         }),
+        ActionResult::StructuredData {
+            path,
+            format,
+            headers,
+            rows,
+            total_rows,
+            truncated,
+            extraction_method,
+        } => serde_json::json!({
+            "type": "structured_data",
+            "path": path,
+            "format": format,
+            "headers": headers,
+            "rows": rows,
+            "total_rows": total_rows,
+            "truncated": truncated,
+            "extraction_method": extraction_method,
+        }),
         ActionResult::DocumentText {
             path,
             content,
@@ -184,11 +238,15 @@ pub(crate) fn compact_action_result_for_context(
         ActionResult::FileWrite {
             path,
             bytes_written,
+            created,
+            overwritten,
             appended,
         } => serde_json::json!({
             "type": "file_write",
             "path": path,
             "bytes_written": bytes_written,
+            "created": created,
+            "overwritten": overwritten,
             "appended": appended,
         }),
         ActionResult::NoteRecorded { note } => serde_json::json!({
@@ -244,6 +302,17 @@ pub(crate) fn compact_last_result_for_compacted_context(
                 .map(|text| preview_text(text, 240)),
             "continuation": "reopen extracted document by path from task_state artifact refs if more detail is needed"
         }),
+        Some("structured_data") => serde_json::json!({
+            "type": "structured_data",
+            "path": value.get("path"),
+            "format": value.get("format"),
+            "headers": value.get("headers"),
+            "rows": value.get("rows"),
+            "total_rows": value.get("total_rows"),
+            "truncated": value.get("truncated"),
+            "extraction_method": value.get("extraction_method"),
+            "continuation": "reopen structured data by path from task_state artifact refs if more rows are needed"
+        }),
         Some("text_search") => serde_json::json!({
             "type": "text_search",
             "root": value.get("root"),
@@ -278,6 +347,7 @@ pub(crate) fn summarize_verified_facts(references: &[ArtifactReference]) -> Vec<
         .take(8)
         .map(|reference| match reference.status.as_str() {
             "read" => format!("read {}", reference.locator),
+            "structured_read" => format!("ingested structured data from {}", reference.locator),
             "extracted" => format!("extracted text from {}", reference.locator),
             "matched" => format!("matched candidate {}", reference.locator),
             "searched" => format!("searched and found evidence in {}", reference.locator),
@@ -301,7 +371,14 @@ pub(crate) fn artifact_references_for_result(result: &ActionResult) -> Vec<Artif
             } else {
                 "failed".to_string()
             },
-        }],
+        }]
+        .into_iter()
+        .chain(command.observed_paths.iter().map(|path| ArtifactReference {
+            kind: "file".to_string(),
+            locator: path.display().to_string(),
+            status: "command_changed".to_string(),
+        }))
+        .collect(),
         ActionResult::Inspection(world) => world
             .files
             .iter()
@@ -331,6 +408,11 @@ pub(crate) fn artifact_references_for_result(result: &ActionResult) -> Vec<Artif
             locator: path.display().to_string(),
             status: "read".to_string(),
         }],
+        ActionResult::StructuredData { path, .. } => vec![ArtifactReference {
+            kind: "structured_data".to_string(),
+            locator: path.display().to_string(),
+            status: "structured_read".to_string(),
+        }],
         ActionResult::DocumentText {
             path, page_range, ..
         } => vec![ArtifactReference {
@@ -347,11 +429,21 @@ pub(crate) fn artifact_references_for_result(result: &ActionResult) -> Vec<Artif
                 status: "searched".to_string(),
             })
             .collect(),
-        ActionResult::FileWrite { path, appended, .. } => vec![ArtifactReference {
+        ActionResult::FileWrite {
+            path,
+            created,
+            overwritten,
+            appended,
+            ..
+        } => vec![ArtifactReference {
             kind: "file".to_string(),
             locator: path.display().to_string(),
             status: if *appended {
                 "appended".to_string()
+            } else if *overwritten {
+                "overwritten".to_string()
+            } else if *created {
+                "created".to_string()
             } else {
                 "written".to_string()
             },
@@ -380,6 +472,7 @@ pub(crate) fn working_sources_for_result(
                 evidence_refs: vec![item.path.display().to_string()],
                 page_reference: None,
                 extraction_method: None,
+                structured_summary: None,
             })
             .collect(),
         ActionResult::DirectoryListing { root, .. } => vec![WorkingSource {
@@ -392,6 +485,7 @@ pub(crate) fn working_sources_for_result(
             evidence_refs: vec![root.display().to_string()],
             page_reference: None,
             extraction_method: None,
+            structured_summary: None,
         }],
         ActionResult::FileMatches { matches, .. } => matches
             .iter()
@@ -406,6 +500,7 @@ pub(crate) fn working_sources_for_result(
                 evidence_refs: vec![path.display().to_string()],
                 page_reference: None,
                 extraction_method: None,
+                structured_summary: None,
             })
             .collect(),
         ActionResult::FileRead { path, .. } => vec![WorkingSource {
@@ -418,6 +513,30 @@ pub(crate) fn working_sources_for_result(
             evidence_refs: vec![path.display().to_string()],
             page_reference: None,
             extraction_method: Some("text_read".to_string()),
+            structured_summary: None,
+        }],
+        ActionResult::StructuredData {
+            path,
+            headers,
+            rows,
+            total_rows,
+            extraction_method,
+            ..
+        } => vec![WorkingSource {
+            kind: "structured_data".to_string(),
+            locator: path.display().to_string(),
+            role: "authoritative".to_string(),
+            status: "ingested".to_string(),
+            why_it_matters: "structured local data currently informing the task".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![path.display().to_string()],
+            page_reference: None,
+            extraction_method: Some(extraction_method.clone()),
+            structured_summary: Some(StructuredSourceSummary {
+                headers: headers.clone(),
+                sample_rows: rows.len(),
+                total_rows: *total_rows,
+            }),
         }],
         ActionResult::DocumentText {
             path,
@@ -434,6 +553,7 @@ pub(crate) fn working_sources_for_result(
             evidence_refs: vec![document_locator_with_page_range(path, page_range.as_ref())],
             page_reference: page_range.as_ref().map(DocumentPageRange::render),
             extraction_method: Some(extraction_method.clone()),
+            structured_summary: None,
         }],
         ActionResult::TextSearch { matches, .. } => matches
             .iter()
@@ -448,14 +568,25 @@ pub(crate) fn working_sources_for_result(
                 evidence_refs: vec![format!("{}:{}", item.path.display(), item.line_number)],
                 page_reference: None,
                 extraction_method: None,
+                structured_summary: None,
             })
             .collect(),
-        ActionResult::FileWrite { path, appended, .. } => vec![WorkingSource {
+        ActionResult::FileWrite {
+            path,
+            created,
+            overwritten,
+            appended,
+            ..
+        } => vec![WorkingSource {
             kind: "file".to_string(),
             locator: path.display().to_string(),
             role: "generated".to_string(),
             status: if *appended {
                 "appended".to_string()
+            } else if *overwritten {
+                "overwritten".to_string()
+            } else if *created {
+                "created".to_string()
             } else {
                 "written".to_string()
             },
@@ -464,24 +595,41 @@ pub(crate) fn working_sources_for_result(
             evidence_refs: vec![path.display().to_string()],
             page_reference: None,
             extraction_method: Some("file_write".to_string()),
+            structured_summary: None,
         }],
-        ActionResult::Command(command) => vec![WorkingSource {
-            kind: "command".to_string(),
-            locator: command.command.clone(),
-            role: "supporting".to_string(),
-            status: if command.cancelled {
-                "cancelled".to_string()
-            } else if command.success {
-                "executed".to_string()
-            } else {
-                "failed".to_string()
-            },
-            why_it_matters: "shell command executed as part of the task".to_string(),
-            last_used_step: step_index,
-            evidence_refs: vec![command.command.clone()],
-            page_reference: None,
-            extraction_method: Some("run_command".to_string()),
-        }],
+        ActionResult::Command(command) => {
+            let mut sources = vec![WorkingSource {
+                kind: "command".to_string(),
+                locator: command.command.clone(),
+                role: "supporting".to_string(),
+                status: if command.cancelled {
+                    "cancelled".to_string()
+                } else if command.success {
+                    "executed".to_string()
+                } else {
+                    "failed".to_string()
+                },
+                why_it_matters: "shell command executed as part of the task".to_string(),
+                last_used_step: step_index,
+                evidence_refs: vec![command.command.clone()],
+                page_reference: None,
+                extraction_method: Some("run_command".to_string()),
+                structured_summary: None,
+            }];
+            sources.extend(command.observed_paths.iter().map(|path| WorkingSource {
+                kind: "file".to_string(),
+                locator: path.display().to_string(),
+                role: "generated".to_string(),
+                status: "command_changed".to_string(),
+                why_it_matters: "shell command created or modified this artifact".to_string(),
+                last_used_step: step_index,
+                evidence_refs: vec![path.display().to_string()],
+                page_reference: None,
+                extraction_method: Some("run_command".to_string()),
+                structured_summary: None,
+            }));
+            sources
+        }
         ActionResult::NoteRecorded { note } => vec![WorkingSource {
             kind: "note".to_string(),
             locator: preview_text(note, 80),
@@ -492,6 +640,7 @@ pub(crate) fn working_sources_for_result(
             evidence_refs: vec![preview_text(note, 80)],
             page_reference: None,
             extraction_method: Some("record_note".to_string()),
+            structured_summary: None,
         }],
         ActionResult::Response { .. } => Vec::new(),
     }
@@ -530,6 +679,18 @@ fn preview_search_matches(matches: &[SearchMatch]) -> String {
         return "no examples".to_string();
     }
     preview.join(" | ")
+}
+
+fn preview_structured_rows(rows: &[StructuredDataRow], limit: usize) -> String {
+    let preview = rows
+        .iter()
+        .take(limit)
+        .map(|row| format!("row {}: {}", row.row_number, row.values.join(" | ")))
+        .collect::<Vec<_>>();
+    if preview.is_empty() {
+        return "no sample rows".to_string();
+    }
+    preview.join("; ")
 }
 
 fn document_locator_with_page_range(path: &Path, page_range: Option<&DocumentPageRange>) -> String {

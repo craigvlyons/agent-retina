@@ -1,3 +1,5 @@
+// File boundary: keep lib.rs limited to module declarations and re-exports.
+// New type families and helper logic should live in focused sibling modules.
 mod actions;
 mod agents;
 mod core;

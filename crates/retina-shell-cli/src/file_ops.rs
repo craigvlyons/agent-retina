@@ -3,6 +3,17 @@ use crate::state_helpers::{
     looks_binary, normalize_requested_page_range, prefers_document_extraction,
 };
 
+const DEFAULT_MAX_STRUCTURED_ROWS: usize = 25;
+
+pub(crate) struct StructuredDataIngestion {
+    pub(crate) format: String,
+    pub(crate) headers: Vec<String>,
+    pub(crate) rows: Vec<StructuredDataRow>,
+    pub(crate) total_rows: usize,
+    pub(crate) truncated: bool,
+    pub(crate) extraction_method: String,
+}
+
 impl CliShell {
     pub(crate) fn list_directory(
         path: &Path,
@@ -190,6 +201,68 @@ impl CliShell {
         Ok((String::from_utf8_lossy(&buffer).to_string(), truncated))
     }
 
+    pub(crate) fn ingest_structured_data(
+        path: &Path,
+        max_rows: Option<usize>,
+    ) -> Result<StructuredDataIngestion> {
+        let path = Self::resolve_path(path)?;
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+        let delimiter = match extension.as_str() {
+            "csv" => b',',
+            "tsv" => b'\t',
+            _ => {
+                return Err(KernelError::Unsupported(format!(
+                    "structured data ingestion is only supported for csv/tsv right now: {}",
+                    path.display()
+                )));
+            }
+        };
+
+        let mut reader = csv::ReaderBuilder::new()
+            .delimiter(delimiter)
+            .flexible(true)
+            .from_path(&path)
+            .map_err(|error| KernelError::Execution(error.to_string()))?;
+
+        let headers = reader
+            .headers()
+            .map_err(|error| KernelError::Execution(error.to_string()))?
+            .iter()
+            .map(|value| value.trim().to_string())
+            .collect::<Vec<_>>();
+
+        let sample_limit = max_rows.unwrap_or(DEFAULT_MAX_STRUCTURED_ROWS).max(1);
+        let mut rows = Vec::new();
+        let mut total_rows = 0usize;
+
+        for record in reader.records() {
+            let record = record.map_err(|error| KernelError::Execution(error.to_string()))?;
+            total_rows += 1;
+            if rows.len() < sample_limit {
+                rows.push(StructuredDataRow {
+                    row_number: total_rows,
+                    values: record
+                        .iter()
+                        .map(|value| value.trim().to_string())
+                        .collect(),
+                });
+            }
+        }
+
+        Ok(StructuredDataIngestion {
+            format: extension,
+            headers,
+            rows,
+            total_rows,
+            truncated: total_rows > sample_limit,
+            extraction_method: "csv_reader".to_string(),
+        })
+    }
+
     pub(crate) fn extract_document_text(
         path: &Path,
         max_chars: Option<usize>,
@@ -283,28 +356,30 @@ impl CliShell {
         ))
     }
 
-    pub(crate) fn write_file(path: &Path, content: &str, overwrite: bool) -> Result<usize> {
+    pub(crate) fn write_file(path: &Path, content: &str, overwrite: bool) -> Result<(usize, bool, bool)> {
         let path = Self::resolve_path(path)?;
+        let existed_before = path.exists();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        if path.exists() && !overwrite {
+        if existed_before && !overwrite {
             return Err(KernelError::Validation(format!(
                 "refusing to overwrite existing file {} without overwrite=true",
                 path.display()
             )));
         }
         fs::write(&path, content)?;
-        Ok(content.len())
+        Ok((content.len(), !existed_before, existed_before))
     }
 
-    pub(crate) fn append_file(path: &Path, content: &str) -> Result<usize> {
+    pub(crate) fn append_file(path: &Path, content: &str) -> Result<(usize, bool)> {
         let path = Self::resolve_path(path)?;
+        let existed_before = path.exists();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         file.write_all(content.as_bytes())?;
-        Ok(content.len())
+        Ok((content.len(), !existed_before))
     }
 }

@@ -104,14 +104,35 @@ pub(crate) fn build_task_frontier(
         .as_ref()
         .filter(|output| !output.verified)
     {
-        open_questions.push(format!("Need to create and verify {}", output.locator_hint));
+        let target_content_needed =
+            output_intent_needs_current_content(output.intent.clone())
+                && !output_target_content_is_ingested(state, output);
+        if target_content_needed {
+            open_questions.push(format!(
+                "Need the current content of {} before it can be {}",
+                output.locator_hint,
+                describe_output_result(output.intent.clone())
+            ));
+            if unresolved_inputs.is_empty() && state.step_index > 0 {
+                blockers.push(format!(
+                    "requested {} target has not been ingested yet: {}",
+                    output.intent, output.locator_hint
+                ));
+            }
+        }
+        open_questions.push(format!(
+            "Need to {} {}",
+            describe_output_verification_work(output.intent.clone()),
+            output.locator_hint
+        ));
         if matches!(shape.kind, TaskKind::Output | TaskKind::Transform)
             && unresolved_inputs.is_empty()
             && state.step_index > 0
         {
             blockers.push(format!(
-                "task is not complete until {} exists as a verified output artifact",
-                output.locator_hint
+                "task is not complete until {} is a verified output artifact for the requested {} task",
+                output.locator_hint,
+                output.intent
             ));
         }
     }
@@ -157,10 +178,20 @@ pub(crate) fn build_task_frontier(
         .as_ref()
         .filter(|output| !output.verified)
     {
-        Some(format!(
-            "Create and verify the requested output artifact: {}",
-            output.locator_hint
-        ))
+        if output_intent_needs_current_content(output.intent.clone())
+            && !output_target_content_is_ingested(state, output)
+        {
+            Some(format!(
+                "Ingest the current content of the target artifact before {} it: {}",
+                output.intent, output.locator_hint
+            ))
+        } else {
+            Some(format!(
+                "{} the requested output artifact: {}",
+                uppercase_first(describe_output_verification_work(output.intent.clone())),
+                output.locator_hint
+            ))
+        }
     } else if matches!(shape.kind, TaskKind::Transform) && state.step_index > 0 {
         Some("Synthesize the ingested evidence into the requested transformed result".to_string())
     } else {
@@ -360,8 +391,9 @@ fn build_success_markers(
     }
     if let Some(output) = requested_output {
         markers.push(format!(
-            "requested output {} is created and verified",
-            output.locator_hint
+            "requested output {} is {} and verified",
+            output.locator_hint,
+            describe_output_result(output.intent.clone())
         ));
     }
     if matches!(kind, TaskKind::Answer) {
@@ -436,10 +468,35 @@ fn infer_requested_output(
         Some(RequestedOutput {
             locator_hint: hint.clone(),
             kind: classify_locator_kind(hint),
+            intent: infer_output_intent(&cue_window),
             exists,
             verified,
         })
     })
+}
+
+fn infer_output_intent(cue_window: &[String]) -> OutputIntent {
+    if cue_window.iter().any(|token| token == "append") {
+        OutputIntent::Append
+    } else if cue_window.iter().any(|token| token == "overwrite") {
+        OutputIntent::Overwrite
+    } else if cue_window.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "update" | "modify" | "edit" | "rewrite" | "revise" | "revised" | "fill"
+        )
+    }) {
+        OutputIntent::Modify
+    } else if cue_window.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "save" | "as" | "to" | "into" | "create" | "write" | "named" | "called" | "output"
+        )
+    }) {
+        OutputIntent::Create
+    } else {
+        OutputIntent::Unknown
+    }
 }
 
 fn infer_required_input_status(hint: &str, state: &TaskLoopState) -> String {
@@ -467,7 +524,7 @@ fn infer_required_input_status(hint: &str, state: &TaskLoopState) -> String {
             continue;
         }
         let (status, priority) = match artifact.status.as_str() {
-            "read" | "extracted" | "searched" => ("ingested", 2),
+            "read" | "extracted" | "searched" | "structured_read" => ("ingested", 2),
             "matched" | "listed" | "inspected" => ("located", 1),
             _ => continue,
         };
@@ -499,12 +556,44 @@ fn infer_requested_output_status(hint: &str, state: &TaskLoopState) -> (bool, bo
             continue;
         }
         exists = true;
-        if matches!(artifact.status.as_str(), "written" | "appended") {
+        if matches!(
+            artifact.status.as_str(),
+            "created" | "written" | "overwritten" | "appended" | "command_changed"
+        ) {
             verified = true;
         }
     }
 
     (exists, verified)
+}
+
+fn output_target_content_is_ingested(state: &TaskLoopState, output: &RequestedOutput) -> bool {
+    let normalized_hint = normalize_locator(&output.locator_hint);
+    state.working_sources.iter().any(|source| {
+        normalize_locator(&source.locator).contains(&normalized_hint)
+            && matches!(
+                source.status.as_str(),
+                "read" | "excerpted" | "ingested" | "matched_text"
+            )
+    }) || state.artifact_references.iter().any(|artifact| {
+        normalize_locator(&artifact.locator).contains(&normalized_hint)
+            && matches!(
+                artifact.status.as_str(),
+                "read" | "structured_read" | "extracted" | "searched"
+            )
+    }) || state.recent_action_summaries.iter().any(|summary| {
+        summary
+            .artifact_refs
+            .iter()
+            .any(|artifact| normalize_locator(&artifact.locator).contains(&normalized_hint))
+            && matches!(
+                summary.action.as_str(),
+                action if action.starts_with("read_file:")
+                    || action.starts_with("extract_document_text:")
+                    || action.starts_with("ingest_structured_data:")
+                    || action.starts_with("search_text:")
+            )
+    })
 }
 
 fn classify_locator_kind(locator: &str) -> String {
@@ -534,6 +623,7 @@ fn is_file_like_hint(hint: &str) -> bool {
             | "md"
             | "pdf"
             | "csv"
+            | "tsv"
             | "json"
             | "toml"
             | "yaml"
@@ -566,4 +656,34 @@ fn normalize_locator(locator: &str) -> String {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn describe_output_verification_work(intent: OutputIntent) -> &'static str {
+    match intent {
+        OutputIntent::Unknown | OutputIntent::Create => "create and verify",
+        OutputIntent::Modify => "update and verify",
+        OutputIntent::Append => "append to and verify",
+        OutputIntent::Overwrite => "overwrite and verify",
+    }
+}
+
+fn describe_output_result(intent: OutputIntent) -> &'static str {
+    match intent {
+        OutputIntent::Unknown | OutputIntent::Create => "created",
+        OutputIntent::Modify => "updated",
+        OutputIntent::Append => "appended",
+        OutputIntent::Overwrite => "overwritten",
+    }
+}
+
+fn output_intent_needs_current_content(intent: OutputIntent) -> bool {
+    matches!(intent, OutputIntent::Modify | OutputIntent::Append)
+}
+
+fn uppercase_first(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
 }

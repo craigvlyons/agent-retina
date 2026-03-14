@@ -85,6 +85,7 @@ Choose exactly one action and return strict JSON with these fields:\n\
 - max_entries\n\
 - max_results\n\
 - max_bytes\n\
+- max_rows\n\
 - max_chars\n\
 - page_start\n\
 - page_end\n\
@@ -103,6 +104,7 @@ Supported action types:\n\
 - find_files\n\
 - search_text\n\
 - read_file\n\
+- ingest_structured_data\n\
 - extract_document_text\n\
 - write_file\n\
 - append_file\n\
@@ -115,7 +117,11 @@ Planning rules:\n\
 - Respect the task shape in task_state. Discovery tasks, answer tasks, transform tasks, and output tasks should be handled differently.\n\
 - Choose the best next verifiable step that most reduces uncertainty or advances the requested result.\n\
 - If the task already names likely source files, directories, or output paths, target those artifacts directly instead of broad parent-directory listing unless location is genuinely uncertain.\n\
+- If task_state includes a requested output intent such as create, modify, append, or overwrite, preserve that intent when choosing the next step and when deciding whether the task is complete.\n\
+- For modify or append tasks, if the current content of the target artifact matters and has not been ingested yet, ingest it before changing it.\n\
+- If you use run_command to create or modify a specific artifact, set path to the target file so the harness can verify the change.\n\
 - Use whichever action gives the clearest verifiable progress: structured file actions, document extraction, or run_command for local shell pipelines, text processing, or small local scripts.\n\
+- Use ingest_structured_data for CSV/TSV-style local data when headers, rows, or sample records matter more than plain prose.\n\
 - Prefer readable text sources such as .md, .txt, code, and config files when multiple candidates could answer the task.\n\
 - Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
 - If the task asks for specific PDF pages, set page_start and page_end so the shell extracts only that page range.\n\
@@ -168,11 +174,57 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
         .as_ref()
         .map(|output| {
             format!(
-                "- {} [exists={}, verified={}]",
-                output.locator_hint, output.exists, output.verified
+                "- {} [intent={}, exists={}, verified={}]",
+                output.locator_hint, output.intent, output.exists, output.verified
             )
         })
         .unwrap_or_else(|| "- none".to_string());
+    let output_artifact = request
+        .context
+        .task_state
+        .output_artifact
+        .as_ref()
+        .map(|artifact| {
+            format!(
+                "- {} [{}|intent={}|exists={}|current_content_ingested={}|written_this_run={}|verified={}]",
+                artifact.locator_hint,
+                artifact.kind,
+                artifact.intent,
+                artifact.exists,
+                artifact.current_content_ingested,
+                artifact.written_this_run,
+                artifact.verified
+            )
+        })
+        .unwrap_or_else(|| "- none".to_string());
+    let source_set = if request.context.task_state.working_sources.is_empty() {
+        "- none".to_string()
+    } else {
+        request
+            .context
+            .task_state
+            .working_sources
+            .iter()
+            .take(5)
+            .map(|source| {
+                let scope = source
+                    .page_reference
+                    .as_ref()
+                    .map(|value| format!("|{value}"))
+                    .unwrap_or_default();
+                let method = source
+                    .extraction_method
+                    .as_ref()
+                    .map(|value| format!(" via {value}"))
+                    .unwrap_or_default();
+                format!(
+                    "- {} [{}|{}|{}{}]{}",
+                    source.locator, source.kind, source.role, source.status, scope, method
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let blockers = if request.context.task_state.frontier.blockers.is_empty() {
         "- none".to_string()
     } else {
@@ -188,11 +240,13 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
     };
 
     format!(
-        "Constraints:\n{}\n\nTask shape:\n- kind: {}\n- required inputs:\n{}\n- requested output:\n{}\n- blockers:\n{}\n\nDynamic task context follows in the next block. Use it as the mutable working set for this step.",
+        "Constraints:\n{}\n\nTask shape:\n- kind: {}\n- required inputs:\n{}\n- requested output:\n{}\n- output artifact state:\n{}\n- compact source set:\n{}\n- blockers:\n{}\n\nDynamic task context follows in the next block. Use it as the mutable working set for this step.",
         constraints,
         request.context.task_state.shape.kind,
         required_inputs,
         requested_output,
+        output_artifact,
+        source_set,
         blockers
     )
 }

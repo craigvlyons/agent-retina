@@ -1,8 +1,12 @@
+// File boundary: keep lib.rs limited to shared test harness surfaces and small
+// cross-crate utilities. Move scenario-specific helpers into modules as it grows.
 use chrono::Utc;
 use retina_traits::{Memory, Reasoner, Shell};
 use retina_types::*;
 use serde_json::json;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -278,6 +282,7 @@ impl Reasoner for MockReasoner {
 pub struct MockShell {
     force_unchanged: bool,
     inputs: Arc<Mutex<Vec<String>>>,
+    files: Arc<Mutex<HashMap<PathBuf, String>>>,
 }
 
 impl Default for MockShell {
@@ -285,6 +290,7 @@ impl Default for MockShell {
         Self {
             force_unchanged: false,
             inputs: Arc::new(Mutex::new(Vec::new())),
+            files: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -297,6 +303,21 @@ impl MockShell {
 
     pub fn with_inputs(mut self, inputs: Vec<String>) -> Self {
         self.inputs = Arc::new(Mutex::new(inputs));
+        self
+    }
+
+    pub fn with_files<I, P, S>(mut self, files: I) -> Self
+    where
+        I: IntoIterator<Item = (P, S)>,
+        P: Into<PathBuf>,
+        S: Into<String>,
+    {
+        self.files = Arc::new(Mutex::new(
+            files
+                .into_iter()
+                .map(|(path, content)| (path.into(), content.into()))
+                .collect(),
+        ));
         self
     }
 }
@@ -312,6 +333,7 @@ impl Shell for MockShell {
     }
 
     fn capture_state(&self, scope: &HashScope) -> Result<StateSnapshot> {
+        let files = recover_mutex(&self.files);
         Ok(StateSnapshot {
             scope: scope.clone(),
             cwd: current_cwd(),
@@ -323,7 +345,27 @@ impl Shell for MockShell {
                     .unwrap_or_default()
                     .to_string()
             },
-            files: Vec::new(),
+            files: scope
+                .tracked_paths
+                .iter()
+                .map(|tracked| {
+                    let content = files.get(&tracked.path).cloned();
+                    PathState {
+                        path: tracked.path.clone(),
+                        exists: content.is_some(),
+                        size: content.as_ref().map(|value| value.len() as u64),
+                        modified_at: None,
+                        content_hash: content
+                            .as_ref()
+                            .filter(|_| tracked.include_content)
+                            .map(|value| {
+                                let mut hasher = DefaultHasher::new();
+                                value.hash(&mut hasher);
+                                hasher.finish().to_string()
+                            }),
+                    }
+                })
+                .collect(),
             last_command: None,
         })
     }
@@ -335,30 +377,74 @@ impl Shell for MockShell {
         action: Option<&Action>,
     ) -> Result<StateDelta> {
         let expect_change = action.map(Action::expects_change).unwrap_or(false);
-        if before.cwd_hash == after.cwd_hash && expect_change {
+        let changed_paths = after
+            .files
+            .iter()
+            .filter(|after_path| {
+                before
+                    .files
+                    .iter()
+                    .find(|before_path| before_path.path == after_path.path)
+                    .map(|before_path| {
+                        before_path.exists != after_path.exists
+                            || before_path.size != after_path.size
+                            || before_path.content_hash != after_path.content_hash
+                    })
+                    .unwrap_or(true)
+            })
+            .map(|state| state.path.clone())
+            .collect::<Vec<_>>();
+        if before.cwd_hash == after.cwd_hash && changed_paths.is_empty() && expect_change {
             Ok(StateDelta::unchanged())
         } else {
             Ok(StateDelta {
-                kind: StateDeltaKind::ChangedAsExpected,
-                summary: "changed".to_string(),
-                changed_paths: Vec::new(),
+                kind: if changed_paths.is_empty() {
+                    StateDeltaKind::Unchanged
+                } else {
+                    StateDeltaKind::ChangedAsExpected
+                },
+                summary: if changed_paths.is_empty() {
+                    "no state change detected".to_string()
+                } else {
+                    "changed".to_string()
+                },
+                changed_paths,
             })
         }
     }
 
     fn execute(&self, action: &Action) -> Result<ActionResult> {
         match action {
-            Action::RunCommand { command, .. } => Ok(ActionResult::Command(CommandResult {
-                command: command.clone(),
-                cwd: current_cwd(),
-                stdout: "ok".to_string(),
-                stderr: String::new(),
-                exit_code: Some(0),
-                success: true,
-                duration_ms: 1,
-                cancelled: false,
-                termination: None,
-            })),
+            Action::RunCommand {
+                command,
+                expect_change,
+                state_scope,
+                ..
+            } => {
+                if *expect_change {
+                    if let Some(tracked) = state_scope.tracked_paths.first() {
+                        let mut files = recover_mutex(&self.files);
+                        let entry = files.entry(tracked.path.clone()).or_default();
+                        if command.contains(">>") {
+                            entry.push_str("command-output\n");
+                        } else {
+                            *entry = "command-output\n".to_string();
+                        }
+                    }
+                }
+                Ok(ActionResult::Command(CommandResult {
+                    command: command.clone(),
+                    cwd: current_cwd(),
+                    stdout: "ok".to_string(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    success: true,
+                    duration_ms: 1,
+                    cancelled: false,
+                    termination: None,
+                    observed_paths: Vec::new(),
+                }))
+            }
             Action::InspectPath { path, .. } => Ok(ActionResult::Inspection(WorldState {
                 cwd: path.clone(),
                 files: Vec::new(),
@@ -382,10 +468,34 @@ impl Shell for MockShell {
             }),
             Action::ReadFile { path, .. } => Ok(ActionResult::FileRead {
                 path: path.clone(),
-                content: "mock-content".to_string(),
+                content: recover_mutex(&self.files)
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| "mock-content".to_string()),
                 truncated: false,
             }),
-            Action::ExtractDocumentText { path, .. } => Ok(ActionResult::DocumentText {
+            Action::IngestStructuredData { path, .. } => Ok(ActionResult::StructuredData {
+                path: path.clone(),
+                format: path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("csv")
+                    .to_string(),
+                headers: vec!["name".to_string(), "value".to_string()],
+                rows: vec![StructuredDataRow {
+                    row_number: 1,
+                    values: vec!["mock".to_string(), "content".to_string()],
+                }],
+                total_rows: 1,
+                truncated: false,
+                extraction_method: "mock_structured_read".to_string(),
+            }),
+            Action::ExtractDocumentText {
+                path,
+                page_start,
+                page_end,
+                ..
+            } => Ok(ActionResult::DocumentText {
                 path: path.clone(),
                 content: "mock-document-content".to_string(),
                 truncated: false,
@@ -395,19 +505,37 @@ impl Shell for MockShell {
                     .unwrap_or("document")
                     .to_string(),
                 extraction_method: "mock_extract".to_string(),
-                page_range: None,
+                page_range: page_start.map(|start_page| DocumentPageRange {
+                    start_page,
+                    end_page: page_end.unwrap_or(start_page),
+                }),
                 structured_rows_detected: false,
             }),
-            Action::WriteFile { path, content, .. } => Ok(ActionResult::FileWrite {
-                path: path.clone(),
-                bytes_written: content.len(),
-                appended: false,
-            }),
-            Action::AppendFile { path, content, .. } => Ok(ActionResult::FileWrite {
-                path: path.clone(),
-                bytes_written: content.len(),
-                appended: true,
-            }),
+            Action::WriteFile { path, content, .. } => {
+                let mut files = recover_mutex(&self.files);
+                let existed_before = files.insert(path.clone(), content.clone()).is_some();
+                Ok(ActionResult::FileWrite {
+                    path: path.clone(),
+                    bytes_written: content.len(),
+                    created: !existed_before,
+                    overwritten: existed_before,
+                    appended: false,
+                })
+            }
+            Action::AppendFile { path, content, .. } => {
+                let mut files = recover_mutex(&self.files);
+                let existed_before = files.contains_key(path);
+                files.entry(path.clone())
+                    .and_modify(|existing| existing.push_str(content))
+                    .or_insert_with(|| content.clone());
+                Ok(ActionResult::FileWrite {
+                    path: path.clone(),
+                    bytes_written: content.len(),
+                    created: !existed_before,
+                    overwritten: false,
+                    appended: true,
+                })
+            }
             Action::RecordNote { note, .. } => {
                 Ok(ActionResult::NoteRecorded { note: note.clone() })
             }

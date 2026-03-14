@@ -117,6 +117,7 @@ pub(crate) struct ClaudeAction {
     pub(crate) max_entries: Option<usize>,
     pub(crate) max_results: Option<usize>,
     pub(crate) max_bytes: Option<usize>,
+    pub(crate) max_rows: Option<usize>,
     pub(crate) max_chars: Option<usize>,
     pub(crate) page_start: Option<usize>,
     pub(crate) page_end: Option<usize>,
@@ -137,9 +138,18 @@ impl ClaudeAction {
                 command: self.command.unwrap_or_else(|| "pwd".to_string()),
                 cwd: None,
                 require_approval: self.require_approval.unwrap_or(false),
-                expect_change: self.expect_change.unwrap_or(false),
+                expect_change: self.expect_change.unwrap_or(self.path.is_some()),
                 state_scope: HashScope {
-                    tracked_paths: Vec::new(),
+                    tracked_paths: self
+                        .path
+                        .clone()
+                        .map(|path| {
+                            vec![TrackedPath {
+                                path: path.into(),
+                                include_content: true,
+                            }]
+                        })
+                        .unwrap_or_default(),
                     include_working_directory: true,
                     include_last_command: true,
                 },
@@ -171,6 +181,11 @@ impl ClaudeAction {
                 id: ActionId::new(),
                 path: self.path.unwrap_or_else(|| ".".to_string()).into(),
                 max_bytes: self.max_bytes,
+            },
+            "ingest_structured_data" => Action::IngestStructuredData {
+                id: ActionId::new(),
+                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
+                max_rows: self.max_rows,
             },
             "extract_document_text" => Action::ExtractDocumentText {
                 id: ActionId::new(),

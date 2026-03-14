@@ -31,6 +31,7 @@ impl CliShell {
                     duration_ms: start.elapsed().as_millis() as u64,
                     cancelled,
                     termination,
+                    observed_paths: Vec::new(),
                 };
                 return Ok(result);
             }

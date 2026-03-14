@@ -1,3 +1,5 @@
+// File boundary: keep lib.rs focused on reasoner wiring and top-level provider
+// orchestration. Move payload, config, planner, and parsing logic into modules.
 mod config;
 mod payload;
 mod planner;
@@ -164,6 +166,7 @@ mod tests {
                             output_written: false,
                             output_verified: false,
                         },
+                        output_artifact: None,
                         frontier: TaskFrontier {
                             next_action_hint: None,
                             open_questions: Vec::new(),
@@ -347,6 +350,7 @@ mod tests {
             max_entries: None,
             max_results: None,
             max_bytes: None,
+            max_rows: None,
             max_chars: None,
             page_start: None,
             page_end: None,
@@ -372,6 +376,7 @@ mod tests {
             max_entries: None,
             max_results: None,
             max_bytes: None,
+            max_rows: None,
             max_chars: None,
             page_start: None,
             page_end: None,
@@ -392,6 +397,50 @@ mod tests {
         match append.action {
             Action::AppendFile { .. } => {}
             other => panic!("expected append action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_command_with_target_path_tracks_that_artifact_for_verification() {
+        let response = ClaudeAction {
+            action_type: "run_command".to_string(),
+            command: Some("python script.py > out.txt".to_string()),
+            path: Some("out.txt".to_string()),
+            root: None,
+            pattern: None,
+            query: None,
+            content: None,
+            include_content: None,
+            recursive: None,
+            max_entries: None,
+            max_results: None,
+            max_bytes: None,
+            max_rows: None,
+            max_chars: None,
+            page_start: None,
+            page_end: None,
+            overwrite: None,
+            require_approval: None,
+            expect_change: None,
+            note: None,
+            message: None,
+            task_complete: Some(false),
+            reasoning: None,
+        }
+        .into_reason_response();
+
+        match response.action {
+            Action::RunCommand {
+                expect_change,
+                state_scope,
+                ..
+            } => {
+                assert!(expect_change);
+                assert_eq!(state_scope.tracked_paths.len(), 1);
+                assert_eq!(state_scope.tracked_paths[0].path, std::path::PathBuf::from("out.txt"));
+                assert!(state_scope.tracked_paths[0].include_content);
+            }
+            other => panic!("expected run_command action, got {other:?}"),
         }
     }
 }

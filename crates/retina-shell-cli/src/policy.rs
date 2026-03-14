@@ -99,6 +99,7 @@ fn validate_action(authority: &AgentAuthority, action: &Action) -> Result<()> {
         }
         Action::InspectPath { path, .. }
         | Action::ReadFile { path, .. }
+        | Action::IngestStructuredData { path, .. }
         | Action::ExtractDocumentText { path, .. } => {
             if !authority.allow_file_reads {
                 return Err(KernelError::Unsupported(

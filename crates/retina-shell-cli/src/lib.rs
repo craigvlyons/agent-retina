@@ -1,3 +1,5 @@
+// File boundary: keep lib.rs focused on shell wiring and the top-level CLI shell
+// type. Move file/process/state helpers into sibling modules before growth.
 mod file_ops;
 mod policy;
 mod process_control;
@@ -224,6 +226,18 @@ impl Shell for CliShell {
                     truncated,
                 })
             }
+            Action::IngestStructuredData { path, max_rows, .. } => {
+                let structured = Self::ingest_structured_data(path, *max_rows)?;
+                Ok(ActionResult::StructuredData {
+                    path: Self::resolve_path(path)?,
+                    format: structured.format,
+                    headers: structured.headers,
+                    rows: structured.rows,
+                    total_rows: structured.total_rows,
+                    truncated: structured.truncated,
+                    extraction_method: structured.extraction_method,
+                })
+            }
             Action::ExtractDocumentText {
                 path,
                 max_chars,
@@ -255,18 +269,23 @@ impl Shell for CliShell {
                 overwrite,
                 ..
             } => {
-                let bytes_written = Self::write_file(path, content, *overwrite)?;
+                let (bytes_written, created, overwritten) =
+                    Self::write_file(path, content, *overwrite)?;
                 Ok(ActionResult::FileWrite {
                     path: Self::resolve_path(path)?,
                     bytes_written,
+                    created,
+                    overwritten,
                     appended: false,
                 })
             }
             Action::AppendFile { path, content, .. } => {
-                let bytes_written = Self::append_file(path, content)?;
+                let (bytes_written, created) = Self::append_file(path, content)?;
                 Ok(ActionResult::FileWrite {
                     path: Self::resolve_path(path)?,
                     bytes_written,
+                    created,
+                    overwritten: false,
                     appended: true,
                 })
             }
@@ -581,6 +600,43 @@ mod tests {
         assert!(!content.to_lowercase().contains("first"));
         assert!(content.to_lowercase().contains("second"));
         assert!(!content.to_lowercase().contains("third"));
+    }
+
+    #[test]
+    fn ingest_structured_data_reads_csv_headers_and_rows() {
+        let dir = must_tempdir();
+        let file = dir.path().join("people.csv");
+        must(fs::write(
+            &file,
+            "name,role,city\nCraig,Engineer,Denver\nEmily,Designer,Boulder\n",
+        ));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::IngestStructuredData {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_rows: Some(1),
+        }));
+        let ActionResult::StructuredData {
+            path,
+            format,
+            headers,
+            rows,
+            total_rows,
+            truncated,
+            extraction_method,
+        } = result
+        else {
+            panic!("expected structured data");
+        };
+        assert_eq!(path, file);
+        assert_eq!(format, "csv");
+        assert_eq!(headers, vec!["name", "role", "city"]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row_number, 1);
+        assert_eq!(rows[0].values, vec!["Craig", "Engineer", "Denver"]);
+        assert_eq!(total_rows, 2);
+        assert!(truncated);
+        assert_eq!(extraction_method, "csv_reader");
     }
 
     fn write_test_pdf_pages(path: &Path, pages: &[&str]) {

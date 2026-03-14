@@ -243,6 +243,17 @@ pub(crate) fn action_utility(action: &Action, result: &ActionResult, delta: &Sta
                 0.85
             }
         }
+        ActionResult::StructuredData {
+            rows, truncated, ..
+        } => {
+            if rows.is_empty() {
+                0.05
+            } else if *truncated {
+                0.65
+            } else {
+                0.85
+            }
+        }
         ActionResult::TextSearch { matches, .. } => {
             if matches.is_empty() {
                 0.1
@@ -292,6 +303,12 @@ pub(crate) fn default_tool_descriptors(capabilities: ShellCapabilities) -> Vec<T
         tools.push(ToolDescriptor {
             name: "read_file".to_string(),
             description: "Read text-like files such as markdown, code, config, and plaintext with truncation protection.".to_string(),
+        });
+        tools.push(ToolDescriptor {
+            name: "ingest_structured_data".to_string(),
+            description:
+                "Inspect structured local data such as CSV or TSV files by headers and sample rows."
+                    .to_string(),
         });
     }
     if capabilities.can_extract_documents {
