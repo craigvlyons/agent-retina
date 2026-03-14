@@ -4,7 +4,7 @@ use crate::controller::{AgentController, InspectController};
 use crate::maintenance::run_cleanup;
 use crate::output::{
     render_action_result, render_agent_registry, render_cleanup_report, render_memory_inspection,
-    render_stats, render_timeline, render_worker_overview,
+    render_stats, render_task_state, render_timeline, render_worker_overview,
 };
 use crate::runtime::init_runtime;
 use clap::Parser;
@@ -60,6 +60,10 @@ pub fn inspect(command: InspectCommands) -> Result<()> {
             let events = inspector.recent_timeline(50)?;
             print!("{}", render_timeline(&events));
         }
+        InspectCommands::TaskState => match inspector.latest_task_state()? {
+            Some(task_state) => print!("{}", render_task_state(&task_state)),
+            None => println!("No task state snapshots recorded yet."),
+        },
         InspectCommands::Overview => {
             let overview = inspector.worker_overview()?;
             print!("{}", render_worker_overview(&overview));

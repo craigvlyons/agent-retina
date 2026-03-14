@@ -147,6 +147,7 @@ pub struct WorkerOverview {
     pub db_size_bytes: u64,
     pub terminal_tasks: TerminalTaskStats,
     pub active_rules: Vec<ReflexiveRule>,
+    pub compaction_stats: CompactionStats,
 }
 
 pub struct TerminalTaskStats {
@@ -154,6 +155,12 @@ pub struct TerminalTaskStats {
     pub failed: usize,
     pub cancelled: usize,
     pub blocked: usize,
+}
+
+pub struct CompactionStats {
+    pub compaction_events: usize,
+    pub cache_reads: u64,
+    pub cache_creations: u64,
 }
 
 impl InspectController {
@@ -165,6 +172,18 @@ impl InspectController {
 
     pub fn recent_timeline(&self, limit: usize) -> Result<Vec<TimelineEvent>> {
         self.memory.recent_states(limit)
+    }
+
+    pub fn latest_task_state(&self) -> Result<Option<TaskState>> {
+        let events = self.memory.recent_states(200)?;
+        for event in events {
+            if let Some(value) = event.payload_json.get("task_state") {
+                let task_state = serde_json::from_value::<TaskState>(value.clone())
+                    .map_err(|error| KernelError::Storage(error.to_string()))?;
+                return Ok(Some(task_state));
+            }
+        }
+        Ok(None)
     }
 
     pub fn memory_lookup(
@@ -190,6 +209,7 @@ impl InspectController {
             .unwrap_or(root_manifest()?);
         let stats = self.memory.stats()?;
         let terminal_tasks = summarize_terminal_tasks(&self.memory.recent_states(200)?);
+        let recent_events = self.memory.recent_states(500)?;
         let active_rules = self.memory.active_rules()?;
         let db_size_bytes = std::fs::metadata(&db_path)
             .map(|meta| meta.len())
@@ -202,6 +222,7 @@ impl InspectController {
             db_size_bytes,
             terminal_tasks,
             active_rules,
+            compaction_stats: summarize_compaction_stats(&recent_events),
         })
     }
 
@@ -316,6 +337,30 @@ fn summarize_terminal_tasks(events: &[TimelineEvent]) -> TerminalTaskStats {
                     stats.blocked += 1;
                 }
             }
+        }
+    }
+
+    stats
+}
+
+fn summarize_compaction_stats(events: &[TimelineEvent]) -> CompactionStats {
+    let mut stats = CompactionStats {
+        compaction_events: 0,
+        cache_reads: 0,
+        cache_creations: 0,
+    };
+
+    for event in events {
+        if matches!(event.event_type, TimelineEventType::TaskCompacted) {
+            stats.compaction_events += 1;
+        }
+        if let Some(tokens) = event
+            .payload_json
+            .get("tokens")
+            .and_then(|value| serde_json::from_value::<TokenUsage>(value.clone()).ok())
+        {
+            stats.cache_reads += tokens.cache_read_input_tokens as u64;
+            stats.cache_creations += tokens.cache_creation_input_tokens as u64;
         }
     }
 

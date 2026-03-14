@@ -465,9 +465,9 @@ fn terminate_child_gracefully(child: &mut Child) -> Result<()> {
         if result == 0 {
             return Ok(());
         }
-        return Err(KernelError::Execution(
+        Err(KernelError::Execution(
             io::Error::last_os_error().to_string(),
-        ));
+        ))
     }
 
     #[cfg(not(unix))]
@@ -486,7 +486,7 @@ fn force_kill_child(child: &mut Child) -> Result<()> {
             return Ok(());
         }
         child.kill()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -838,19 +838,25 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
 
+    fn must<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
+        result.unwrap_or_else(|error| panic!("test operation failed: {error}"))
+    }
+
+    fn must_tempdir() -> tempfile::TempDir {
+        tempdir().unwrap_or_else(|error| panic!("failed to create tempdir: {error}"))
+    }
+
     #[test]
     fn command_execution_captures_output() {
         let shell = CliShell::new();
-        let result = shell
-            .execute(&Action::RunCommand {
-                id: ActionId::new(),
-                command: "printf 'hello'".to_string(),
-                cwd: None,
-                require_approval: false,
-                expect_change: false,
-                state_scope: HashScope::default(),
-            })
-            .unwrap();
+        let result = must(shell.execute(&Action::RunCommand {
+            id: ActionId::new(),
+            command: "printf 'hello'".to_string(),
+            cwd: None,
+            require_approval: false,
+            expect_change: false,
+            state_scope: HashScope::default(),
+        }));
         let ActionResult::Command(result) = result else {
             panic!("expected command result");
         };
@@ -870,19 +876,17 @@ mod tests {
             cancel_handle.request_cancel();
         });
 
-        let result = shell
-            .execute_controlled(
-                &Action::RunCommand {
-                    id: ActionId::new(),
-                    command: "sleep 5".to_string(),
-                    cwd: None,
-                    require_approval: false,
-                    expect_change: false,
-                    state_scope: HashScope::default(),
-                },
-                Some(&handle),
-            )
-            .unwrap();
+        let result = must(shell.execute_controlled(
+            &Action::RunCommand {
+                id: ActionId::new(),
+                command: "sleep 5".to_string(),
+                cwd: None,
+                require_approval: false,
+                expect_change: false,
+                state_scope: HashScope::default(),
+            },
+            Some(&handle),
+        ));
         let ActionResult::Command(result) = result else {
             panic!("expected command result");
         };
@@ -893,17 +897,15 @@ mod tests {
 
     #[test]
     fn read_file_returns_content() {
-        let dir = tempdir().unwrap();
+        let dir = must_tempdir();
         let file = dir.path().join("note.txt");
-        fs::write(&file, "hello retina").unwrap();
+        must(fs::write(&file, "hello retina"));
         let shell = CliShell::new();
-        let result = shell
-            .execute(&Action::ReadFile {
-                id: ActionId::new(),
-                path: file.clone(),
-                max_bytes: None,
-            })
-            .unwrap();
+        let result = must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }));
         let ActionResult::FileRead {
             path,
             content,
@@ -919,17 +921,18 @@ mod tests {
 
     #[test]
     fn read_file_rejects_pdf_and_requests_document_tool() {
-        let dir = tempdir().unwrap();
+        let dir = must_tempdir();
         let file = dir.path().join("resume.pdf");
         write_test_pdf(&file, "hello pdf");
         let shell = CliShell::new();
-        let error = shell
-            .execute(&Action::ReadFile {
-                id: ActionId::new(),
-                path: file.clone(),
-                max_bytes: None,
-            })
-            .unwrap_err();
+        let error = match shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }) {
+            Ok(_) => panic!("expected unsupported error"),
+            Err(error) => error,
+        };
         let KernelError::Unsupported(message) = error else {
             panic!("expected unsupported error");
         };
@@ -938,18 +941,16 @@ mod tests {
 
     #[test]
     fn find_files_returns_matches() {
-        let dir = tempdir().unwrap();
+        let dir = must_tempdir();
         let target = dir.path().join("target.txt");
-        fs::write(&target, "hello").unwrap();
+        must(fs::write(&target, "hello"));
         let shell = CliShell::new();
-        let result = shell
-            .execute(&Action::FindFiles {
-                id: ActionId::new(),
-                root: dir.path().to_path_buf(),
-                pattern: "target".to_string(),
-                max_results: 10,
-            })
-            .unwrap();
+        let result = must(shell.execute(&Action::FindFiles {
+            id: ActionId::new(),
+            root: dir.path().to_path_buf(),
+            pattern: "target".to_string(),
+            max_results: 10,
+        }));
         let ActionResult::FileMatches { matches, .. } = result else {
             panic!("expected file matches");
         };
@@ -958,9 +959,9 @@ mod tests {
 
     #[test]
     fn state_capture_detects_file_change() {
-        let dir = tempdir().unwrap();
+        let dir = must_tempdir();
         let file = dir.path().join("note.txt");
-        fs::write(&file, "before").unwrap();
+        must(fs::write(&file, "before"));
         let shell = CliShell::new();
         let scope = HashScope {
             tracked_paths: vec![TrackedPath {
@@ -970,31 +971,29 @@ mod tests {
             include_working_directory: false,
             include_last_command: false,
         };
-        let before = shell.capture_state(&scope).unwrap();
-        fs::write(&file, "after").unwrap();
-        let after = shell.capture_state(&scope).unwrap();
-        let delta = shell
-            .compare_state(
-                &before,
-                &after,
-                Some(&Action::WriteFile {
-                    id: ActionId::new(),
-                    path: file.clone(),
-                    content: "after".to_string(),
-                    overwrite: true,
-                    require_approval: true,
-                }),
-            )
-            .unwrap();
+        let before = must(shell.capture_state(&scope));
+        must(fs::write(&file, "after"));
+        let after = must(shell.capture_state(&scope));
+        let delta = must(shell.compare_state(
+            &before,
+            &after,
+            Some(&Action::WriteFile {
+                id: ActionId::new(),
+                path: file.clone(),
+                content: "after".to_string(),
+                overwrite: true,
+                require_approval: true,
+            }),
+        ));
         assert!(matches!(delta.kind, StateDeltaKind::ChangedAsExpected));
         assert_eq!(delta.changed_paths, vec![file]);
     }
 
     #[test]
     fn state_capture_reports_unchanged_for_noop() {
-        let dir = tempdir().unwrap();
+        let dir = must_tempdir();
         let file = dir.path().join("note.txt");
-        fs::write(&file, "same").unwrap();
+        must(fs::write(&file, "same"));
         let shell = CliShell::new();
         let scope = HashScope {
             tracked_paths: vec![TrackedPath {
@@ -1004,25 +1003,23 @@ mod tests {
             include_working_directory: false,
             include_last_command: false,
         };
-        let before = shell.capture_state(&scope).unwrap();
-        let after = shell.capture_state(&scope).unwrap();
-        let delta = shell.compare_state(&before, &after, None).unwrap();
+        let before = must(shell.capture_state(&scope));
+        let after = must(shell.capture_state(&scope));
+        let delta = must(shell.compare_state(&before, &after, None));
         assert!(matches!(delta.kind, StateDeltaKind::Unchanged));
     }
 
     #[test]
     fn extract_document_text_reads_pdf_text() {
-        let dir = tempdir().unwrap();
+        let dir = must_tempdir();
         let file = dir.path().join("sample.pdf");
         write_test_pdf(&file, "hello pdf");
         let shell = CliShell::new();
-        let result = shell
-            .execute(&Action::ExtractDocumentText {
-                id: ActionId::new(),
-                path: file.clone(),
-                max_chars: None,
-            })
-            .unwrap();
+        let result = must(shell.execute(&Action::ExtractDocumentText {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_chars: None,
+        }));
         let ActionResult::DocumentText {
             content, format, ..
         } = result
@@ -1050,7 +1047,9 @@ mod tests {
                 Operation::new("ET", vec![]),
             ],
         };
-        let encoded = content.encode().unwrap();
+        let encoded = content
+            .encode()
+            .unwrap_or_else(|error| panic!("failed to encode PDF test content: {error}"));
 
         document.objects.insert(
             font_id,
@@ -1097,6 +1096,8 @@ mod tests {
         });
         document.trailer.set("Root", catalog_id);
         document.compress();
-        document.save(path).unwrap();
+        document
+            .save(path)
+            .unwrap_or_else(|error| panic!("failed to save test PDF: {error}"));
     }
 }

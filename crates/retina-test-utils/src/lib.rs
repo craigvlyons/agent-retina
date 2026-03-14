@@ -186,6 +186,8 @@ impl Memory for MockMemory {
             merged_knowledge: 0,
             promoted_rules: promoted,
             compacted_events: 0,
+            decayed_knowledge: 0,
+            optimized: false,
         })
     }
 
@@ -218,6 +220,8 @@ impl MockReasoner {
             tokens_used: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             },
         })
     }
@@ -251,6 +255,8 @@ impl Reasoner for MockReasoner {
                 tokens_used: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
                 },
             })
         };

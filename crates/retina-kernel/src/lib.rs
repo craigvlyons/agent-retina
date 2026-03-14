@@ -94,7 +94,14 @@ impl Kernel {
                 "recommended_route": format!("{:?}", routing.recommended_decision),
                 "routing_rationale": routing.rationale,
                 "routing_candidates": routing.candidates,
-                "network_enabled": routing.network_enabled
+                "network_enabled": routing.network_enabled,
+                "task_state": self.build_task_state(
+                    &task,
+                    &TaskLoopState::new(config.max_steps),
+                    1,
+                    config.max_steps,
+                    None,
+                )
             }),
         ))?;
         self.emit_event(EventSpec::new(
@@ -153,13 +160,15 @@ impl Kernel {
             }
 
             let step = self.select_action(
-                &task,
-                &intent,
+                StepSelectionContext {
+                    task: &task,
+                    intent: &intent,
+                    state: &state,
+                    control: config.control.as_ref(),
+                    current_step: state.step_index + 1,
+                    max_steps: config.max_steps,
+                },
                 next_reflex_action.take(),
-                &state,
-                config.control.as_ref(),
-                state.step_index + 1,
-                config.max_steps,
             )?;
             if let Some(outcome) = self.check_cancellation(
                 &task,
@@ -173,6 +182,39 @@ impl Kernel {
             let outcome =
                 self.execute_action(&task, &mut intent, &step, config.control.as_ref(), true)?;
             let progress = state.record_step(&step, &outcome)?;
+            let compaction = state.apply_live_compaction();
+            let task_state = self.build_task_state(
+                &task,
+                &state,
+                state.step_index.max(1),
+                config.max_steps,
+                state.last_result_summary.clone(),
+            );
+
+            if let Some(compaction) = compaction {
+                self.emit_event(EventSpec::new(
+                    &task,
+                    Some(&intent),
+                    Some(&step.action),
+                    TimelineEventType::TaskCompacted,
+                    json!({
+                        "reason": compaction.reason,
+                        "score_explanations": compaction.score_explanations,
+                        "task_state": task_state.clone()
+                    }),
+                ))?;
+            }
+
+            self.emit_event(EventSpec::new(
+                &task,
+                Some(&intent),
+                Some(&step.action),
+                TimelineEventType::TaskStepCompleted,
+                json!({
+                    "result": "step_completed",
+                    "task_state": task_state
+                }),
+            ))?;
 
             if progress.repeated_without_progress {
                 return self.reflect_or_fail(
@@ -185,6 +227,19 @@ impl Kernel {
                 );
             }
 
+            if step.task_complete {
+                self.emit_event(EventSpec::new(
+                    &task,
+                    Some(&intent),
+                    Some(&step.action),
+                    TimelineEventType::TaskCompleted,
+                    json!({
+                        "outcome": "success",
+                        "task_state": task_state
+                    }),
+                ))?;
+            }
+
             if step.task_complete || matches!(outcome, Outcome::Failure(_) | Outcome::Blocked(_)) {
                 return Ok(outcome);
             }
@@ -193,14 +248,17 @@ impl Kernel {
 
     fn select_action(
         &self,
-        task: &Task,
-        intent: &Intent,
+        selection: StepSelectionContext<'_>,
         reflex_action: Option<Action>,
-        state: &TaskLoopState,
-        control: Option<&ExecutionControlHandle>,
-        current_step: usize,
-        max_steps: usize,
     ) -> Result<StepDecision> {
+        let StepSelectionContext {
+            task,
+            intent,
+            state,
+            control,
+            current_step,
+            max_steps,
+        } = selection;
         if let Some(action) = reflex_action {
             self.emit_event(EventSpec::new(
                 task,
@@ -215,15 +273,15 @@ impl Kernel {
             });
         }
 
-        let context = self.assemble_context(
+        let context = self.assemble_context(ContextAssemblyInput {
             task,
-            state.last_result_json.clone(),
-            state.last_result_summary.clone(),
-            state.recent_steps.clone(),
-            control.and_then(ExecutionControlHandle::take_guidance),
+            state,
+            last_result: state.last_result_json.clone(),
+            last_result_summary: state.last_result_summary.clone(),
+            operator_guidance: control.and_then(ExecutionControlHandle::take_guidance),
             current_step,
             max_steps,
-        )?;
+        })?;
         let response = self.reasoner.reason(&ReasonRequest {
             tools: context.tools.clone(),
             context,
@@ -303,12 +361,12 @@ impl Kernel {
                 reason: approval_reason(&action),
             })?;
             if matches!(response, ApprovalResponse::Cancelled) {
-                return Ok(self.cancel_outcome(
+                return self.cancel_outcome(
                     task,
                     Some(intent),
                     Some(&action),
                     "task cancelled by operator during approval",
-                )?);
+                );
             }
             if matches!(response, ApprovalResponse::Denied) {
                 return Err(KernelError::ApprovalDenied(
@@ -360,7 +418,7 @@ impl Kernel {
 
         if let ActionResult::Command(command) = &result {
             if command.cancelled {
-                return Ok(self.cancel_outcome(
+                return self.cancel_outcome(
                     task,
                     Some(intent),
                     Some(&action),
@@ -368,7 +426,7 @@ impl Kernel {
                         .termination
                         .clone()
                         .unwrap_or_else(|| "task cancelled by operator".to_string()),
-                )?);
+                );
             }
         }
 
@@ -444,23 +502,6 @@ impl Kernel {
             self.circuit_breaker.record_failure(intent);
             return self.reflect_or_fail(task, intent, &action, control, reason, allow_retry);
         }
-
-        self.emit_event(EventSpec::new(
-            task,
-            Some(intent),
-            Some(&action),
-            TimelineEventType::TaskStepCompleted,
-            json!({ "result": "step_completed" }),
-        ))?;
-        if step.task_complete {
-            self.emit_event(EventSpec::new(
-                task,
-                Some(intent),
-                Some(&action),
-                TimelineEventType::TaskCompleted,
-                json!({ "outcome": "success" }),
-            ))?;
-        }
         Ok(Outcome::Success(result))
     }
 
@@ -490,15 +531,27 @@ impl Kernel {
             json!({ "reason": reason }),
         ))?;
 
-        let reflection_context = self.assemble_context(
+        let mut reflection_state = TaskLoopState::new(1);
+        reflection_state.recent_steps = vec![format!("failed action: {}", action_label(action))];
+        reflection_state.recent_action_summaries = vec![RecentActionSummary {
+            step: 1,
+            action: action_label(action),
+            outcome: reason.clone(),
+            artifact_refs: Vec::new(),
+        }];
+        reflection_state.avoid_rules = vec![AvoidRule {
+            label: action_label(action),
+            reason: reason.clone(),
+        }];
+        let reflection_context = self.assemble_context(ContextAssemblyInput {
             task,
-            Some(reason.clone()),
-            Some(reason.clone()),
-            vec![format!("failed action: {}", action_label(action))],
-            control.and_then(ExecutionControlHandle::take_guidance),
-            1,
-            1,
-        )?;
+            state: &reflection_state,
+            last_result: Some(reason.clone()),
+            last_result_summary: Some(reason.clone()),
+            operator_guidance: control.and_then(ExecutionControlHandle::take_guidance),
+            current_step: 1,
+            max_steps: 1,
+        })?;
         let reflection = self.reasoner.reflect(&ReasonRequest {
             tools: reflection_context.tools.clone(),
             context: reflection_context,
@@ -581,16 +634,22 @@ impl Kernel {
         self.memory.record_experience(&experience)
     }
 
-    fn assemble_context(
-        &self,
-        task: &Task,
-        last_result: Option<String>,
-        last_result_summary: Option<String>,
-        recent_steps: Vec<String>,
-        operator_guidance: Option<String>,
-        current_step: usize,
-        max_steps: usize,
-    ) -> Result<AssembledContext> {
+    fn assemble_context(&self, input: ContextAssemblyInput<'_>) -> Result<AssembledContext> {
+        let ContextAssemblyInput {
+            task,
+            state,
+            last_result,
+            last_result_summary,
+            operator_guidance,
+            current_step,
+            max_steps,
+        } = input;
+        let shell_constraints = self
+            .shell
+            .constraints()
+            .iter()
+            .map(|constraint| format!("{constraint:?}"))
+            .collect::<Vec<_>>();
         let experiences = self.memory.recall_experiences(&task.description, 3)?;
         let knowledge = self.memory.recall_knowledge(&task.description, 3)?;
         let mut tools = default_tool_descriptors(self.shell.capabilities());
@@ -610,6 +669,15 @@ impl Kernel {
                 task.agent_id
             ),
             task: task.description.clone(),
+            task_state: self
+                .build_task_state(
+                    task,
+                    state,
+                    current_step,
+                    max_steps,
+                    last_result_summary.clone(),
+                )
+                .with_constraints(shell_constraints),
             tools,
             memory_slice: experiences
                 .into_iter()
@@ -636,11 +704,61 @@ impl Kernel {
                 .collect(),
             last_result,
             last_result_summary,
-            recent_steps,
+            recent_steps: state.recent_steps.clone(),
             operator_guidance,
             current_step,
             max_steps,
         })
+    }
+
+    fn build_task_state(
+        &self,
+        task: &Task,
+        state: &TaskLoopState,
+        current_step: usize,
+        max_steps: usize,
+        last_result_summary: Option<String>,
+    ) -> TaskState {
+        TaskState {
+            goal: TaskGoal {
+                objective: task.description.clone(),
+                success_criteria: Vec::new(),
+                constraints: Vec::new(),
+            },
+            progress: TaskProgress {
+                current_phase: describe_task_phase(state, current_step, max_steps),
+                current_step,
+                max_steps,
+                completed_checkpoints: state.recent_steps.clone(),
+                verified_facts: summarize_verified_facts(&state.artifact_references),
+            },
+            frontier: TaskFrontier {
+                next_action_hint: Some(
+                    match (last_result_summary, state.last_compaction_reason.as_ref()) {
+                        (Some(summary), Some(reason)) => format!(
+                            "Continue from compact task state ({reason}); use the latest verified result to choose the next smallest useful step: {summary}"
+                        ),
+                        (Some(summary), None) => format!(
+                            "Use the latest verified result to choose the next smallest useful step: {summary}"
+                        ),
+                        (None, Some(reason)) => {
+                            format!("Continue from compact task state ({reason})")
+                        }
+                        (None, None) => {
+                            "Choose the next smallest useful step from current task state"
+                                .to_string()
+                        }
+                    },
+                ),
+                open_questions: Vec::new(),
+                blockers: Vec::new(),
+            },
+            recent_actions: state.recent_action_summaries.clone(),
+            working_sources: state.working_sources.clone(),
+            artifact_references: state.artifact_references.clone(),
+            avoid: state.avoid_rules.clone(),
+            compaction: state.last_compaction_snapshot.clone(),
+        }
     }
 
     fn check_cancellation(
@@ -711,11 +829,37 @@ struct StepDecision {
     task_complete: bool,
 }
 
+struct StepSelectionContext<'a> {
+    task: &'a Task,
+    intent: &'a Intent,
+    state: &'a TaskLoopState,
+    control: Option<&'a ExecutionControlHandle>,
+    current_step: usize,
+    max_steps: usize,
+}
+
+struct ContextAssemblyInput<'a> {
+    task: &'a Task,
+    state: &'a TaskLoopState,
+    last_result: Option<String>,
+    last_result_summary: Option<String>,
+    operator_guidance: Option<String>,
+    current_step: usize,
+    max_steps: usize,
+}
+
 struct TaskLoopState {
     step_index: usize,
     last_result_json: Option<String>,
     last_result_summary: Option<String>,
     recent_steps: Vec<String>,
+    recent_action_summaries: Vec<RecentActionSummary>,
+    working_sources: Vec<WorkingSource>,
+    artifact_references: Vec<ArtifactReference>,
+    avoid_rules: Vec<AvoidRule>,
+    compaction_count: usize,
+    last_compaction_reason: Option<String>,
+    last_compaction_snapshot: Option<CompactionSnapshot>,
     seen_signatures: HashMap<String, usize>,
 }
 
@@ -726,6 +870,13 @@ impl TaskLoopState {
             last_result_json: None,
             last_result_summary: None,
             recent_steps: Vec::new(),
+            recent_action_summaries: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            avoid_rules: Vec::new(),
+            compaction_count: 0,
+            last_compaction_reason: None,
+            last_compaction_snapshot: None,
             seen_signatures: HashMap::new(),
         }
     }
@@ -736,6 +887,9 @@ impl TaskLoopState {
         self.last_result_json = match outcome {
             Outcome::Success(result) if !matches!(step.action, Action::Respond { .. }) => {
                 let summary = summarize_action_result(result);
+                let artifact_refs = artifact_references_for_result(result);
+                let working_sources =
+                    working_sources_for_result(&step.action, result, self.step_index + 1);
                 self.last_result_summary = Some(summary.clone());
                 self.recent_steps.push(format!(
                     "step {}: {} -> {}",
@@ -744,6 +898,15 @@ impl TaskLoopState {
                     summary
                 ));
                 trim_recent_steps(&mut self.recent_steps);
+                self.recent_action_summaries.push(RecentActionSummary {
+                    step: self.step_index,
+                    action: action_label(&step.action),
+                    outcome: summary.clone(),
+                    artifact_refs: artifact_refs.clone(),
+                });
+                trim_recent_action_summaries(&mut self.recent_action_summaries);
+                merge_working_sources(&mut self.working_sources, working_sources);
+                merge_artifact_references(&mut self.artifact_references, artifact_refs);
                 if let Some(signature) = repeated_step_signature(&step.action, result) {
                     let count = self.seen_signatures.entry(signature).or_insert(0);
                     *count += 1;
@@ -762,6 +925,13 @@ impl TaskLoopState {
                     action_label(&step.action)
                 ));
                 trim_recent_steps(&mut self.recent_steps);
+                self.recent_action_summaries.push(RecentActionSummary {
+                    step: self.step_index,
+                    action: action_label(&step.action),
+                    outcome: "responded to operator".to_string(),
+                    artifact_refs: Vec::new(),
+                });
+                trim_recent_action_summaries(&mut self.recent_action_summaries);
                 None
             }
             Outcome::Failure(reason) | Outcome::Blocked(reason) => {
@@ -773,6 +943,18 @@ impl TaskLoopState {
                     reason
                 ));
                 trim_recent_steps(&mut self.recent_steps);
+                self.recent_action_summaries.push(RecentActionSummary {
+                    step: self.step_index,
+                    action: action_label(&step.action),
+                    outcome: reason.clone(),
+                    artifact_refs: Vec::new(),
+                });
+                trim_recent_action_summaries(&mut self.recent_action_summaries);
+                self.avoid_rules.push(AvoidRule {
+                    label: action_label(&step.action),
+                    reason: reason.clone(),
+                });
+                trim_avoid_rules(&mut self.avoid_rules);
                 None
             }
         };
@@ -780,11 +962,62 @@ impl TaskLoopState {
             repeated_without_progress,
         })
     }
+
+    fn apply_live_compaction(&mut self) -> Option<CompactionDecision> {
+        let mut reasons = Vec::new();
+
+        if self.step_index >= 3 && self.recent_steps.len() > 3 {
+            reasons.push("step threshold".to_string());
+        }
+        if self
+            .last_result_json
+            .as_ref()
+            .map(|value| value.len() > 1400)
+            .unwrap_or(false)
+        {
+            reasons.push("large tool result".to_string());
+        }
+        if self.working_sources.len() > 6 {
+            reasons.push("source set growth".to_string());
+        }
+
+        if reasons.is_empty() {
+            return None;
+        }
+
+        let reason = reasons.join(", ");
+        let score_explanations = build_compaction_score_explanations(self);
+        self.compaction_count += 1;
+        self.last_compaction_reason = Some(reason.clone());
+        self.last_compaction_snapshot = Some(CompactionSnapshot {
+            reason: reason.clone(),
+            score_explanations: score_explanations.clone(),
+        });
+
+        if let Some(last_result) = self.last_result_json.as_ref() {
+            self.last_result_json = compact_last_result_for_compacted_context(last_result).ok();
+        }
+
+        trim_recent_steps_for_compacted_state(&mut self.recent_steps);
+        trim_recent_action_summaries_for_compacted_state(&mut self.recent_action_summaries);
+        trim_working_sources_for_compacted_state(&mut self.working_sources);
+        trim_artifact_references_for_compacted_state(&mut self.artifact_references);
+
+        Some(CompactionDecision {
+            reason,
+            score_explanations,
+        })
+    }
 }
 
 #[derive(Default)]
 struct StepProgress {
     repeated_without_progress: bool,
+}
+
+struct CompactionDecision {
+    reason: String,
+    score_explanations: Vec<CompactionScoreExplanation>,
 }
 
 struct EventSpec<'a> {
@@ -917,21 +1150,19 @@ fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn action_requires_approval(action: &Action) -> bool {
-    match action {
+    matches!(
+        action,
         Action::RunCommand {
             require_approval: true,
             ..
-        }
-        | Action::WriteFile {
+        } | Action::WriteFile {
+            require_approval: true,
+            ..
+        } | Action::AppendFile {
             require_approval: true,
             ..
         }
-        | Action::AppendFile {
-            require_approval: true,
-            ..
-        } => true,
-        _ => false,
-    }
+    )
 }
 
 fn approval_reason(action: &Action) -> String {
@@ -1285,6 +1516,409 @@ fn trim_recent_steps(recent_steps: &mut Vec<String>) {
     }
 }
 
+fn trim_recent_action_summaries(recent_actions: &mut Vec<RecentActionSummary>) {
+    const MAX_RECENT_ACTION_SUMMARIES: usize = 6;
+    if recent_actions.len() > MAX_RECENT_ACTION_SUMMARIES {
+        let excess = recent_actions.len() - MAX_RECENT_ACTION_SUMMARIES;
+        recent_actions.drain(0..excess);
+    }
+}
+
+fn trim_avoid_rules(avoid_rules: &mut Vec<AvoidRule>) {
+    const MAX_AVOID_RULES: usize = 6;
+    if avoid_rules.len() > MAX_AVOID_RULES {
+        let excess = avoid_rules.len() - MAX_AVOID_RULES;
+        avoid_rules.drain(0..excess);
+    }
+}
+
+fn merge_artifact_references(
+    existing: &mut Vec<ArtifactReference>,
+    candidates: Vec<ArtifactReference>,
+) {
+    const MAX_ARTIFACT_REFERENCES: usize = 12;
+
+    for candidate in candidates {
+        if let Some(position) = existing
+            .iter()
+            .position(|item| item.locator == candidate.locator && item.kind == candidate.kind)
+        {
+            existing[position] = candidate;
+        } else {
+            existing.push(candidate);
+        }
+    }
+
+    if existing.len() > MAX_ARTIFACT_REFERENCES {
+        let excess = existing.len() - MAX_ARTIFACT_REFERENCES;
+        existing.drain(0..excess);
+    }
+}
+
+fn merge_working_sources(existing: &mut Vec<WorkingSource>, candidates: Vec<WorkingSource>) {
+    const MAX_WORKING_SOURCES: usize = 12;
+
+    for candidate in candidates {
+        if let Some(position) = existing
+            .iter()
+            .position(|item| item.locator == candidate.locator && item.kind == candidate.kind)
+        {
+            existing[position] = candidate;
+        } else {
+            existing.push(candidate);
+        }
+    }
+
+    if existing.len() > MAX_WORKING_SOURCES {
+        let excess = existing.len() - MAX_WORKING_SOURCES;
+        existing.drain(0..excess);
+    }
+}
+
+fn trim_recent_steps_for_compacted_state(recent_steps: &mut Vec<String>) {
+    const MAX_COMPACTED_RECENT_STEPS: usize = 3;
+    if recent_steps.len() > MAX_COMPACTED_RECENT_STEPS {
+        let excess = recent_steps.len() - MAX_COMPACTED_RECENT_STEPS;
+        recent_steps.drain(0..excess);
+    }
+}
+
+fn trim_recent_action_summaries_for_compacted_state(recent_actions: &mut Vec<RecentActionSummary>) {
+    const MAX_COMPACTED_RECENT_ACTIONS: usize = 3;
+    if recent_actions.len() > MAX_COMPACTED_RECENT_ACTIONS {
+        let excess = recent_actions.len() - MAX_COMPACTED_RECENT_ACTIONS;
+        recent_actions.drain(0..excess);
+    }
+}
+
+fn trim_working_sources_for_compacted_state(working_sources: &mut Vec<WorkingSource>) {
+    const MAX_COMPACTED_WORKING_SOURCES: usize = 6;
+    if working_sources.len() > MAX_COMPACTED_WORKING_SOURCES {
+        let excess = working_sources.len() - MAX_COMPACTED_WORKING_SOURCES;
+        working_sources.drain(0..excess);
+    }
+}
+
+fn trim_artifact_references_for_compacted_state(artifact_refs: &mut Vec<ArtifactReference>) {
+    const MAX_COMPACTED_ARTIFACT_REFS: usize = 8;
+    if artifact_refs.len() > MAX_COMPACTED_ARTIFACT_REFS {
+        let excess = artifact_refs.len() - MAX_COMPACTED_ARTIFACT_REFS;
+        artifact_refs.drain(0..excess);
+    }
+}
+
+fn compact_last_result_for_compacted_context(last_result: &str) -> serde_json::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(last_result)?;
+    let compact = match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("file_read") => serde_json::json!({
+            "type": "file_read",
+            "path": value.get("path"),
+            "truncated": value.get("truncated"),
+            "content_preview": value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| preview_text(text, 240)),
+            "continuation": "reopen file by path from task_state artifact refs if more detail is needed"
+        }),
+        Some("document_text") => serde_json::json!({
+            "type": "document_text",
+            "path": value.get("path"),
+            "format": value.get("format"),
+            "truncated": value.get("truncated"),
+            "content_preview": value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| preview_text(text, 240)),
+            "continuation": "reopen extracted document by path from task_state artifact refs if more detail is needed"
+        }),
+        Some("text_search") => serde_json::json!({
+            "type": "text_search",
+            "root": value.get("root"),
+            "query": value.get("query"),
+            "count": value.get("count"),
+            "matches": value.get("matches"),
+            "continuation": "use task_state working sources and artifact refs for exact evidence"
+        }),
+        Some("file_matches") => serde_json::json!({
+            "type": "file_matches",
+            "root": value.get("root"),
+            "pattern": value.get("pattern"),
+            "count": value.get("count"),
+            "matches": value.get("matches"),
+            "continuation": "choose from task_state candidate sources instead of re-searching"
+        }),
+        Some("directory_listing") => serde_json::json!({
+            "type": "directory_listing",
+            "root": value.get("root"),
+            "count": value.get("count"),
+            "entries": value.get("entries"),
+            "continuation": "use task_state candidate sources instead of replaying the full listing"
+        }),
+        _ => value,
+    };
+    serde_json::to_string(&compact)
+}
+
+fn build_compaction_score_explanations(state: &TaskLoopState) -> Vec<CompactionScoreExplanation> {
+    let mut explanations = Vec::new();
+
+    for source in &state.working_sources {
+        let decision = if source.role == "authoritative" || source.role == "generated" {
+            "keep"
+        } else if source.status == "matched" || source.status == "listed" {
+            "compact"
+        } else {
+            "keep"
+        };
+        let rationale = if source.role == "authoritative" {
+            "high state dependency and recovery value".to_string()
+        } else if source.role == "generated" {
+            "captures produced artifact and recovery anchor".to_string()
+        } else if source.status == "matched" || source.status == "listed" {
+            "useful candidate context but lower forward utility than authoritative sources"
+                .to_string()
+        } else {
+            "still relevant to current frontier".to_string()
+        };
+        explanations.push(CompactionScoreExplanation {
+            item_kind: "source".to_string(),
+            locator: source.locator.clone(),
+            decision: decision.to_string(),
+            rationale,
+        });
+    }
+
+    for artifact in &state.artifact_references {
+        explanations.push(CompactionScoreExplanation {
+            item_kind: "artifact".to_string(),
+            locator: artifact.locator.clone(),
+            decision: "keep_ref".to_string(),
+            rationale: "exact evidence reference preserved for recovery and re-open".to_string(),
+        });
+    }
+
+    for avoid in &state.avoid_rules {
+        explanations.push(CompactionScoreExplanation {
+            item_kind: "avoid".to_string(),
+            locator: avoid.label.clone(),
+            decision: "keep".to_string(),
+            rationale: "failed path preserved to avoid repeating harmful work".to_string(),
+        });
+    }
+
+    explanations
+}
+
+fn describe_task_phase(state: &TaskLoopState, current_step: usize, max_steps: usize) -> String {
+    if state.step_index == 0 {
+        "starting".to_string()
+    } else if current_step >= max_steps {
+        "final step".to_string()
+    } else {
+        format!("working through step {} of {}", current_step, max_steps)
+    }
+}
+
+fn summarize_verified_facts(references: &[ArtifactReference]) -> Vec<String> {
+    references
+        .iter()
+        .take(8)
+        .map(|reference| match reference.status.as_str() {
+            "read" => format!("read {}", reference.locator),
+            "extracted" => format!("extracted text from {}", reference.locator),
+            "matched" => format!("matched candidate {}", reference.locator),
+            "searched" => format!("searched and found evidence in {}", reference.locator),
+            "listed" => format!("listed directory {}", reference.locator),
+            "written" => format!("wrote {}", reference.locator),
+            "appended" => format!("appended {}", reference.locator),
+            _ => format!("{} {}", reference.status, reference.locator),
+        })
+        .collect()
+}
+
+fn artifact_references_for_result(result: &ActionResult) -> Vec<ArtifactReference> {
+    match result {
+        ActionResult::Command(command) => vec![ArtifactReference {
+            kind: "command".to_string(),
+            locator: command.command.clone(),
+            status: if command.cancelled {
+                "cancelled".to_string()
+            } else if command.success {
+                "executed".to_string()
+            } else {
+                "failed".to_string()
+            },
+        }],
+        ActionResult::Inspection(world) => world
+            .files
+            .iter()
+            .take(6)
+            .map(|item| ArtifactReference {
+                kind: "path".to_string(),
+                locator: item.path.display().to_string(),
+                status: "inspected".to_string(),
+            })
+            .collect(),
+        ActionResult::DirectoryListing { root, .. } => vec![ArtifactReference {
+            kind: "directory".to_string(),
+            locator: root.display().to_string(),
+            status: "listed".to_string(),
+        }],
+        ActionResult::FileMatches { matches, .. } => matches
+            .iter()
+            .take(6)
+            .map(|path| ArtifactReference {
+                kind: if path.is_dir() { "directory" } else { "file" }.to_string(),
+                locator: path.display().to_string(),
+                status: "matched".to_string(),
+            })
+            .collect(),
+        ActionResult::FileRead { path, .. } => vec![ArtifactReference {
+            kind: "file".to_string(),
+            locator: path.display().to_string(),
+            status: "read".to_string(),
+        }],
+        ActionResult::DocumentText { path, .. } => vec![ArtifactReference {
+            kind: "document".to_string(),
+            locator: path.display().to_string(),
+            status: "extracted".to_string(),
+        }],
+        ActionResult::TextSearch { matches, .. } => matches
+            .iter()
+            .take(6)
+            .map(|item| ArtifactReference {
+                kind: "file".to_string(),
+                locator: item.path.display().to_string(),
+                status: "searched".to_string(),
+            })
+            .collect(),
+        ActionResult::FileWrite { path, appended, .. } => vec![ArtifactReference {
+            kind: "file".to_string(),
+            locator: path.display().to_string(),
+            status: if *appended {
+                "appended".to_string()
+            } else {
+                "written".to_string()
+            },
+        }],
+        ActionResult::NoteRecorded { .. } | ActionResult::Response { .. } => Vec::new(),
+    }
+}
+
+fn working_sources_for_result(
+    action: &Action,
+    result: &ActionResult,
+    step_index: usize,
+) -> Vec<WorkingSource> {
+    match result {
+        ActionResult::Inspection(world) => world
+            .files
+            .iter()
+            .take(6)
+            .map(|item| WorkingSource {
+                kind: "path".to_string(),
+                locator: item.path.display().to_string(),
+                role: "supporting".to_string(),
+                status: "inspected".to_string(),
+                why_it_matters: format!("observed while {}", action_label(action)),
+                last_used_step: step_index,
+                evidence_refs: vec![item.path.display().to_string()],
+            })
+            .collect(),
+        ActionResult::DirectoryListing { root, .. } => vec![WorkingSource {
+            kind: "directory".to_string(),
+            locator: root.display().to_string(),
+            role: "supporting".to_string(),
+            status: "listed".to_string(),
+            why_it_matters: "directory explored for task-relevant candidates".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![root.display().to_string()],
+        }],
+        ActionResult::FileMatches { matches, .. } => matches
+            .iter()
+            .take(6)
+            .map(|path| WorkingSource {
+                kind: if path.is_dir() { "directory" } else { "file" }.to_string(),
+                locator: path.display().to_string(),
+                role: "candidate".to_string(),
+                status: "matched".to_string(),
+                why_it_matters: "candidate source discovered for the task".to_string(),
+                last_used_step: step_index,
+                evidence_refs: vec![path.display().to_string()],
+            })
+            .collect(),
+        ActionResult::FileRead { path, .. } => vec![WorkingSource {
+            kind: "file".to_string(),
+            locator: path.display().to_string(),
+            role: "authoritative".to_string(),
+            status: "read".to_string(),
+            why_it_matters: "content source currently informing the task".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![path.display().to_string()],
+        }],
+        ActionResult::DocumentText { path, .. } => vec![WorkingSource {
+            kind: "document".to_string(),
+            locator: path.display().to_string(),
+            role: "authoritative".to_string(),
+            status: "excerpted".to_string(),
+            why_it_matters: "document text extracted for task reasoning".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![path.display().to_string()],
+        }],
+        ActionResult::TextSearch { matches, .. } => matches
+            .iter()
+            .take(6)
+            .map(|item| WorkingSource {
+                kind: "file".to_string(),
+                locator: item.path.display().to_string(),
+                role: "supporting".to_string(),
+                status: "matched_text".to_string(),
+                why_it_matters: "contains text evidence relevant to the task".to_string(),
+                last_used_step: step_index,
+                evidence_refs: vec![format!("{}:{}", item.path.display(), item.line_number)],
+            })
+            .collect(),
+        ActionResult::FileWrite { path, appended, .. } => vec![WorkingSource {
+            kind: "file".to_string(),
+            locator: path.display().to_string(),
+            role: "generated".to_string(),
+            status: if *appended {
+                "appended".to_string()
+            } else {
+                "written".to_string()
+            },
+            why_it_matters: "task produced or updated this artifact".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![path.display().to_string()],
+        }],
+        ActionResult::Command(command) => vec![WorkingSource {
+            kind: "command".to_string(),
+            locator: command.command.clone(),
+            role: "supporting".to_string(),
+            status: if command.cancelled {
+                "cancelled".to_string()
+            } else if command.success {
+                "executed".to_string()
+            } else {
+                "failed".to_string()
+            },
+            why_it_matters: "shell command executed as part of the task".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![command.command.clone()],
+        }],
+        ActionResult::NoteRecorded { note } => vec![WorkingSource {
+            kind: "note".to_string(),
+            locator: preview_text(note, 80),
+            role: "generated".to_string(),
+            status: "recorded".to_string(),
+            why_it_matters: "operator/task note captured by the harness".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![preview_text(note, 80)],
+        }],
+        ActionResult::Response { .. } => Vec::new(),
+    }
+}
+
 fn should_retry(previous: &Action, next: &Action) -> bool {
     action_label(previous) != action_label(next) && !matches!(next, Action::Respond { .. })
 }
@@ -1372,12 +2006,23 @@ fn action_label(action: &Action) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn must<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
+        result.unwrap_or_else(|error| panic!("test operation failed: {error}"))
+    }
+
+    fn must_some<T>(value: Option<T>, message: &str) -> T {
+        value.unwrap_or_else(|| panic!("{message}"))
+    }
     use retina_test_utils::{MockMemory, MockReasoner, MockShell};
+    use retina_traits::Shell;
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
     struct GuidanceReasoner {
         seen_guidance: Arc<Mutex<Vec<Option<String>>>>,
+        seen_task_states: Arc<Mutex<Vec<TaskState>>>,
         responses: Arc<Mutex<Vec<ReasonResponse>>>,
     }
 
@@ -1385,26 +2030,40 @@ mod tests {
         fn new(responses: Vec<ReasonResponse>) -> Self {
             Self {
                 seen_guidance: Arc::new(Mutex::new(Vec::new())),
+                seen_task_states: Arc::new(Mutex::new(Vec::new())),
                 responses: Arc::new(Mutex::new(responses)),
             }
         }
 
         fn seen_guidance(&self) -> Vec<Option<String>> {
-            self.seen_guidance.lock().unwrap().clone()
+            recover_mutex(&self.seen_guidance).clone()
+        }
+
+        fn seen_task_states(&self) -> Vec<TaskState> {
+            recover_mutex(&self.seen_task_states).clone()
         }
     }
 
     impl retina_traits::Reasoner for GuidanceReasoner {
         fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
-            self.seen_guidance
-                .lock()
-                .unwrap()
-                .push(request.context.operator_guidance.clone());
-            let mut responses = self.responses.lock().unwrap();
+            recover_mutex(&self.seen_guidance).push(request.context.operator_guidance.clone());
+            recover_mutex(&self.seen_task_states).push(request.context.task_state.clone());
+            let mut responses = recover_mutex(&self.responses);
             Ok(if responses.len() > 1 {
                 responses.remove(0)
             } else {
-                responses.first().cloned().unwrap()
+                responses
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| ReasonResponse {
+                        action: Action::Respond {
+                            id: ActionId::new(),
+                            message: "done".to_string(),
+                        },
+                        task_complete: true,
+                        reasoning: Some("fallback test response".to_string()),
+                        tokens_used: TokenUsage::default(),
+                    })
             })
         }
 
@@ -1419,17 +2078,98 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct LargeReadShell;
+
+    impl Shell for LargeReadShell {
+        fn observe(&self) -> Result<WorldState> {
+            Ok(WorldState {
+                cwd: PathBuf::from("."),
+                files: Vec::new(),
+                last_command: None,
+                notes: Vec::new(),
+            })
+        }
+
+        fn capture_state(&self, scope: &HashScope) -> Result<StateSnapshot> {
+            Ok(StateSnapshot {
+                scope: scope.clone(),
+                cwd: PathBuf::from("."),
+                cwd_hash: "stable".to_string(),
+                files: Vec::new(),
+                last_command: None,
+            })
+        }
+
+        fn compare_state(
+            &self,
+            _before: &StateSnapshot,
+            _after: &StateSnapshot,
+            _action: Option<&Action>,
+        ) -> Result<StateDelta> {
+            Ok(StateDelta {
+                kind: StateDeltaKind::ChangedAsExpected,
+                summary: "changed".to_string(),
+                changed_paths: Vec::new(),
+            })
+        }
+
+        fn execute(&self, action: &Action) -> Result<ActionResult> {
+            match action {
+                Action::ReadFile { path, .. } => Ok(ActionResult::FileRead {
+                    path: path.clone(),
+                    content: "a".repeat(4000),
+                    truncated: false,
+                }),
+                Action::Respond { message, .. } => Ok(ActionResult::Response {
+                    message: message.clone(),
+                }),
+                _ => Err(KernelError::Unsupported(
+                    "unsupported test action".to_string(),
+                )),
+            }
+        }
+
+        fn constraints(&self) -> &[HardConstraint] {
+            const CONSTRAINTS: &[HardConstraint] = &[HardConstraint::NoNetworkShellActions];
+            CONSTRAINTS
+        }
+
+        fn capabilities(&self) -> ShellCapabilities {
+            ShellCapabilities {
+                can_execute_commands: false,
+                can_read_files: true,
+                can_write_files: false,
+                can_search_files: false,
+                can_extract_documents: false,
+                can_write_notes: false,
+                can_respond_text: true,
+            }
+        }
+
+        fn request_approval(&self, _request: &ApprovalRequest) -> Result<ApprovalResponse> {
+            Ok(ApprovalResponse::Approved)
+        }
+
+        fn notify(&self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn request_input(&self, _prompt: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
     #[test]
     fn router_defaults_to_handle_directly() {
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(MockShell::default()),
             Box::new(MockReasoner::for_action(Action::Respond {
                 id: ActionId::new(),
                 message: "hello".to_string(),
             })),
             Box::new(MockMemory::default()),
-        )
-        .unwrap();
+        ));
         let task = Task::new(AgentId::new(), "inspect");
         assert!(matches!(
             kernel.route_task(&task),
@@ -1438,18 +2178,146 @@ mod tests {
     }
 
     #[test]
+    fn assembled_context_includes_structured_task_state() {
+        let reasoner = GuidanceReasoner::new(vec![ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            reasoning: Some("test".to_string()),
+            tokens_used: TokenUsage::default(),
+        }]);
+        let kernel = must(Kernel::new(
+            Box::new(MockShell::default()),
+            Box::new(reasoner.clone()),
+            Box::new(MockMemory::default()),
+        ));
+
+        let task = Task::new(AgentId::new(), "read startup.md");
+        let outcome = must(kernel.execute_task(task));
+        assert!(matches!(
+            outcome,
+            Outcome::Success(ActionResult::Response { .. })
+        ));
+
+        let seen = reasoner.seen_task_states();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].goal.objective, "read startup.md");
+        assert_eq!(seen[0].progress.current_phase, "starting");
+    }
+
+    #[test]
+    fn task_step_snapshot_tracks_working_sources() {
+        let memory = MockMemory::default();
+        let kernel = must(Kernel::new(
+            Box::new(MockShell::default()),
+            Box::new(MockReasoner::for_action(Action::ReadFile {
+                id: ActionId::new(),
+                path: "startup.md".into(),
+                max_bytes: Some(1024),
+            })),
+            Box::new(memory.clone()),
+        ));
+
+        let outcome = must(kernel.execute_task(Task::new(AgentId::new(), "read startup.md")));
+        assert!(matches!(
+            outcome,
+            Outcome::Success(ActionResult::FileRead { .. })
+        ));
+
+        let events = must(memory.recent_states(20));
+        let task_state = events
+            .into_iter()
+            .find_map(|event| event.payload_json.get("task_state").cloned())
+            .and_then(|value| serde_json::from_value::<TaskState>(value).ok());
+        let task_state = must_some(task_state, "expected task_state snapshot");
+
+        assert!(
+            task_state
+                .working_sources
+                .iter()
+                .any(|source| source.locator.ends_with("startup.md") && source.status == "read")
+        );
+    }
+
+    #[test]
+    fn large_result_triggers_live_compaction_event() {
+        let memory = MockMemory::default();
+        let kernel = must(Kernel::new(
+            Box::new(LargeReadShell),
+            Box::new(MockReasoner::sequence(vec![
+                ReasonResponse {
+                    action: Action::ReadFile {
+                        id: ActionId::new(),
+                        path: "big.md".into(),
+                        max_bytes: Some(8000),
+                    },
+                    task_complete: false,
+                    reasoning: Some("read".to_string()),
+                    tokens_used: TokenUsage::default(),
+                },
+                ReasonResponse {
+                    action: Action::Respond {
+                        id: ActionId::new(),
+                        message: "done".to_string(),
+                    },
+                    task_complete: true,
+                    reasoning: Some("answer".to_string()),
+                    tokens_used: TokenUsage::default(),
+                },
+            ])),
+            Box::new(memory.clone()),
+        ));
+
+        let outcome = must(kernel.execute_task(Task::new(AgentId::new(), "read big.md")));
+        assert!(matches!(
+            outcome,
+            Outcome::Success(ActionResult::Response { .. })
+        ));
+
+        let events = must(memory.recent_states(30));
+        let compacted = must_some(
+            events
+                .iter()
+                .find(|event| event.event_type == TimelineEventType::TaskCompacted),
+            "expected compaction event",
+        );
+        let reason = compacted
+            .payload_json
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(reason.contains("large tool result"));
+
+        let task_state = compacted
+            .payload_json
+            .get("task_state")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<TaskState>(value).ok());
+        let task_state = must_some(task_state, "expected compacted task state");
+        let snapshot = must_some(task_state.compaction, "expected compaction snapshot");
+        assert!(!snapshot.score_explanations.is_empty());
+        assert!(
+            snapshot
+                .score_explanations
+                .iter()
+                .any(|item| item.item_kind == "artifact" && item.decision == "keep_ref")
+        );
+    }
+
+    #[test]
     fn execute_loop_records_timeline() {
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(MockShell::default()),
             Box::new(MockReasoner::for_action(Action::Respond {
                 id: ActionId::new(),
                 message: "hello".to_string(),
             })),
             Box::new(MockMemory::default()),
-        )
-        .unwrap();
+        ));
         let task = Task::new(AgentId::new(), "hello");
-        let outcome = kernel.execute_task(task).unwrap();
+        let outcome = must(kernel.execute_task(task));
         assert!(matches!(
             outcome,
             Outcome::Success(ActionResult::Response { .. })
@@ -1467,21 +2335,20 @@ mod tests {
             expect_change: true,
             state_scope: HashScope::default(),
         };
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(shell),
             Box::new(MockReasoner::for_action(action.clone())),
             Box::new(MockMemory::default()),
-        )
-        .unwrap();
+        ));
         let task = Task::new(AgentId::new(), "run echo hi > note.txt");
-        let outcome = kernel.execute_task(task).unwrap();
+        let outcome = must(kernel.execute_task(task));
         assert!(matches!(outcome, Outcome::Failure(_)));
     }
 
     #[test]
     fn repeated_successful_pattern_promotes_rule() {
         let memory = MockMemory::default();
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(MockShell::default()),
             Box::new(MockReasoner::for_action(Action::ReadFile {
                 id: ActionId::new(),
@@ -1489,19 +2356,12 @@ mod tests {
                 max_bytes: None,
             })),
             Box::new(memory.clone()),
-        )
-        .unwrap();
+        ));
 
         let task = "read startup.md";
-        let _ = kernel
-            .execute_task(Task::new(AgentId::new(), task))
-            .unwrap();
-        let _ = kernel
-            .execute_task(Task::new(AgentId::new(), task))
-            .unwrap();
-        let _ = kernel
-            .execute_task(Task::new(AgentId::new(), task))
-            .unwrap();
+        let _ = must(kernel.execute_task(Task::new(AgentId::new(), task)));
+        let _ = must(kernel.execute_task(Task::new(AgentId::new(), task)));
+        let _ = must(kernel.execute_task(Task::new(AgentId::new(), task)));
 
         assert!(memory.rule_count() >= 1);
     }
@@ -1509,7 +2369,7 @@ mod tests {
     #[test]
     fn successful_read_steps_get_positive_utility() {
         let memory = MockMemory::default();
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(MockShell::default()),
             Box::new(MockReasoner::for_action(Action::ReadFile {
                 id: ActionId::new(),
@@ -1517,12 +2377,9 @@ mod tests {
                 max_bytes: None,
             })),
             Box::new(memory.clone()),
-        )
-        .unwrap();
+        ));
 
-        let _ = kernel
-            .execute_task(Task::new(AgentId::new(), "read startup.md"))
-            .unwrap();
+        let _ = must(kernel.execute_task(Task::new(AgentId::new(), "read startup.md")));
 
         let experiences = memory.experiences();
         assert_eq!(experiences.len(), 1);
@@ -1531,7 +2388,7 @@ mod tests {
 
     #[test]
     fn multi_step_task_continues_until_terminal_step() {
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(MockShell::default()),
             Box::new(MockReasoner::sequence(vec![
                 ReasonResponse {
@@ -1557,12 +2414,10 @@ mod tests {
                 },
             ])),
             Box::new(MockMemory::default()),
-        )
-        .unwrap();
+        ));
 
-        let outcome = kernel
-            .execute_task(Task::new(AgentId::new(), "find startup.md and read it"))
-            .unwrap();
+        let outcome =
+            must(kernel.execute_task(Task::new(AgentId::new(), "find startup.md and read it")));
         assert!(matches!(
             outcome,
             Outcome::Success(ActionResult::FileRead { .. })
@@ -1577,7 +2432,7 @@ mod tests {
             pattern: "startup.md".to_string(),
             max_results: 5,
         };
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(MockShell::default()),
             Box::new(MockReasoner::sequence(vec![
                 ReasonResponse {
@@ -1594,12 +2449,10 @@ mod tests {
                 },
             ])),
             Box::new(MockMemory::default()),
-        )
-        .unwrap();
+        ));
 
-        let outcome = kernel
-            .execute_task(Task::new(AgentId::new(), "find startup.md and read it"))
-            .unwrap();
+        let outcome =
+            must(kernel.execute_task(Task::new(AgentId::new(), "find startup.md and read it")));
         assert!(matches!(
             outcome,
             Outcome::Failure(reason) if reason.contains("repeated the same step")
@@ -1610,7 +2463,7 @@ mod tests {
     fn interactive_stop_cancels_continuation() {
         let control = ExecutionControl::new();
         control.handle().request_cancel();
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(MockShell::default()),
             Box::new(MockReasoner::for_response(ReasonResponse {
                 action: Action::FindFiles {
@@ -1624,18 +2477,15 @@ mod tests {
                 tokens_used: TokenUsage::default(),
             })),
             Box::new(MockMemory::default()),
-        )
-        .unwrap();
+        ));
 
-        let outcome = kernel
-            .execute_task_with_config(
-                Task::new(AgentId::new(), "find startup.md and read it"),
-                ExecutionConfig {
-                    max_steps: 3,
-                    control: Some(control.handle()),
-                },
-            )
-            .unwrap();
+        let outcome = must(kernel.execute_task_with_config(
+            Task::new(AgentId::new(), "find startup.md and read it"),
+            ExecutionConfig {
+                max_steps: 3,
+                control: Some(control.handle()),
+            },
+        ));
         assert!(matches!(outcome, Outcome::Blocked(reason) if reason.contains("cancelled")));
     }
 
@@ -1667,22 +2517,19 @@ mod tests {
             },
         ]);
         let inspector = reasoner.clone();
-        let kernel = Kernel::new(
+        let kernel = must(Kernel::new(
             Box::new(MockShell::default()),
             Box::new(reasoner),
             Box::new(MockMemory::default()),
-        )
-        .unwrap();
+        ));
 
-        let outcome = kernel
-            .execute_task_with_config(
-                Task::new(AgentId::new(), "find startup.md and answer"),
-                ExecutionConfig {
-                    max_steps: 3,
-                    control: Some(handle),
-                },
-            )
-            .unwrap();
+        let outcome = must(kernel.execute_task_with_config(
+            Task::new(AgentId::new(), "find startup.md and answer"),
+            ExecutionConfig {
+                max_steps: 3,
+                control: Some(handle),
+            },
+        ));
         assert!(matches!(
             outcome,
             Outcome::Success(ActionResult::Response { .. })

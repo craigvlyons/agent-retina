@@ -1,5 +1,5 @@
 use retina_types::*;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn plan_task(task: &str, last_result: Option<&str>) -> Option<ReasonResponse> {
     let trimmed = task.trim();
@@ -154,7 +154,7 @@ fn pick_preferred_path(paths: &[PathBuf]) -> Option<PathBuf> {
         .cloned()
 }
 
-fn readability_rank(path: &PathBuf) -> usize {
+fn readability_rank(path: &Path) -> usize {
     if path.is_dir() {
         return 0;
     }
@@ -228,9 +228,21 @@ fn content_action_for_path(path: PathBuf) -> Action {
 mod tests {
     use super::*;
 
+    fn must<T>(value: Option<T>, message: &str) -> T {
+        value.unwrap_or_else(|| panic!("{message}"))
+    }
+
+    fn to_json(value: &ActionResult) -> String {
+        serde_json::to_string(value)
+            .unwrap_or_else(|error| panic!("failed to serialize test action result: {error}"))
+    }
+
     #[test]
     fn plans_capability_response() {
-        let response = plan_task("what can you do", None).unwrap();
+        let response = must(
+            plan_task("what can you do", None),
+            "expected planner response",
+        );
         let Action::Respond { message, .. } = response.action else {
             panic!("expected response action");
         };
@@ -239,30 +251,31 @@ mod tests {
 
     #[test]
     fn plans_follow_up_read_after_find() {
-        let previous = serde_json::to_string(&ActionResult::FileMatches {
+        let previous = to_json(&ActionResult::FileMatches {
             root: ".".into(),
             pattern: "Cargo.toml".to_string(),
             matches: vec!["Cargo.toml".into(), "crates/retina-cli/Cargo.toml".into()],
-        })
-        .unwrap();
+        });
         let response = plan_task(
             "find files named Cargo.toml and read the root one",
             Some(&previous),
-        )
-        .unwrap();
+        );
+        let response = must(response, "expected follow-up read plan");
         assert!(matches!(response.action, Action::ReadFile { .. }));
         assert!(response.task_complete);
     }
 
     #[test]
     fn plans_follow_up_document_extract_after_pdf_find() {
-        let previous = serde_json::to_string(&ActionResult::FileMatches {
+        let previous = to_json(&ActionResult::FileMatches {
             root: ".".into(),
             pattern: "Craig Lyons.pdf".to_string(),
             matches: vec!["Craig Lyons.pdf".into()],
-        })
-        .unwrap();
-        let response = plan_task("find the resume and read it", Some(&previous)).unwrap();
+        });
+        let response = must(
+            plan_task("find the resume and read it", Some(&previous)),
+            "expected document extract plan",
+        );
         assert!(matches!(
             response.action,
             Action::ExtractDocumentText { .. }
@@ -271,17 +284,16 @@ mod tests {
 
     #[test]
     fn plans_follow_up_directory_listing_after_find() {
-        let previous = serde_json::to_string(&ActionResult::FileMatches {
+        let previous = to_json(&ActionResult::FileMatches {
             root: "Desktop".into(),
             pattern: "resume".to_string(),
             matches: vec!["Desktop/resume".into()],
-        })
-        .unwrap();
+        });
         let response = plan_task(
             "find the resume folder and tell me what files are there",
             Some(&previous),
-        )
-        .unwrap();
+        );
+        let response = must(response, "expected directory listing follow-up");
         assert!(matches!(response.action, Action::ListDirectory { .. }));
     }
 
@@ -298,17 +310,16 @@ mod tests {
 
     #[test]
     fn plans_follow_up_read_for_content_question_after_find() {
-        let previous = serde_json::to_string(&ActionResult::FileMatches {
+        let previous = to_json(&ActionResult::FileMatches {
             root: "Desktop/resume".into(),
             pattern: "Craig Lyons resume.md".to_string(),
             matches: vec!["Desktop/resume/Craig Lyons resume.md".into()],
-        })
-        .unwrap();
+        });
         let response = plan_task(
             "find the craig lyons resume.md file and tell me what my last job was",
             Some(&previous),
-        )
-        .unwrap();
+        );
+        let response = must(response, "expected read follow-up for content question");
         assert!(matches!(response.action, Action::ReadFile { .. }));
         assert!(response.task_complete);
     }

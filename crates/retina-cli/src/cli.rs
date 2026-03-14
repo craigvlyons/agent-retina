@@ -33,6 +33,7 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum InspectCommands {
     Timeline,
+    TaskState,
     Overview,
     Agents,
     Memory {

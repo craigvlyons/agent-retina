@@ -141,6 +141,82 @@ pub fn render_timeline_event(event: &TimelineEvent) -> String {
     )
 }
 
+pub fn render_task_state(task_state: &TaskState) -> String {
+    let sources = if task_state.working_sources.is_empty() {
+        "(none)".to_string()
+    } else {
+        task_state
+            .working_sources
+            .iter()
+            .map(|source| {
+                format!(
+                    "- {} [{}|{}|{}] step={} why={}",
+                    source.locator,
+                    source.kind,
+                    source.role,
+                    source.status,
+                    source.last_used_step,
+                    source.why_it_matters
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let artifacts = if task_state.artifact_references.is_empty() {
+        "(none)".to_string()
+    } else {
+        task_state
+            .artifact_references
+            .iter()
+            .map(|reference| {
+                format!(
+                    "- {} [{}|{}]",
+                    reference.locator, reference.kind, reference.status
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let compaction = task_state
+        .compaction
+        .as_ref()
+        .map(|snapshot| {
+            let ranking = if snapshot.score_explanations.is_empty() {
+                "(none)".to_string()
+            } else {
+                snapshot
+                    .score_explanations
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "- {} {} => {} ({})",
+                            item.item_kind, item.locator, item.decision, item.rationale
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!("reason: {}\nranking:\n{}", snapshot.reason, ranking)
+        })
+        .unwrap_or_else(|| "none".to_string());
+
+    format!(
+        "goal: {}\nphase: {}\nstep: {} / {}\nnext: {}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
+        task_state.goal.objective,
+        task_state.progress.current_phase,
+        task_state.progress.current_step,
+        task_state.progress.max_steps,
+        task_state
+            .frontier
+            .next_action_hint
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        sources,
+        artifacts,
+        compaction
+    )
+}
+
 pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
     if debug {
         return render_timeline_event(event);
@@ -193,6 +269,37 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .get("action")
             .and_then(Value::as_str)
             .map(|action| format!("action: {}", humanize_action_label(action))),
+        TimelineEventType::TaskCompacted => event
+            .payload_json
+            .get("task_state")
+            .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
+            .and_then(|task_state| {
+                task_state.compaction.as_ref().map(|snapshot| {
+                    let kept = snapshot
+                        .score_explanations
+                        .iter()
+                        .filter(|item| item.decision == "keep" || item.decision == "keep_ref")
+                        .count();
+                    format!("compact: {} (kept {} ranked items)", snapshot.reason, kept)
+                })
+            })
+            .or_else(|| {
+                event
+                    .payload_json
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(|reason| format!("compact: {reason}"))
+            }),
+        TimelineEventType::TaskStepCompleted => event
+            .payload_json
+            .get("task_state")
+            .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
+            .and_then(|task_state| {
+                task_state
+                    .working_sources
+                    .last()
+                    .map(|source| format!("source: {} [{}]", source.locator, source.status))
+            }),
         TimelineEventType::ReflectionRequested => event
             .payload_json
             .get("reason")
@@ -369,7 +476,7 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
     };
 
     format!(
-        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
+        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\ncompaction:\n- task_compactions: {}\n- cache_reads: {}\n- cache_creations: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
         overview.manifest.agent_id.0,
         overview.manifest.domain,
         overview.manifest.status,
@@ -397,6 +504,9 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
         overview.terminal_tasks.failed,
         overview.terminal_tasks.cancelled,
         overview.terminal_tasks.blocked,
+        overview.compaction_stats.compaction_events,
+        overview.compaction_stats.cache_reads,
+        overview.compaction_stats.cache_creations,
         overview.manifest.budget.max_steps_per_task,
         overview.manifest.budget.max_reasoner_calls_per_task,
         overview.manifest.budget.max_tokens_per_task,

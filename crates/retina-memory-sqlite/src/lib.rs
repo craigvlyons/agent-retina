@@ -737,9 +737,19 @@ impl Memory for SqliteMemory {
 
 fn register_sqlite_vec() {
     REGISTER_VEC.call_once(|| unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite3_vec_init as *const (),
-        )));
+        let init: unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *mut i8,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> i32 = std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(
+                *mut rusqlite::ffi::sqlite3,
+                *mut *mut i8,
+                *const rusqlite::ffi::sqlite3_api_routines,
+            ) -> i32,
+        >(sqlite3_vec_init as *const ());
+        rusqlite::ffi::sqlite3_auto_extension(Some(init));
     });
 }
 
@@ -1037,16 +1047,24 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn must<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
+        result.unwrap_or_else(|error| panic!("test operation failed: {error}"))
+    }
+
+    fn must_tempdir() -> tempfile::TempDir {
+        tempdir().unwrap_or_else(|error| panic!("failed to create tempdir: {error}"))
+    }
+
     #[test]
     fn migrations_create_schema() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
-        let events = memory.recent_states(10).unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
+        let events = must(memory.recent_states(10));
         assert!(events.is_empty());
     }
 
     #[test]
     fn timeline_events_persist() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
         let event = TimelineEvent {
             event_id: EventId::new(),
             session_id: SessionId::new(),
@@ -1062,8 +1080,8 @@ mod tests {
             duration_ms: None,
             payload_json: json!({"test": true}),
         };
-        memory.append_timeline_event(&event).unwrap();
-        let events = memory.recent_states(10).unwrap();
+        must(memory.append_timeline_event(&event));
+        let events = must(memory.recent_states(10));
         assert_eq!(events.len(), 1);
         assert!(matches!(
             events[0].event_type,
@@ -1073,7 +1091,7 @@ mod tests {
 
     #[test]
     fn knowledge_and_experience_can_be_recalled() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
         let knowledge = KnowledgeNode {
             id: None,
             category: "lesson".to_string(),
@@ -1083,7 +1101,7 @@ mod tests {
             updated_at: Utc::now(),
             metadata: json!({}),
         };
-        memory.store_knowledge(&knowledge).unwrap();
+        must(memory.store_knowledge(&knowledge));
         let experience = Experience {
             id: None,
             session_id: SessionId::new(),
@@ -1095,19 +1113,14 @@ mod tests {
             created_at: Utc::now(),
             metadata: json!({}),
         };
-        memory.record_experience(&experience).unwrap();
-        assert!(
-            !memory
-                .recall_knowledge("verification", 5)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(!memory.recall_experiences("write", 5).unwrap().is_empty());
+        must(memory.record_experience(&experience));
+        assert!(!must(memory.recall_knowledge("verification", 5)).is_empty());
+        assert!(!must(memory.recall_experiences("write", 5)).is_empty());
     }
 
     #[test]
     fn utility_update_changes_ranking() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
         let first = Experience {
             id: Some(ExperienceId::new()),
             session_id: SessionId::new(),
@@ -1130,50 +1143,47 @@ mod tests {
             created_at: Utc::now(),
             metadata: json!({}),
         };
-        let first_id = memory.record_experience(&first).unwrap();
-        memory.record_experience(&second).unwrap();
-        memory.update_utility(first_id, 0.9).unwrap();
-        let recalled = memory.recall_experiences("run", 5).unwrap();
+        let first_id = must(memory.record_experience(&first));
+        must(memory.record_experience(&second));
+        must(memory.update_utility(first_id, 0.9));
+        let recalled = must(memory.recall_experiences("run", 5));
         assert_eq!(recalled[0].outcome, "old");
     }
 
     #[test]
     fn similar_task_phrasing_reuses_prior_experience() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
-        memory
-            .record_experience(&Experience {
-                id: None,
-                session_id: SessionId::new(),
-                task_id: TaskId::new(),
-                intent_id: IntentId::new(),
-                action_summary: "read_file:/Users/macc/Desktop/resume/Craig Lyons resume.md"
-                    .to_string(),
-                outcome: "success".to_string(),
-                utility: 0.8,
-                created_at: Utc::now(),
-                metadata: json!({
-                    "task": "read the craig lyons resume markdown file and summarize it",
-                    "action": Action::ReadFile {
-                        id: ActionId::new(),
-                        path: "/Users/macc/Desktop/resume/Craig Lyons resume.md".into(),
-                        max_bytes: None,
-                    }
-                }),
-            })
-            .unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
+        must(memory.record_experience(&Experience {
+            id: None,
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            intent_id: IntentId::new(),
+            action_summary:
+                "read_file:/Users/macc/Desktop/resume/Craig Lyons resume.md".to_string(),
+            outcome: "success".to_string(),
+            utility: 0.8,
+            created_at: Utc::now(),
+            metadata: json!({
+                "task": "read the craig lyons resume markdown file and summarize it",
+                "action": Action::ReadFile {
+                    id: ActionId::new(),
+                    path: "/Users/macc/Desktop/resume/Craig Lyons resume.md".into(),
+                    max_bytes: None,
+                }
+            }),
+        }));
 
-        let recalled = memory
-            .recall_experiences("find craig lyons resume.md and tell me about it", 5)
-            .unwrap();
+        let recalled =
+            must(memory.recall_experiences("find craig lyons resume.md and tell me about it", 5));
         assert_eq!(recalled.len(), 1);
     }
 
     #[test]
     fn backup_succeeds() {
-        let dir = tempdir().unwrap();
+        let dir = must_tempdir();
         let db = dir.path().join("agent.db");
         let backup = dir.path().join("backup.db");
-        let memory = SqliteMemory::open(&db).unwrap();
+        let memory = must(SqliteMemory::open(&db));
         let event = TimelineEvent {
             event_id: EventId::new(),
             session_id: SessionId::new(),
@@ -1189,53 +1199,49 @@ mod tests {
             duration_ms: None,
             payload_json: json!({}),
         };
-        memory.append_timeline_event(&event).unwrap();
-        memory.backup(&backup).unwrap();
+        must(memory.append_timeline_event(&event));
+        must(memory.backup(&backup));
         assert!(backup.exists());
     }
 
     #[test]
     fn manifests_persist_lifecycle_and_registry_snapshot() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
         let now = Utc::now();
-        memory
-            .save_manifest(&AgentManifest {
-                agent_id: AgentId("root".to_string()),
-                domain: "orchestrator".to_string(),
-                status: AgentStatus::Idle,
-                description: "root".to_string(),
-                created_at: now,
-                updated_at: now,
-                parent_agent_id: None,
-                capabilities: vec!["cli".to_string()],
-                authority: AgentAuthority::default(),
-                lifecycle: AgentLifecycle::ready(),
-                budget: AgentBudget::default(),
-            })
-            .unwrap();
+        must(memory.save_manifest(&AgentManifest {
+            agent_id: AgentId("root".to_string()),
+            domain: "orchestrator".to_string(),
+            status: AgentStatus::Idle,
+            description: "root".to_string(),
+            created_at: now,
+            updated_at: now,
+            parent_agent_id: None,
+            capabilities: vec!["cli".to_string()],
+            authority: AgentAuthority::default(),
+            lifecycle: AgentLifecycle::ready(),
+            budget: AgentBudget::default(),
+        }));
         let mut archived_lifecycle = AgentLifecycle::ready();
         archived_lifecycle.transition(
             AgentLifecyclePhase::Archived,
             now,
             Some("idle timeout".to_string()),
         );
-        memory
-            .save_manifest(&AgentManifest {
-                agent_id: AgentId("research-a1".to_string()),
-                domain: "research".to_string(),
-                status: AgentStatus::Archived,
-                description: "research specialist".to_string(),
-                created_at: now,
-                updated_at: now,
-                parent_agent_id: Some(AgentId("root".to_string())),
-                capabilities: vec!["web".to_string(), "documents".to_string()],
-                authority: AgentAuthority::default(),
-                lifecycle: archived_lifecycle,
-                budget: AgentBudget::default(),
-            })
-            .unwrap();
+        must(memory.save_manifest(&AgentManifest {
+            agent_id: AgentId("research-a1".to_string()),
+            domain: "research".to_string(),
+            status: AgentStatus::Archived,
+            description: "research specialist".to_string(),
+            created_at: now,
+            updated_at: now,
+            parent_agent_id: Some(AgentId("root".to_string())),
+            capabilities: vec!["web".to_string(), "documents".to_string()],
+            authority: AgentAuthority::default(),
+            lifecycle: archived_lifecycle,
+            budget: AgentBudget::default(),
+        }));
 
-        let registry = memory.agent_registry().unwrap();
+        let registry = must(memory.agent_registry());
         assert_eq!(registry.active_agents.len(), 1);
         assert_eq!(registry.archived_agents.len(), 1);
         assert_eq!(registry.archived_agents[0].domain, "research");
@@ -1243,44 +1249,40 @@ mod tests {
 
     #[test]
     fn consolidation_can_decay_stale_knowledge_and_trim_old_timeline() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
         let stale_time = Utc::now() - chrono::Duration::days(45);
         let recent_time = Utc::now();
 
-        memory
-            .append_timeline_event(&TimelineEvent {
-                event_id: EventId::new(),
-                session_id: SessionId::new(),
-                task_id: TaskId::new(),
-                agent_id: AgentId::new(),
-                timestamp: stale_time,
-                event_type: TimelineEventType::TaskReceived,
-                intent_id: None,
-                action_id: None,
-                pre_state_hash: None,
-                post_state_hash: None,
-                delta_summary: None,
-                duration_ms: None,
-                payload_json: json!({}),
-            })
-            .unwrap();
-        memory
-            .append_timeline_event(&TimelineEvent {
-                event_id: EventId::new(),
-                session_id: SessionId::new(),
-                task_id: TaskId::new(),
-                agent_id: AgentId::new(),
-                timestamp: recent_time,
-                event_type: TimelineEventType::TaskCompleted,
-                intent_id: None,
-                action_id: None,
-                pre_state_hash: None,
-                post_state_hash: None,
-                delta_summary: None,
-                duration_ms: None,
-                payload_json: json!({}),
-            })
-            .unwrap();
+        must(memory.append_timeline_event(&TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            timestamp: stale_time,
+            event_type: TimelineEventType::TaskReceived,
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            delta_summary: None,
+            duration_ms: None,
+            payload_json: json!({}),
+        }));
+        must(memory.append_timeline_event(&TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            timestamp: recent_time,
+            event_type: TimelineEventType::TaskCompleted,
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            delta_summary: None,
+            duration_ms: None,
+            payload_json: json!({}),
+        }));
 
         let stale = KnowledgeNode {
             id: None,
@@ -1291,38 +1293,34 @@ mod tests {
             updated_at: stale_time,
             metadata: json!({}),
         };
-        let knowledge_id = memory.store_knowledge(&stale).unwrap();
+        let knowledge_id = must(memory.store_knowledge(&stale));
 
-        let report = memory
-            .consolidate(&ConsolidationConfig {
-                max_recent_states: 1,
-                stale_knowledge_days: Some(30),
-                optimize_after_cleanup: true,
-                ..ConsolidationConfig::default()
-            })
-            .unwrap();
+        let report = must(memory.consolidate(&ConsolidationConfig {
+            max_recent_states: 1,
+            stale_knowledge_days: Some(30),
+            optimize_after_cleanup: true,
+            ..ConsolidationConfig::default()
+        }));
 
         assert_eq!(report.compacted_events, 1);
         assert_eq!(report.decayed_knowledge, 1);
         assert!(report.optimized);
-        assert_eq!(memory.recent_states(10).unwrap().len(), 1);
+        assert_eq!(must(memory.recent_states(10)).len(), 1);
 
-        let confidence: f64 = memory
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT confidence FROM knowledge WHERE id = ?1",
-                    params![knowledge_id.0],
-                    |row| row.get(0),
-                )
-                .map_err(to_storage)
-            })
-            .unwrap();
+        let confidence: f64 = must(memory.with_conn(|conn| {
+            conn.query_row(
+                "SELECT confidence FROM knowledge WHERE id = ?1",
+                params![knowledge_id.0],
+                |row| row.get(0),
+            )
+            .map_err(to_storage)
+        }));
         assert!(confidence < 0.9);
     }
 
     #[test]
     fn consolidation_promotes_repeated_success_into_knowledge_and_rule() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
         let action = Action::ReadFile {
             id: ActionId::new(),
             path: "startup.md".into(),
@@ -1330,32 +1328,28 @@ mod tests {
         };
 
         for _ in 0..3 {
-            memory
-                .record_experience(&Experience {
-                    id: None,
-                    session_id: SessionId::new(),
-                    task_id: TaskId::new(),
-                    intent_id: IntentId::new(),
-                    action_summary: "read_file:startup.md".to_string(),
-                    outcome: "ChangedAsExpected".to_string(),
-                    utility: 1.0,
-                    created_at: Utc::now(),
-                    metadata: json!({
-                        "task": "read startup.md",
-                        "action": action.clone(),
-                    }),
-                })
-                .unwrap();
+            must(memory.record_experience(&Experience {
+                id: None,
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                intent_id: IntentId::new(),
+                action_summary: "read_file:startup.md".to_string(),
+                outcome: "ChangedAsExpected".to_string(),
+                utility: 1.0,
+                created_at: Utc::now(),
+                metadata: json!({
+                    "task": "read startup.md",
+                    "action": action.clone(),
+                }),
+            }));
         }
 
-        let report = memory.consolidate(&ConsolidationConfig::default()).unwrap();
+        let report = must(memory.consolidate(&ConsolidationConfig::default()));
         assert!(report.merged_knowledge >= 1);
         assert!(report.promoted_rules >= 1);
-        assert!(!memory.active_rules().unwrap().is_empty());
+        assert!(!must(memory.active_rules()).is_empty());
         assert!(
-            memory
-                .recall_knowledge("prefer read_file", 5)
-                .unwrap()
+            must(memory.recall_knowledge("prefer read_file", 5))
                 .iter()
                 .any(|node| node.category == "pattern")
         );
@@ -1363,7 +1357,7 @@ mod tests {
 
     #[test]
     fn consolidation_can_deactivate_rule_after_later_failures() {
-        let memory = SqliteMemory::open_in_memory().unwrap();
+        let memory = must(SqliteMemory::open_in_memory());
         let action = Action::ReadFile {
             id: ActionId::new(),
             path: "startup.md".into(),
@@ -1371,47 +1365,43 @@ mod tests {
         };
 
         for _ in 0..3 {
-            memory
-                .record_experience(&Experience {
-                    id: None,
-                    session_id: SessionId::new(),
-                    task_id: TaskId::new(),
-                    intent_id: IntentId::new(),
-                    action_summary: "read_file:startup.md".to_string(),
-                    outcome: "success".to_string(),
-                    utility: 0.9,
-                    created_at: Utc::now(),
-                    metadata: json!({
-                        "task": "read startup.md",
-                        "action": action.clone(),
-                    }),
-                })
-                .unwrap();
+            must(memory.record_experience(&Experience {
+                id: None,
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                intent_id: IntentId::new(),
+                action_summary: "read_file:startup.md".to_string(),
+                outcome: "success".to_string(),
+                utility: 0.9,
+                created_at: Utc::now(),
+                metadata: json!({
+                    "task": "read startup.md",
+                    "action": action.clone(),
+                }),
+            }));
         }
 
-        memory.consolidate(&ConsolidationConfig::default()).unwrap();
-        assert_eq!(memory.active_rules().unwrap().len(), 1);
+        must(memory.consolidate(&ConsolidationConfig::default()));
+        assert_eq!(must(memory.active_rules()).len(), 1);
 
         for _ in 0..4 {
-            memory
-                .record_experience(&Experience {
-                    id: None,
-                    session_id: SessionId::new(),
-                    task_id: TaskId::new(),
-                    intent_id: IntentId::new(),
-                    action_summary: "read_file:startup.md".to_string(),
-                    outcome: "failure".to_string(),
-                    utility: -0.8,
-                    created_at: Utc::now(),
-                    metadata: json!({
-                        "task": "open startup.md",
-                        "action": action.clone(),
-                    }),
-                })
-                .unwrap();
+            must(memory.record_experience(&Experience {
+                id: None,
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                intent_id: IntentId::new(),
+                action_summary: "read_file:startup.md".to_string(),
+                outcome: "failure".to_string(),
+                utility: -0.8,
+                created_at: Utc::now(),
+                metadata: json!({
+                    "task": "open startup.md",
+                    "action": action.clone(),
+                }),
+            }));
         }
 
-        memory.consolidate(&ConsolidationConfig::default()).unwrap();
-        assert!(memory.active_rules().unwrap().is_empty());
+        must(memory.consolidate(&ConsolidationConfig::default()));
+        assert!(must(memory.active_rules()).is_empty());
     }
 }

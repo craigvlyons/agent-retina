@@ -12,6 +12,8 @@ pub struct ClaudeReasoner {
     client: Client,
     model_id: String,
     api_key: Option<String>,
+    prompt_caching: ClaudePromptCaching,
+    context_management: ClaudeContextManagement,
 }
 
 impl ClaudeReasoner {
@@ -21,6 +23,8 @@ impl ClaudeReasoner {
             model_id: env::var("RETINA_CLAUDE_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
             api_key: env::var("ANTHROPIC_API_KEY").ok(),
+            prompt_caching: ClaudePromptCaching::from_env(),
+            context_management: ClaudeContextManagement::from_env(),
         }
     }
 
@@ -29,24 +33,26 @@ impl ClaudeReasoner {
             KernelError::Configuration("ANTHROPIC_API_KEY is not set".to_string())
         })?;
 
-        let prompt = build_prompt(request, reflection);
-        let payload = json!({
-            "model": self.model_id,
-            "max_tokens": request.max_tokens.unwrap_or(if reflection { 256 } else { 512 }),
-            "system": "Return JSON only. Do not wrap the response in markdown fences.",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
-        });
+        let payload = build_payload(
+            &self.model_id,
+            request,
+            reflection,
+            &self.prompt_caching,
+            &self.context_management,
+        );
 
-        let response = self
+        let mut request_builder = self
             .client
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-version", "2023-06-01");
+        if let Some(beta_header) =
+            anthropic_beta_header_value(&self.model_id, &self.context_management)
+        {
+            request_builder = request_builder.header("anthropic-beta", beta_header);
+        }
+
+        let response = request_builder
             .json(&payload)
             .send()
             .map_err(|error| KernelError::Reasoning(error.to_string()))?;
@@ -75,7 +81,9 @@ impl ClaudeReasoner {
         let action: ClaudeAction = serde_json::from_str(&parsed).map_err(|error| {
             KernelError::Reasoning(format!("invalid Claude JSON response: {error}"))
         })?;
-        Ok(action.into_reason_response())
+        let mut response = action.into_reason_response();
+        response.tokens_used = body.usage.into();
+        Ok(response)
     }
 }
 
@@ -127,24 +135,77 @@ impl Reasoner for ClaudeReasoner {
             max_context_tokens: 200_000,
             supports_tool_use: false,
             supports_vision: false,
-            supports_caching: false,
+            supports_caching: self.prompt_caching.enabled,
             model_id: self.model_id.clone(),
         }
     }
 }
 
-fn build_prompt(request: &ReasonRequest, reflection: bool) -> String {
-    let constraints = if request.constraints.is_empty() {
-        "none".to_string()
-    } else {
-        request
-            .constraints
-            .iter()
-            .map(|constraint| format!("- {constraint}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+fn build_payload(
+    model_id: &str,
+    request: &ReasonRequest,
+    reflection: bool,
+    prompt_caching: &ClaudePromptCaching,
+    context_management: &ClaudeContextManagement,
+) -> serde_json::Value {
+    let system_blocks = build_system_blocks(reflection, prompt_caching);
+    let user_content = build_user_content_blocks(request);
+    let mut payload = json!({
+        "model": model_id,
+        "max_tokens": request.max_tokens.unwrap_or(if reflection { 256 } else { 512 }),
+        "system": system_blocks,
+        "messages": [
+            {
+                "role": "user",
+                "content": user_content
+            }
+        ]
+    });
 
+    if let Some(edits) =
+        build_context_management_edits(model_id, request, reflection, context_management)
+    {
+        payload["context_management"] = json!({ "edits": edits });
+    }
+
+    payload
+}
+
+fn build_system_blocks(
+    reflection: bool,
+    prompt_caching: &ClaudePromptCaching,
+) -> Vec<serde_json::Value> {
+    let stable_instructions = build_stable_instructions(reflection);
+    let mut blocks = vec![json!({
+        "type": "text",
+        "text": "Return JSON only. Do not wrap the response in markdown fences."
+    })];
+
+    let mut stable_block = json!({
+        "type": "text",
+        "text": stable_instructions
+    });
+    if prompt_caching.enabled {
+        stable_block["cache_control"] = prompt_caching.cache_control_json();
+    }
+    blocks.push(stable_block);
+    blocks
+}
+
+fn build_user_content_blocks(request: &ReasonRequest) -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "type": "text",
+            "text": build_dynamic_context_block(request)
+        }),
+        json!({
+            "type": "text",
+            "text": request.context.render()
+        }),
+    ]
+}
+
+fn build_stable_instructions(reflection: bool) -> String {
     format!(
         "You are the Retina agent reasoner.\n\
 Reflection mode: {reflection}.\n\
@@ -185,6 +246,7 @@ Supported action types:\n\
 \n\
 Planning rules:\n\
 - The harness is your body. Explore through shell actions instead of guessing.\n\
+- Treat the task state artifact as the canonical compact continuity record for this task.\n\
 - Use the smallest useful next step.\n\
 - Prefer structured filesystem actions over shell commands when possible.\n\
 - Prefer readable text sources such as .md, .txt, code, and config files when multiple candidates could answer the task.\n\
@@ -197,9 +259,6 @@ Planning rules:\n\
 - If a request needs discovery first, choose the exploratory action and set task_complete=false.\n\
 - Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
 \n\
-Constraints:\n\
-{}\n\
-\n\
 Prefer structured filesystem actions over shell commands when possible.\n\
 Only use run_command for an explicit shell command or when no structured action fits.\n\
 Write and append actions should normally set require_approval=true.\n\
@@ -207,12 +266,96 @@ You are allowed to explore the workspace in bounded steps.\n\
 Use find_files, list_directory, search_text, and read_file to discover what you need before acting.\n\
 Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
 If a request needs discovery first, choose the exploratory action and set task_complete=false.\n\
-Path hints like Desktop, Documents, Downloads, and ~/ refer to locations under the user's home directory.\n\
-\n\
-Context:\n{}",
-        constraints,
-        request.context.render()
+Path hints like Desktop, Documents, Downloads, and ~/ refer to locations under the user's home directory."
     )
+}
+
+fn build_dynamic_context_block(request: &ReasonRequest) -> String {
+    let constraints = if request.constraints.is_empty() {
+        "none".to_string()
+    } else {
+        request
+            .constraints
+            .iter()
+            .map(|constraint| format!("- {constraint}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "Constraints:\n{}\n\nDynamic task context follows in the next block. Use it as the mutable working set for this step.",
+        constraints
+    )
+}
+
+fn build_context_management_edits(
+    model_id: &str,
+    request: &ReasonRequest,
+    reflection: bool,
+    context_management: &ClaudeContextManagement,
+) -> Option<Vec<serde_json::Value>> {
+    let mut edits = Vec::new();
+
+    if context_management.tool_result_clearing_enabled {
+        edits.push(json!({
+            "type": "clear_tool_uses_20250919",
+            "trigger": {
+                "type": "input_tokens",
+                "value": context_management.tool_result_trigger_tokens
+            },
+            "clear_tool_inputs": false
+        }));
+    }
+
+    if context_management.server_side_compaction_enabled
+        && model_supports_server_compaction(model_id)
+    {
+        edits.push(json!({
+            "type": "compact_20260112",
+            "trigger": {
+                "type": "input_tokens",
+                "value": context_management.compaction_trigger_tokens
+            },
+            "pause_after_compaction": false,
+            "instructions": build_compaction_instructions(request, reflection)
+        }));
+    }
+
+    if edits.is_empty() { None } else { Some(edits) }
+}
+
+fn build_compaction_instructions(request: &ReasonRequest, reflection: bool) -> String {
+    format!(
+        "Write a compact continuation artifact for this Retina task. Preserve the task goal, progress, working sources, artifact references, blockers, failed paths, and next frontier. Prefer exact file paths, IDs, and evidence references over vague prose. Keep it concise and continuation-oriented. Reflection mode: {reflection}. Task: {}. Wrap the result in <summary></summary>.",
+        request.context.task
+    )
+}
+
+fn anthropic_beta_header_value(
+    model_id: &str,
+    context_management: &ClaudeContextManagement,
+) -> Option<String> {
+    let mut betas = Vec::new();
+
+    if context_management.tool_result_clearing_enabled {
+        betas.push("context-management-2025-06-27");
+    }
+
+    if context_management.server_side_compaction_enabled
+        && model_supports_server_compaction(model_id)
+    {
+        betas.push("compact-2026-01-12");
+    }
+
+    if betas.is_empty() {
+        None
+    } else {
+        Some(betas.join(","))
+    }
+}
+
+fn model_supports_server_compaction(model_id: &str) -> bool {
+    matches!(model_id, "claude-sonnet-4-6" | "claude-opus-4-6")
 }
 
 fn extract_json_blob(text: &str) -> Result<String> {
@@ -249,6 +392,8 @@ fn extract_json_blob(text: &str) -> Result<String> {
 #[derive(Debug, Deserialize)]
 struct ClaudeResponse {
     content: Vec<ClaudeContentBlock>,
+    #[serde(default)]
+    usage: ClaudeUsage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +413,84 @@ struct ClaudeContentBlock {
     #[serde(rename = "type")]
     block_type: String,
     text: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    #[serde(default)]
+    output_tokens: u32,
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    #[serde(default)]
+    cache_read_input_tokens: u32,
+}
+
+impl From<ClaudeUsage> for TokenUsage {
+    fn from(value: ClaudeUsage) -> Self {
+        Self {
+            input_tokens: value.input_tokens,
+            output_tokens: value.output_tokens,
+            cache_creation_input_tokens: value.cache_creation_input_tokens,
+            cache_read_input_tokens: value.cache_read_input_tokens,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClaudePromptCaching {
+    enabled: bool,
+}
+
+impl ClaudePromptCaching {
+    fn from_env() -> Self {
+        let enabled = env::var("RETINA_CLAUDE_PROMPT_CACHE")
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+            })
+            .unwrap_or(true);
+        Self { enabled }
+    }
+
+    fn cache_control_json(&self) -> serde_json::Value {
+        json!({ "type": "ephemeral" })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClaudeContextManagement {
+    tool_result_clearing_enabled: bool,
+    tool_result_trigger_tokens: u32,
+    server_side_compaction_enabled: bool,
+    compaction_trigger_tokens: u32,
+}
+
+impl ClaudeContextManagement {
+    fn from_env() -> Self {
+        Self {
+            tool_result_clearing_enabled: env_flag("RETINA_CLAUDE_CONTEXT_EDITING", true),
+            tool_result_trigger_tokens: env::var("RETINA_CLAUDE_TOOL_RESULT_TRIGGER_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(100_000),
+            server_side_compaction_enabled: env_flag("RETINA_CLAUDE_SERVER_COMPACTION", true),
+            compaction_trigger_tokens: env::var("RETINA_CLAUDE_COMPACTION_TRIGGER_TOKENS")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(120_000),
+        }
+    }
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    env::var(name)
+        .map(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(default)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -387,10 +610,86 @@ impl ClaudeAction {
 mod tests {
     use super::*;
 
+    fn must_some<T>(value: Option<T>, message: &str) -> T {
+        value.unwrap_or_else(|| panic!("{message}"))
+    }
+
+    fn must_json(body: &str) -> String {
+        extract_json_blob(body).unwrap_or_else(|_| panic!("expected JSON blob in test body"))
+    }
+
+    #[test]
+    fn payload_adds_cached_system_block_when_enabled() {
+        let payload = build_payload(
+            "claude-sonnet-test",
+            &ReasonRequest {
+                context: AssembledContext {
+                    identity: "Retina/test".to_string(),
+                    task: "read startup.md".to_string(),
+                    task_state: TaskState {
+                        goal: TaskGoal {
+                            objective: "read startup.md".to_string(),
+                            success_criteria: Vec::new(),
+                            constraints: Vec::new(),
+                        },
+                        progress: TaskProgress {
+                            current_phase: "starting".to_string(),
+                            current_step: 1,
+                            max_steps: 4,
+                            completed_checkpoints: Vec::new(),
+                            verified_facts: Vec::new(),
+                        },
+                        frontier: TaskFrontier {
+                            next_action_hint: None,
+                            open_questions: Vec::new(),
+                            blockers: Vec::new(),
+                        },
+                        recent_actions: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        avoid: Vec::new(),
+                        compaction: None,
+                    },
+                    tools: Vec::new(),
+                    memory_slice: Vec::new(),
+                    last_result: None,
+                    last_result_summary: None,
+                    recent_steps: Vec::new(),
+                    operator_guidance: None,
+                    current_step: 1,
+                    max_steps: 4,
+                },
+                tools: Vec::new(),
+                constraints: vec!["NoNetworkShellActions".to_string()],
+                max_tokens: Some(256),
+            },
+            false,
+            &ClaudePromptCaching { enabled: true },
+            &ClaudeContextManagement {
+                tool_result_clearing_enabled: false,
+                tool_result_trigger_tokens: 100_000,
+                server_side_compaction_enabled: false,
+                compaction_trigger_tokens: 120_000,
+            },
+        );
+
+        let system = must_some(
+            payload.get("system").and_then(serde_json::Value::as_array),
+            "system blocks",
+        );
+        assert_eq!(system.len(), 2);
+        assert_eq!(
+            system[1]
+                .get("cache_control")
+                .and_then(|value| value.get("type"))
+                .and_then(serde_json::Value::as_str),
+            Some("ephemeral")
+        );
+    }
+
     #[test]
     fn fenced_json_is_unwrapped() {
-        let body =
-            extract_json_blob("```json\n{\"type\":\"respond\",\"message\":\"hi\"}\n```").unwrap();
+        let body = must_json("```json\n{\"type\":\"respond\",\"message\":\"hi\"}\n```");
         assert_eq!(body, "{\"type\":\"respond\",\"message\":\"hi\"}");
     }
 
@@ -410,10 +709,91 @@ mod tests {
 
     #[test]
     fn json_blob_is_extracted_from_prefixed_text() {
-        let body = extract_json_blob(
+        let body = must_json(
             "Here is the JSON you requested:\n{\n  \"type\":\"respond\",\n  \"message\":\"hi\"\n}",
-        )
-        .unwrap();
+        );
         assert_eq!(body, "{\n  \"type\":\"respond\",\n  \"message\":\"hi\"\n}");
+    }
+
+    #[test]
+    fn claude_usage_maps_cache_token_fields() {
+        let usage = ClaudeUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_input_tokens: 80,
+            cache_read_input_tokens: 60,
+        };
+        let tokens: TokenUsage = usage.into();
+        assert_eq!(tokens.input_tokens, 100);
+        assert_eq!(tokens.output_tokens, 20);
+        assert_eq!(tokens.cache_creation_input_tokens, 80);
+        assert_eq!(tokens.cache_read_input_tokens, 60);
+    }
+
+    #[test]
+    fn payload_adds_context_management_for_supported_model() {
+        let payload = build_payload(
+            "claude-sonnet-4-6",
+            &ReasonRequest {
+                context: AssembledContext {
+                    identity: "Retina/test".to_string(),
+                    task: "read startup.md".to_string(),
+                    task_state: TaskState::default(),
+                    tools: Vec::new(),
+                    memory_slice: Vec::new(),
+                    last_result: None,
+                    last_result_summary: None,
+                    recent_steps: Vec::new(),
+                    operator_guidance: None,
+                    current_step: 1,
+                    max_steps: 4,
+                },
+                tools: Vec::new(),
+                constraints: Vec::new(),
+                max_tokens: Some(256),
+            },
+            false,
+            &ClaudePromptCaching { enabled: true },
+            &ClaudeContextManagement {
+                tool_result_clearing_enabled: true,
+                tool_result_trigger_tokens: 90_000,
+                server_side_compaction_enabled: true,
+                compaction_trigger_tokens: 120_000,
+            },
+        );
+
+        let edits = must_some(
+            payload
+                .get("context_management")
+                .and_then(|value| value.get("edits"))
+                .and_then(serde_json::Value::as_array),
+            "context management edits",
+        );
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            edits[0].get("type").and_then(serde_json::Value::as_str),
+            Some("clear_tool_uses_20250919")
+        );
+        assert_eq!(
+            edits[1].get("type").and_then(serde_json::Value::as_str),
+            Some("compact_20260112")
+        );
+    }
+
+    #[test]
+    fn beta_header_combines_context_management_features() {
+        let header = anthropic_beta_header_value(
+            "claude-sonnet-4-6",
+            &ClaudeContextManagement {
+                tool_result_clearing_enabled: true,
+                tool_result_trigger_tokens: 100_000,
+                server_side_compaction_enabled: true,
+                compaction_trigger_tokens: 120_000,
+            },
+        );
+        assert_eq!(
+            header.as_deref(),
+            Some("context-management-2025-06-27,compact-2026-01-12")
+        );
     }
 }
