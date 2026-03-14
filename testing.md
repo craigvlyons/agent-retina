@@ -18,8 +18,8 @@ The current worker can:
 - search text across files
 - read text files
 - extract text from PDFs
-- write and append files with approval
-- run controlled shell commands
+- write and append files directly
+- run shell commands, pipelines, and scripts
 - answer questions from what it found
 - take bounded multi-step actions
 - record timeline, experience, knowledge, and reflexes
@@ -73,17 +73,25 @@ During testing, look for:
 - `find the v1 plan and tell me what is still not done`
 - `search for document extraction support and tell me how PDFs are handled`
 
-### Write Tasks With Approval
+### Write Tasks
 
 - `write "test note" to tmp/test.txt`
 - `create tmp/test.md with a short summary of startup.md`
 - `append "another line" to tmp/test.txt`
 
-### Controlled Shell Tasks
+### Shell Tasks
 
 - `run git status`
 - `run pwd`
 - `run ls`
+- `run python -c "print('hello retina')"`
+- `run curl --version`
+
+### Delete Or Kill Approval Tests
+
+- `run rm tmp/test.txt`
+- `run rmdir tmp`
+- `run kill 1234`
 
 ### Failure Honesty Tests
 
@@ -129,9 +137,10 @@ Outside chat:
 1. Start with file finding and read tasks.
 2. Test one PDF/document task.
 3. Test one repo search/read/summarize task.
-4. Test one write task with approval.
-5. Test one failure case.
-6. Repeat a similar task 2-3 times and see whether behavior feels more stable.
+4. Test one write task.
+5. Test one delete or kill task and confirm it prompts.
+6. Test one failure case.
+7. Repeat a similar task 2-3 times and see whether behavior feels more stable.
 
 ## Notes
 

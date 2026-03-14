@@ -54,6 +54,7 @@ Retina is not yet the full colony:
 - Memory is pull-based and should keep prompts small.
 - Every meaningful action must be captured in the observation timeline.
 - Expansion should be additive. We do not want future specialist support to require major refactors of the kernel.
+- `lib.rs` files should stay focused on exports and top-level wiring. If a change adds a new responsibility or a `lib.rs` starts accumulating multiple concerns, split it into modules before adding more feature code.
 - If implementation intent is unclear, consult the canonical research stack before adding or refactoring behavior.
 - Do not hide real agent failures behind broad fallback behavior. If the agent cannot plan, act, or verify correctly, that gap should be visible in the timeline and operator surface so the system can improve honestly.
 - Do not cover up or withhold signals the agent needs in order to learn. The harness should expose constraints, errors, state mismatches, and missing capability edges clearly so the agent or operator can respond.

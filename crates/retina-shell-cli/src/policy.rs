@@ -217,7 +217,6 @@ mod tests {
                 path: dir.path().join("note.txt"),
                 content: "hello".to_string(),
                 overwrite: true,
-                require_approval: false,
             })
             .unwrap_err();
         assert!(matches!(error, KernelError::Unsupported(_)));

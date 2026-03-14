@@ -14,6 +14,39 @@ The goal is not to hardcode workflows. The goal is to give the harness and reaso
 
 This is the first useful-worker plan because weak task-shape understanding poisons every later step.
 
+## Current Progress
+
+Implemented:
+- shared `TaskState` now carries task shape, required inputs, requested output, and success markers
+- task progress now tracks required-input satisfaction and output-written/output-verified state
+- the kernel builds output-aware frontier hints and open questions
+- the kernel has a generic completion guard for answer/transform/output tasks
+- the Claude prompt now explicitly references task shape and output completion rules
+- the Claude prompt and kernel frontier language no longer push the worker toward “smallest step / structured first” behavior that can collapse into shallow directory browsing
+- output/transform tasks now receive a larger default step budget than simple answer/discovery tasks
+- chat and task-state output now surface clearer “not done yet” and blocker/open-question context instead of only showing the last source touched
+- the kernel now has task-shape-aware anti-thrash checks for answer/transform/output tasks that keep wandering in discovery after all required inputs are already ingested
+- task-kind inference now handles edit/update style tasks more cleanly by treating the repeated target file as the requested output instead of a second required input
+- regression coverage exists for:
+  - output-task shape assembly
+  - preventing discovery-only steps from finishing named-output tasks
+  - allowing longer output tasks to finish under a task-shape-aware default budget
+  - failing output tasks that keep discovering instead of producing the output once inputs are ready
+  - preventing answer tasks from finishing after evidence gathering without returning a grounded answer
+  - preventing transform tasks without named output from finishing before synthesis
+  - failing answer tasks that keep exploring after enough evidence is already ingested
+  - inferring existing-file edit targets as requested outputs
+
+Done for the v1 useful-worker boundary:
+- the worker now understands that discovery is intermediate progress, not completion, for answer/transform/output tasks
+- the harness blocks shallow fake completion without scripting the action path
+- the operator can see why a task is not done yet from blocker/open-question output
+
+Future tuning, not required to close this plan:
+- better semantic task-kind inference from richer natural-language phrasing
+- more nuanced transform-vs-answer distinctions for edge phrasing
+- stronger long-horizon task-quality signals once `u2` and `u3` expand the worker’s document and synthesis abilities
+
 ## Research Basis
 
 Use these docs as the governing stack:
@@ -164,4 +197,4 @@ The worker should still be free to explore, but the harness should detect low-va
 
 ## Done Condition
 
-This plan is done when the worker can correctly understand that a multi-source output task is still in progress after discovery, and the kernel no longer lets shallow exploration masquerade as completion.
+This plan is complete for v1 when the worker can correctly understand that answer, transform, and multi-source output tasks are still in progress after discovery/evidence gathering alone, and the kernel no longer lets shallow exploration masquerade as completion.

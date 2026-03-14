@@ -35,9 +35,11 @@ pub fn init_runtime() -> Result<()> {
 
     let db_path = root.join("agent.db");
     let memory = open_memory(&db_path)?;
-    let manifest = memory
-        .load_manifest(&root_agent_id())?
-        .unwrap_or(root_manifest()?);
+    let manifest = normalize_root_manifest(
+        memory
+            .load_manifest(&root_agent_id())?
+            .unwrap_or(root_manifest()?),
+    );
     memory.save_manifest(&manifest)?;
     write_manifest(root.join("manifest.toml"), &manifest)?;
     println!("Initialized Retina runtime at {}", home.display());
@@ -68,9 +70,6 @@ pub fn root_agent_id() -> AgentId {
 }
 
 pub fn root_manifest() -> Result<AgentManifest> {
-    let home = dirs::home_dir().ok_or_else(|| {
-        KernelError::Configuration("could not determine home directory".to_string())
-    })?;
     let now = Utc::now();
     Ok(AgentManifest {
         agent_id: root_agent_id(),
@@ -87,11 +86,35 @@ pub fn root_manifest() -> Result<AgentManifest> {
             "command".to_string(),
             "memory".to_string(),
         ],
-        authority: AgentAuthority {
-            accessible_roots: vec![home],
-            ..AgentAuthority::default()
-        },
+        authority: AgentAuthority::default(),
         lifecycle: AgentLifecycle::ready(),
         budget: AgentBudget::default(),
     })
+}
+
+pub fn normalize_root_manifest(mut manifest: AgentManifest) -> AgentManifest {
+    manifest.authority.accessible_roots.clear();
+    manifest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_manifest_is_unscoped_for_the_root_worker() {
+        let manifest = root_manifest().unwrap_or_else(|error| panic!("root manifest: {error}"));
+        assert!(manifest.authority.accessible_roots.is_empty());
+    }
+
+    #[test]
+    fn normalize_root_manifest_clears_old_scoped_roots() {
+        let mut manifest = root_manifest().unwrap_or_else(|error| panic!("root manifest: {error}"));
+        manifest
+            .authority
+            .accessible_roots
+            .push(PathBuf::from("/tmp"));
+        let normalized = normalize_root_manifest(manifest);
+        assert!(normalized.authority.accessible_roots.is_empty());
+    }
 }

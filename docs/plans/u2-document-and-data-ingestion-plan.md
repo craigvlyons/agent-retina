@@ -8,6 +8,28 @@ This plan strengthens the shell/body for real local source ingestion.
 
 The worker should be able to read, extract, and normalize useful content from common local sources so it can act on document-driven tasks without browser or vision support.
 
+## Current Progress
+
+Implemented:
+- `extract_document_text` now supports page-aware PDF extraction with `page_start` / `page_end`
+- document extraction results now carry richer metadata:
+  - extraction method
+  - optional page range
+  - structured-row detection flag
+- the kernel now preserves that metadata in compact result state, artifact references, summaries, and working-source fidelity
+- operator output now shows page-scoped extraction and extraction method details instead of flattening all document ingestion into one generic line
+- the narrow PDF follow-up helper can carry explicit page hints when the task asks for a specific page
+- regression coverage exists for:
+  - full PDF extraction
+  - page-specific PDF extraction
+  - task-state / CLI output compatibility with richer source metadata
+
+Still left in this plan:
+- explicit CSV and simple structured-data ingestion
+- better file-type-aware source selection across mixed source candidates
+- richer working-source fidelity for structured local data, not just document pages
+- broader mixed-source acceptance tests such as `.txt` + `.pdf` + `.csv`
+
 ## Research Basis
 
 Use these docs as the governing stack:
@@ -22,6 +44,7 @@ Research rules to preserve:
 - exact evidence stays outside the prompt
 - compact task state tracks authoritative working sources
 - missing capabilities should surface honestly
+- strengthen ingestion capability without scripting how the worker must use it
 
 ## Boundary
 
@@ -71,6 +94,9 @@ The shell should return enough metadata to know:
 
 This should improve working-source tracking and downstream synthesis.
 
+Status:
+- implemented for document extraction results in the CLI shell
+
 ### Phase U2.2: page-level PDF extraction
 
 Add page-aware PDF extraction.
@@ -84,6 +110,9 @@ This is enough for v1 document tasks that say:
 - “use page 2”
 - “read the first page”
 - “compare page 1 and page 3”
+
+Status:
+- implemented for page-aware local PDF extraction
 
 ### Phase U2.3: CSV and simple structured data ingestion
 
@@ -102,11 +131,12 @@ It does need useful row/column-aware ingestion.
 
 Improve how the worker chooses between candidate sources.
 
-The system should prefer:
+The worker should be able to choose:
 - directly readable text when it is sufficient
 - extracted document text when raw binary would be unhelpful
 - page-level extraction when the task requests a page-specific subsource
 - structured data ingestion when the source is CSV-like
+- shell commands or small local scripts when they are the best ingestion path
 
 This is selection quality, not hardcoded task routing.
 
@@ -148,6 +178,7 @@ This keeps compaction and resumption faithful to the real inputs.
 - OCR or screenshot-based extraction
 - browser/document viewer logic
 - domain-specific hardcoded PDF handling
+- forcing one ingestion path when the shell/body already has a better local option
 
 ## Done Condition
 

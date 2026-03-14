@@ -25,7 +25,7 @@ pub fn plan_task(task: &str, last_result: Option<&str>) -> Option<ReasonResponse
 }
 
 pub fn capability_message() -> String {
-    "I can explore and act through the CLI shell: inspect paths, list directories, find files, search text, read files, extract text from documents, write or append files with approval, record notes, and run controlled shell commands. For concrete work, I should reason about the task and choose the next action through the kernel.".to_string()
+    "I can explore and act through the CLI shell: inspect paths, list directories, find files, search text, read files, extract text from documents, create or modify files, record notes, and run shell commands when they help complete the task. For concrete work, I should reason about the task and choose the next action through the kernel.".to_string()
 }
 
 fn with_reasoning(action: Action, task_complete: bool, reasoning: &str) -> ReasonResponse {
@@ -100,7 +100,7 @@ fn plan_follow_up_action(task: &str, last_result: Option<&str>) -> Option<Action
                 || lower.contains("open")
                 || lower.contains("summarize")
             {
-                Some(content_action_for_path(path))
+                Some(content_action_for_path(task, path))
             } else {
                 None
             }
@@ -112,7 +112,7 @@ fn plan_follow_up_action(task: &str, last_result: Option<&str>) -> Option<Action
                     .map(|item| item.path)
                     .collect::<Vec<_>>(),
             )?;
-            Some(content_action_for_path(path))
+            Some(content_action_for_path(task, path))
         }
         _ => None,
     }
@@ -203,17 +203,20 @@ fn asks_for_content_answer(task: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-fn content_action_for_path(path: PathBuf) -> Action {
+fn content_action_for_path(task: &str, path: PathBuf) -> Action {
     if path
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.eq_ignore_ascii_case("pdf"))
         .unwrap_or(false)
     {
+        let (page_start, page_end) = requested_page_range(task);
         Action::ExtractDocumentText {
             id: ActionId::new(),
             path,
             max_chars: Some(24 * 1024),
+            page_start,
+            page_end,
         }
     } else {
         Action::ReadFile {
@@ -222,6 +225,34 @@ fn content_action_for_path(path: PathBuf) -> Action {
             max_bytes: Some(24 * 1024),
         }
     }
+}
+
+fn requested_page_range(task: &str) -> (Option<usize>, Option<usize>) {
+    let tokens = task
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    for window in tokens.windows(4) {
+        if matches!(window[0].as_str(), "pages" | "page")
+            && matches!(window[2].as_str(), "to" | "through" | "thru")
+        {
+            if let (Ok(start), Ok(end)) = (window[1].parse::<usize>(), window[3].parse::<usize>()) {
+                return (Some(start), Some(end));
+            }
+        }
+    }
+
+    for window in tokens.windows(2) {
+        if matches!(window[0].as_str(), "page" | "pages") {
+            if let Ok(page) = window[1].parse::<usize>() {
+                return (Some(page), Some(page));
+            }
+        }
+    }
+
+    (None, None)
 }
 
 #[cfg(test)]

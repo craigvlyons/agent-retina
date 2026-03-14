@@ -25,6 +25,7 @@ Research rules to preserve:
 - compact task state should preserve output goals and evidence references
 - exact source evidence should remain retrievable
 - the worker should not claim completion before output creation is verified
+- the harness should verify output completion without prescribing one synthesis route
 
 ## Boundary
 
@@ -84,6 +85,7 @@ Strengthen the worker’s write path so it can:
 - overwrite intentionally when the task implies replacement
 - append when the task implies incremental output
 - perform light modifications to existing local text artifacts
+- use commands or helper scripts when they are better than a single direct write
 
 ### Phase U3.4: output verification and completion
 
@@ -128,6 +130,7 @@ The failure should still preserve gathered evidence and working state.
 - fake success without writing the file
 - PDF layout reconstruction as a v1 requirement
 - hardcoded domain templates for specific user files
+- forcing direct write actions when a command or script is the more natural local path
 
 ## Done Condition
 

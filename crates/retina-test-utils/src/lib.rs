@@ -394,6 +394,9 @@ impl Shell for MockShell {
                     .and_then(|value| value.to_str())
                     .unwrap_or("document")
                     .to_string(),
+                extraction_method: "mock_extract".to_string(),
+                page_range: None,
+                structured_rows_detected: false,
             }),
             Action::WriteFile { path, content, .. } => Ok(ActionResult::FileWrite {
                 path: path.clone(),
@@ -415,10 +418,7 @@ impl Shell for MockShell {
     }
 
     fn constraints(&self) -> &[HardConstraint] {
-        static CONSTRAINTS: [HardConstraint; 2] = [
-            HardConstraint::NoNetworkShellActions,
-            HardConstraint::DestructiveOperationsRequireApproval,
-        ];
+        static CONSTRAINTS: [HardConstraint; 1] = [HardConstraint::DeleteOrKillRequireApproval];
         &CONSTRAINTS
     }
 

@@ -1,21 +1,21 @@
+mod file_ops;
 mod policy;
+mod process_control;
+mod state_helpers;
 
 pub use policy::ScopedShell;
 
+use crate::state_helpers::{command_fingerprint, path_fingerprint};
 use blake3::Hasher;
 use chrono::{DateTime, Utc};
-use pdf_extract::extract_text;
+use pdf_extract::{extract_text, extract_text_by_pages};
 use retina_traits::Shell;
 use retina_types::*;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::{Mutex, MutexGuard};
-use std::thread;
-use std::time::Instant;
 
 const DEFAULT_MAX_READ_BYTES: usize = 32 * 1024;
 const DEFAULT_MAX_LIST_ENTRIES: usize = 200;
@@ -44,455 +44,6 @@ impl CliShell {
             last_command: Mutex::new(None),
             notes: Mutex::new(Vec::new()),
         }
-    }
-
-    fn inspect_path_state(path: &Path, include_content: bool) -> Result<PathState> {
-        if !path.exists() {
-            return Ok(PathState {
-                path: path.to_path_buf(),
-                exists: false,
-                size: None,
-                modified_at: None,
-                content_hash: None,
-            });
-        }
-
-        let metadata = fs::metadata(path)?;
-        let modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
-        let content_hash = if include_content && metadata.is_file() {
-            let bytes = fs::read(path)?;
-            Some(blake3::hash(&bytes).to_hex().to_string())
-        } else {
-            None
-        };
-
-        Ok(PathState {
-            path: path.to_path_buf(),
-            exists: true,
-            size: Some(metadata.len()),
-            modified_at,
-            content_hash,
-        })
-    }
-
-    fn cwd_hash(path: &Path) -> String {
-        blake3::hash(path.display().to_string().as_bytes())
-            .to_hex()
-            .to_string()
-    }
-
-    fn contains_network_command(command: &str) -> bool {
-        let lower = command.to_lowercase();
-        [
-            "curl ", "wget ", "ssh ", "scp ", "nc ", "ping ", "http://", "https://",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    }
-
-    fn looks_destructive(command: &str) -> bool {
-        let lower = command.to_lowercase();
-        [
-            "rm ",
-            "mv ",
-            "chmod ",
-            "chown ",
-            "dd ",
-            "mkfs",
-            ">: ",
-            "truncate ",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    }
-
-    pub(crate) fn resolve_path(path: &Path) -> Result<PathBuf> {
-        if let Some(expanded) = expand_homeish_path(path) {
-            return Ok(expanded);
-        }
-        if path.is_absolute() {
-            Ok(path.to_path_buf())
-        } else {
-            Ok(std::env::current_dir()?.join(path))
-        }
-    }
-
-    fn list_directory(
-        path: &Path,
-        recursive: bool,
-        max_entries: usize,
-    ) -> Result<Vec<DirectoryEntry>> {
-        let root = Self::resolve_path(path)?;
-        let mut entries = Vec::new();
-        Self::collect_directory_entries(&root, recursive, max_entries.max(1), &mut entries)?;
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(entries)
-    }
-
-    fn collect_directory_entries(
-        dir: &Path,
-        recursive: bool,
-        max_entries: usize,
-        entries: &mut Vec<DirectoryEntry>,
-    ) -> Result<()> {
-        if entries.len() >= max_entries {
-            return Ok(());
-        }
-        for item in fs::read_dir(dir)? {
-            if entries.len() >= max_entries {
-                break;
-            }
-            let item = item?;
-            let path = item.path();
-            let metadata = item.metadata()?;
-            entries.push(DirectoryEntry {
-                path: path.clone(),
-                is_dir: metadata.is_dir(),
-                size: if metadata.is_file() {
-                    Some(metadata.len())
-                } else {
-                    None
-                },
-            });
-            if recursive && metadata.is_dir() {
-                Self::collect_directory_entries(&path, true, max_entries, entries)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn find_files(root: &Path, pattern: &str, max_results: usize) -> Result<Vec<PathBuf>> {
-        let root = Self::resolve_path(root)?;
-        let mut matches = Vec::new();
-        Self::collect_matching_files(
-            &root,
-            &pattern.to_lowercase(),
-            max_results.max(1),
-            &mut matches,
-        )?;
-        matches.sort();
-        Ok(matches)
-    }
-
-    fn collect_matching_files(
-        root: &Path,
-        pattern: &str,
-        max_results: usize,
-        matches: &mut Vec<PathBuf>,
-    ) -> Result<()> {
-        if matches.len() >= max_results {
-            return Ok(());
-        }
-        for item in fs::read_dir(root)? {
-            if matches.len() >= max_results {
-                break;
-            }
-            let item = item?;
-            let path = item.path();
-            let metadata = item.metadata()?;
-            let name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_lowercase();
-            let path_text = path.display().to_string().to_lowercase();
-
-            if name.contains(pattern) || path_text.contains(pattern) {
-                matches.push(path.clone());
-                if matches.len() >= max_results {
-                    break;
-                }
-            }
-
-            if metadata.is_dir() {
-                Self::collect_matching_files(&path, pattern, max_results, matches)?;
-                continue;
-            }
-        }
-        Ok(())
-    }
-
-    fn search_text(root: &Path, query: &str, max_results: usize) -> Result<Vec<SearchMatch>> {
-        let root = Self::resolve_path(root)?;
-        let mut matches = Vec::new();
-        Self::collect_text_matches(
-            &root,
-            &query.to_lowercase(),
-            max_results.max(1),
-            &mut matches,
-        )?;
-        Ok(matches)
-    }
-
-    fn collect_text_matches(
-        root: &Path,
-        query: &str,
-        max_results: usize,
-        matches: &mut Vec<SearchMatch>,
-    ) -> Result<()> {
-        if matches.len() >= max_results {
-            return Ok(());
-        }
-        for item in fs::read_dir(root)? {
-            if matches.len() >= max_results {
-                break;
-            }
-            let item = item?;
-            let path = item.path();
-            let metadata = item.metadata()?;
-            if metadata.is_dir() {
-                Self::collect_text_matches(&path, query, max_results, matches)?;
-                continue;
-            }
-            if metadata.len() > 512 * 1024 {
-                continue;
-            }
-            let bytes = fs::read(&path)?;
-            if bytes.contains(&0) {
-                continue;
-            }
-            let content = String::from_utf8_lossy(&bytes);
-            for (index, line) in content.lines().enumerate() {
-                if line.to_lowercase().contains(query) {
-                    matches.push(SearchMatch {
-                        path: path.clone(),
-                        line_number: index + 1,
-                        line: line.to_string(),
-                    });
-                    if matches.len() >= max_results {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn read_file(path: &Path, max_bytes: Option<usize>) -> Result<(String, bool)> {
-        let path = Self::resolve_path(path)?;
-        if prefers_document_extraction(&path) {
-            return Err(KernelError::Unsupported(format!(
-                "read_file is not suitable for {}; use extract_document_text instead",
-                path.display()
-            )));
-        }
-        let mut file = fs::File::open(&path)?;
-        let limit = max_bytes.unwrap_or(DEFAULT_MAX_READ_BYTES);
-        let mut buffer = Vec::new();
-        Read::by_ref(&mut file)
-            .take((limit + 1) as u64)
-            .read_to_end(&mut buffer)?;
-        if looks_binary(&buffer) {
-            return Err(KernelError::Unsupported(format!(
-                "read_file only supports text-like files; {} appears to be binary",
-                path.display()
-            )));
-        }
-        let truncated = buffer.len() > limit;
-        if truncated {
-            buffer.truncate(limit);
-        }
-        Ok((String::from_utf8_lossy(&buffer).to_string(), truncated))
-    }
-
-    fn extract_document_text(
-        path: &Path,
-        max_chars: Option<usize>,
-    ) -> Result<(String, bool, String)> {
-        let path = Self::resolve_path(path)?;
-        let extension = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_lowercase();
-
-        let (content, format) = match extension.as_str() {
-            "pdf" => (
-                extract_text(&path).map_err(|error| KernelError::Execution(error.to_string()))?,
-                "pdf".to_string(),
-            ),
-            "md" | "txt" | "rs" | "toml" | "json" | "yaml" | "yml" => {
-                let (content, _) = Self::read_file(&path, None)?;
-                (content, extension)
-            }
-            _ => {
-                return Err(KernelError::Unsupported(format!(
-                    "document extraction is not supported for {}",
-                    path.display()
-                )));
-            }
-        };
-
-        let limit = max_chars.unwrap_or(DEFAULT_MAX_READ_BYTES);
-        let mut truncated = false;
-        let content = if content.chars().count() > limit {
-            truncated = true;
-            content.chars().take(limit).collect::<String>()
-        } else {
-            content
-        };
-        Ok((content, truncated, format))
-    }
-
-    fn write_file(path: &Path, content: &str, overwrite: bool) -> Result<usize> {
-        let path = Self::resolve_path(path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if path.exists() && !overwrite {
-            return Err(KernelError::Validation(format!(
-                "refusing to overwrite existing file {} without overwrite=true",
-                path.display()
-            )));
-        }
-        fs::write(&path, content)?;
-        Ok(content.len())
-    }
-
-    fn append_file(path: &Path, content: &str) -> Result<usize> {
-        let path = Self::resolve_path(path)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        file.write_all(content.as_bytes())?;
-        Ok(content.len())
-    }
-
-    fn run_command(
-        command: &str,
-        cwd: Option<PathBuf>,
-        control: Option<&ExecutionControlHandle>,
-    ) -> Result<CommandResult> {
-        let workdir = cwd.unwrap_or(std::env::current_dir()?);
-        let start = Instant::now();
-        let mut child = build_shell_command(command, &workdir)?.spawn()?;
-        let mut cancelled = false;
-        let mut termination = None;
-
-        loop {
-            if let Some(status) = child.try_wait()? {
-                let (stdout, stderr) = read_child_output(&mut child)?;
-                let success = status.success() && !cancelled;
-                let result = CommandResult {
-                    command: command.to_string(),
-                    cwd: workdir,
-                    stdout,
-                    stderr,
-                    exit_code: status.code(),
-                    success,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    cancelled,
-                    termination,
-                };
-                return Ok(result);
-            }
-
-            if control
-                .map(ExecutionControlHandle::is_cancel_requested)
-                .unwrap_or(false)
-            {
-                cancelled = true;
-                terminate_child_gracefully(&mut child)?;
-                if wait_for_exit(&mut child, 1_000)? {
-                    termination = Some("terminated gracefully after cancellation".to_string());
-                } else {
-                    force_kill_child(&mut child)?;
-                    let _ = child.wait();
-                    termination = Some("force killed after cancellation".to_string());
-                }
-                continue;
-            }
-
-            thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-}
-
-fn build_shell_command(command: &str, workdir: &Path) -> Result<Command> {
-    let mut process = Command::new("sh");
-    process
-        .arg("-lc")
-        .arg(command)
-        .current_dir(workdir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    unsafe {
-        process.pre_exec(|| {
-            if libc::setpgid(0, 0) == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::last_os_error())
-            }
-        });
-    }
-    Ok(process)
-}
-
-fn read_child_output(child: &mut Child) -> Result<(String, String)> {
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_string(&mut stdout)?;
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_string(&mut stderr)?;
-    }
-    Ok((stdout, stderr))
-}
-
-fn wait_for_exit(child: &mut Child, timeout_ms: u64) -> Result<bool> {
-    let started = Instant::now();
-    while started.elapsed().as_millis() < timeout_ms as u128 {
-        if child.try_wait()?.is_some() {
-            return Ok(true);
-        }
-        thread::sleep(std::time::Duration::from_millis(50));
-    }
-    Ok(false)
-}
-
-fn terminate_child_gracefully(child: &mut Child) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        let result = unsafe { libc::kill(-pid, libc::SIGTERM) };
-        if result == 0 {
-            return Ok(());
-        }
-        let result = unsafe { libc::kill(pid, libc::SIGTERM) };
-        if result == 0 {
-            return Ok(());
-        }
-        Err(KernelError::Execution(
-            io::Error::last_os_error().to_string(),
-        ))
-    }
-
-    #[cfg(not(unix))]
-    {
-        child.kill()?;
-        Ok(())
-    }
-}
-
-fn force_kill_child(child: &mut Child) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let pid = child.id() as i32;
-        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
-        if result == 0 {
-            return Ok(());
-        }
-        child.kill()?;
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    {
-        child.kill()?;
-        Ok(())
     }
 }
 
@@ -600,14 +151,10 @@ impl Shell for CliShell {
                 require_approval,
                 ..
             } => {
-                if Self::contains_network_command(command) {
-                    return Err(KernelError::Unsupported(
-                        "network commands are not shell-native actions in v1".to_string(),
-                    ));
-                }
-                if Self::looks_destructive(command) && !require_approval {
+                if classify_privileged_command(command).is_some() && !require_approval {
                     return Err(KernelError::ApprovalDenied(
-                        "destructive command blocked until explicitly approved".to_string(),
+                        "delete-like or kill-like command blocked until explicitly approved"
+                            .to_string(),
                     ));
                 }
 
@@ -678,14 +225,28 @@ impl Shell for CliShell {
                 })
             }
             Action::ExtractDocumentText {
-                path, max_chars, ..
+                path,
+                max_chars,
+                page_start,
+                page_end,
+                ..
             } => {
-                let (content, truncated, format) = Self::extract_document_text(path, *max_chars)?;
+                let (
+                    content,
+                    truncated,
+                    format,
+                    extraction_method,
+                    page_range,
+                    structured_rows_detected,
+                ) = Self::extract_document_text(path, *max_chars, *page_start, *page_end)?;
                 Ok(ActionResult::DocumentText {
                     path: Self::resolve_path(path)?,
                     content,
                     truncated,
                     format,
+                    extraction_method,
+                    page_range,
+                    structured_rows_detected,
                 })
             }
             Action::WriteFile {
@@ -720,10 +281,7 @@ impl Shell for CliShell {
     }
 
     fn constraints(&self) -> &[HardConstraint] {
-        static CONSTRAINTS: [HardConstraint; 2] = [
-            HardConstraint::NoNetworkShellActions,
-            HardConstraint::DestructiveOperationsRequireApproval,
-        ];
+        static CONSTRAINTS: [HardConstraint; 1] = [HardConstraint::DeleteOrKillRequireApproval];
         &CONSTRAINTS
     }
 
@@ -769,66 +327,6 @@ impl Shell for CliShell {
     }
 }
 
-fn path_fingerprint(path_state: &PathState) -> String {
-    format!(
-        "{}:{}:{:?}:{:?}",
-        path_state.exists,
-        path_state.size.unwrap_or_default(),
-        path_state.modified_at,
-        path_state.content_hash
-    )
-}
-
-fn command_fingerprint(result: &CommandResult) -> String {
-    let mut hasher = Hasher::new();
-    hasher.update(result.command.as_bytes());
-    hasher.update(result.stdout.as_bytes());
-    hasher.update(result.stderr.as_bytes());
-    hasher.update(&result.exit_code.unwrap_or_default().to_le_bytes());
-    hasher.finalize().to_hex().to_string()
-}
-
-fn expand_homeish_path(path: &Path) -> Option<PathBuf> {
-    let raw = path.to_str()?;
-    if raw == "~" {
-        return dirs::home_dir();
-    }
-    if let Some(stripped) = raw.strip_prefix("~/") {
-        return dirs::home_dir().map(|home| home.join(stripped));
-    }
-
-    let first = path
-        .components()
-        .next()?
-        .as_os_str()
-        .to_str()?
-        .to_lowercase();
-    let base = match first.as_str() {
-        "desktop" => dirs::home_dir().map(|home| home.join("Desktop")),
-        "documents" => dirs::home_dir().map(|home| home.join("Documents")),
-        "downloads" => dirs::home_dir().map(|home| home.join("Downloads")),
-        _ => None,
-    }?;
-
-    let remainder = path.iter().skip(1).collect::<PathBuf>();
-    Some(if remainder.as_os_str().is_empty() {
-        base
-    } else {
-        base.join(remainder)
-    })
-}
-
-fn prefers_document_extraction(path: &Path) -> bool {
-    path.extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.eq_ignore_ascii_case("pdf"))
-        .unwrap_or(false)
-}
-
-fn looks_binary(bytes: &[u8]) -> bool {
-    bytes.contains(&0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +361,23 @@ mod tests {
         assert_eq!(result.stdout, "hello");
         assert_eq!(result.exit_code, Some(0));
         assert!(result.duration_ms <= 5_000);
+    }
+
+    #[test]
+    fn delete_like_command_requires_explicit_approval() {
+        let shell = CliShell::new();
+        let error = match shell.execute(&Action::RunCommand {
+            id: ActionId::new(),
+            command: "rm tmp/test.txt".to_string(),
+            cwd: None,
+            require_approval: false,
+            expect_change: true,
+            state_scope: HashScope::default(),
+        }) {
+            Ok(_) => panic!("expected approval-denied error"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, KernelError::ApprovalDenied(_)));
     }
 
     #[test]
@@ -923,7 +438,7 @@ mod tests {
     fn read_file_rejects_pdf_and_requests_document_tool() {
         let dir = must_tempdir();
         let file = dir.path().join("resume.pdf");
-        write_test_pdf(&file, "hello pdf");
+        write_test_pdf_pages(&file, &["hello pdf"]);
         let shell = CliShell::new();
         let error = match shell.execute(&Action::ReadFile {
             id: ActionId::new(),
@@ -982,7 +497,6 @@ mod tests {
                 path: file.clone(),
                 content: "after".to_string(),
                 overwrite: true,
-                require_approval: true,
             }),
         ));
         assert!(matches!(delta.kind, StateDeltaKind::ChangedAsExpected));
@@ -1013,12 +527,14 @@ mod tests {
     fn extract_document_text_reads_pdf_text() {
         let dir = must_tempdir();
         let file = dir.path().join("sample.pdf");
-        write_test_pdf(&file, "hello pdf");
+        write_test_pdf_pages(&file, &["hello pdf"]);
         let shell = CliShell::new();
         let result = must(shell.execute(&Action::ExtractDocumentText {
             id: ActionId::new(),
             path: file.clone(),
             max_chars: None,
+            page_start: None,
+            page_end: None,
         }));
         let ActionResult::DocumentText {
             content, format, ..
@@ -1030,26 +546,52 @@ mod tests {
         assert!(content.to_lowercase().contains("hello"));
     }
 
-    fn write_test_pdf(path: &Path, text: &str) {
+    #[test]
+    fn extract_document_text_reads_only_requested_pdf_page() {
+        let dir = must_tempdir();
+        let file = dir.path().join("multipage.pdf");
+        write_test_pdf_pages(&file, &["first page", "second page", "third page"]);
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::ExtractDocumentText {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_chars: None,
+            page_start: Some(2),
+            page_end: Some(2),
+        }));
+        let ActionResult::DocumentText {
+            content,
+            format,
+            extraction_method,
+            page_range,
+            ..
+        } = result
+        else {
+            panic!("expected document text");
+        };
+        assert_eq!(format, "pdf");
+        assert_eq!(extraction_method, "pdf_extract_by_page");
+        assert_eq!(
+            page_range,
+            Some(DocumentPageRange {
+                start_page: 2,
+                end_page: 2
+            })
+        );
+        assert!(!content.to_lowercase().contains("first"));
+        assert!(content.to_lowercase().contains("second"));
+        assert!(!content.to_lowercase().contains("third"));
+    }
+
+    fn write_test_pdf_pages(path: &Path, pages: &[&str]) {
         let mut document = Document::with_version("1.5");
         let pages_id = document.new_object_id();
-        let page_id = document.new_object_id();
         let font_id = document.new_object_id();
-        let resources_id = document.new_object_id();
-        let content_id = document.new_object_id();
-
-        let content = Content {
-            operations: vec![
-                Operation::new("BT", vec![]),
-                Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), 24.into()]),
-                Operation::new("Td", vec![72.into(), 100.into()]),
-                Operation::new("Tj", vec![Object::string_literal(text)]),
-                Operation::new("ET", vec![]),
-            ],
-        };
-        let encoded = content
-            .encode()
-            .unwrap_or_else(|error| panic!("failed to encode PDF test content: {error}"));
+        let resources_id = document.add_object(dictionary! {
+            "Font" => dictionary! {
+                "F1" => font_id,
+            }
+        });
 
         document.objects.insert(
             font_id,
@@ -1059,34 +601,56 @@ mod tests {
                 "BaseFont" => "Helvetica",
             }),
         );
-        document.objects.insert(
-            resources_id,
-            Object::Dictionary(dictionary! {
-                "Font" => dictionary! {
-                    "F1" => font_id,
-                }
-            }),
-        );
-        document.objects.insert(
-            content_id,
-            Object::Stream(Stream::new(dictionary! {}, encoded)),
-        );
-        document.objects.insert(
-            page_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Page",
-                "Parent" => pages_id,
-                "MediaBox" => vec![0.into(), 0.into(), 300.into(), 144.into()],
-                "Contents" => content_id,
-                "Resources" => resources_id,
-            }),
-        );
+
+        let page_ids = pages
+            .iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let page_id = document.new_object_id();
+                let content_id = document.new_object_id();
+                let content = Content {
+                    operations: vec![
+                        Operation::new("BT", vec![]),
+                        Operation::new("Tf", vec![Object::Name(b"F1".to_vec()), 24.into()]),
+                        Operation::new("Td", vec![72.into(), 100.into()]),
+                        Operation::new(
+                            "Tj",
+                            vec![Object::string_literal(format!(
+                                "page {} {}",
+                                index + 1,
+                                text
+                            ))],
+                        ),
+                        Operation::new("ET", vec![]),
+                    ],
+                };
+                let encoded = content
+                    .encode()
+                    .unwrap_or_else(|error| panic!("failed to encode PDF test content: {error}"));
+                document.objects.insert(
+                    content_id,
+                    Object::Stream(Stream::new(dictionary! {}, encoded)),
+                );
+                document.objects.insert(
+                    page_id,
+                    Object::Dictionary(dictionary! {
+                        "Type" => "Page",
+                        "Parent" => pages_id,
+                        "MediaBox" => vec![0.into(), 0.into(), 300.into(), 144.into()],
+                        "Contents" => content_id,
+                        "Resources" => resources_id,
+                    }),
+                );
+                page_id
+            })
+            .collect::<Vec<_>>();
+
         document.objects.insert(
             pages_id,
             Object::Dictionary(dictionary! {
                 "Type" => "Pages",
-                "Kids" => vec![page_id.into()],
-                "Count" => 1,
+                "Kids" => page_ids.iter().copied().map(Object::from).collect::<Vec<_>>(),
+                "Count" => page_ids.len() as i64,
             }),
         );
 

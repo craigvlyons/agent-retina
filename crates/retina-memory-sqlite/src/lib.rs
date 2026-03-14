@@ -1,30 +1,34 @@
 mod consolidation;
+mod embedder;
+mod manifest;
 mod registry;
 mod retrieval;
+mod storage;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use consolidation::{
     build_experience_patterns, knowledge_content, metadata_key, metadata_success_count,
     pattern_metadata, rule_matches_pattern, rule_name, should_promote_rule,
 };
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use embedder::Embedder;
+pub use manifest::write_manifest;
 use refinery::embed_migrations;
-use registry::registry_snapshot;
 use retina_traits::Memory;
 use retina_types::*;
 use retrieval::{rank_experiences, rerank_knowledge};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, params};
-use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sqlite_vec::sqlite3_vec_init;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, Once};
+use std::path::Path;
+use std::sync::Mutex;
+use storage::{
+    embedding_json, load_knowledge_nodes, load_recent_experiences, load_rules, parse_datetime,
+    persist_knowledge, persist_rule, register_sqlite_vec, row_to_experience, row_to_knowledge,
+    row_to_timeline_event, sanitize_fts_query, to_storage,
+};
 
 embed_migrations!("migrations");
-
-static REGISTER_VEC: Once = Once::new();
 
 pub struct SqliteMemory {
     conn: Mutex<Connection>,
@@ -90,147 +94,6 @@ impl SqliteMemory {
 
     fn embed_text(&self, input: &str) -> Vec<f32> {
         self.embedder.embed(input)
-    }
-
-    pub fn save_manifest(&self, manifest: &AgentManifest) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO agent_manifest
-                 (agent_id, domain, status, description, created_at, updated_at, parent_agent_id, capabilities_json, authority_json, lifecycle_json, budget_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    manifest.agent_id.0,
-                    manifest.domain,
-                    serde_json::to_string(&manifest.status).map_err(to_storage)?,
-                    manifest.description,
-                    manifest.created_at.to_rfc3339(),
-                    manifest.updated_at.to_rfc3339(),
-                    manifest.parent_agent_id.as_ref().map(|value| value.0.clone()),
-                    serde_json::to_string(&manifest.capabilities).map_err(to_storage)?,
-                    serde_json::to_string(&manifest.authority).map_err(to_storage)?,
-                    serde_json::to_string(&manifest.lifecycle).map_err(to_storage)?,
-                    serde_json::to_string(&manifest.budget).map_err(to_storage)?,
-                ],
-            )
-            .map_err(to_storage)?;
-            Ok(())
-        })
-    }
-
-    pub fn load_manifest(&self, agent_id: &AgentId) -> Result<Option<AgentManifest>> {
-        self.with_conn(|conn| {
-            conn.query_row(
-                "SELECT domain, status, description, created_at, updated_at, parent_agent_id, capabilities_json, authority_json, lifecycle_json, budget_json
-                 FROM agent_manifest WHERE agent_id = ?1",
-                params![agent_id.0],
-                |row| {
-                    let status_json: String = row.get(1)?;
-                    let created_at: String = row.get(3)?;
-                    let updated_at: String = row.get(4)?;
-                    let capabilities_json: String = row.get(6)?;
-                    let authority_json: String = row.get(7)?;
-                    let lifecycle_json: String = row.get(8)?;
-                    let budget_json: String = row.get(9)?;
-                    Ok(AgentManifest {
-                        agent_id: agent_id.clone(),
-                        domain: row.get(0)?,
-                        status: serde_json::from_str(&status_json).unwrap_or(AgentStatus::Spawned),
-                        description: row.get(2)?,
-                        created_at: parse_datetime(&created_at),
-                        updated_at: parse_datetime(&updated_at),
-                        parent_agent_id: row.get::<_, Option<String>>(5)?.map(AgentId),
-                        capabilities: serde_json::from_str(&capabilities_json)
-                            .unwrap_or_else(|_| Vec::new()),
-                        authority: serde_json::from_str(&authority_json)
-                            .unwrap_or_else(|_| AgentAuthority::default()),
-                        lifecycle: serde_json::from_str(&lifecycle_json)
-                            .unwrap_or_else(|_| AgentLifecycle::ready()),
-                        budget: serde_json::from_str(&budget_json)
-                            .unwrap_or_else(|_| AgentBudget::default()),
-                    })
-                },
-            )
-            .optional()
-            .map_err(to_storage)
-        })
-    }
-
-    pub fn list_manifests(&self) -> Result<Vec<AgentManifest>> {
-        self.with_conn(|conn| {
-            let mut statement = conn
-                .prepare(
-                    "SELECT agent_id, domain, status, description, created_at, updated_at, parent_agent_id, capabilities_json, authority_json, lifecycle_json, budget_json
-                     FROM agent_manifest
-                     ORDER BY domain, agent_id",
-                )
-                .map_err(to_storage)?;
-            let rows = statement
-                .query_map([], |row| {
-                    let status_json: String = row.get(2)?;
-                    let created_at: String = row.get(4)?;
-                    let updated_at: String = row.get(5)?;
-                    let capabilities_json: String = row.get(7)?;
-                    let authority_json: String = row.get(8)?;
-                    let lifecycle_json: String = row.get(9)?;
-                    let budget_json: String = row.get(10)?;
-                    Ok(AgentManifest {
-                        agent_id: AgentId(row.get(0)?),
-                        domain: row.get(1)?,
-                        status: serde_json::from_str(&status_json).unwrap_or(AgentStatus::Spawned),
-                        description: row.get(3)?,
-                        created_at: parse_datetime(&created_at),
-                        updated_at: parse_datetime(&updated_at),
-                        parent_agent_id: row.get::<_, Option<String>>(6)?.map(AgentId),
-                        capabilities: serde_json::from_str(&capabilities_json)
-                            .unwrap_or_else(|_| Vec::new()),
-                        authority: serde_json::from_str(&authority_json)
-                            .unwrap_or_else(|_| AgentAuthority::default()),
-                        lifecycle: serde_json::from_str(&lifecycle_json)
-                            .unwrap_or_else(|_| AgentLifecycle::ready()),
-                        budget: serde_json::from_str(&budget_json)
-                            .unwrap_or_else(|_| AgentBudget::default()),
-                    })
-                })
-                .map_err(to_storage)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(to_storage)
-        })
-    }
-
-    pub fn agent_registry(&self) -> Result<AgentRegistrySnapshot> {
-        Ok(registry_snapshot(self.list_manifests()?))
-    }
-
-    pub fn update_manifest_lifecycle(
-        &self,
-        agent_id: &AgentId,
-        status: AgentStatus,
-        phase: AgentLifecyclePhase,
-        reason: Option<&str>,
-    ) -> Result<Option<AgentManifest>> {
-        let Some(mut manifest) = self.load_manifest(agent_id)? else {
-            return Ok(None);
-        };
-        let now = Utc::now();
-        manifest.status = status;
-        manifest.updated_at = now;
-        manifest
-            .lifecycle
-            .transition(phase, now, reason.map(str::to_string));
-        self.save_manifest(&manifest)?;
-        Ok(Some(manifest))
-    }
-
-    pub fn stats(&self) -> Result<MemoryStats> {
-        self.with_conn(|conn| {
-            Ok(MemoryStats {
-                timeline_events: count_table(conn, "timeline_events")?,
-                experiences: count_table(conn, "experiences")?,
-                knowledge: count_table(conn, "knowledge")?,
-                rules: count_table(conn, "reflexive_rules")?,
-                tools: count_table(conn, "tool_registry")?,
-            })
-        })
     }
 }
 
@@ -735,313 +598,6 @@ impl Memory for SqliteMemory {
     }
 }
 
-fn register_sqlite_vec() {
-    REGISTER_VEC.call_once(|| unsafe {
-        let init: unsafe extern "C" fn(
-            *mut rusqlite::ffi::sqlite3,
-            *mut *mut i8,
-            *const rusqlite::ffi::sqlite3_api_routines,
-        ) -> i32 = std::mem::transmute::<
-            *const (),
-            unsafe extern "C" fn(
-                *mut rusqlite::ffi::sqlite3,
-                *mut *mut i8,
-                *const rusqlite::ffi::sqlite3_api_routines,
-            ) -> i32,
-        >(sqlite3_vec_init as *const ());
-        rusqlite::ffi::sqlite3_auto_extension(Some(init));
-    });
-}
-
-fn to_storage(error: impl ToString) -> KernelError {
-    KernelError::Storage(error.to_string())
-}
-
-fn count_table(conn: &Connection, table: &str) -> Result<usize> {
-    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-        row.get::<_, i64>(0)
-    })
-    .map(|value| value as usize)
-    .map_err(to_storage)
-}
-
-fn parse_datetime(value: &str) -> DateTime<Utc> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
-}
-
-fn embedding_json(values: &[f32]) -> String {
-    let output = values
-        .iter()
-        .map(|value| value.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{output}]")
-}
-
-fn sanitize_fts_query(query: &str) -> Option<String> {
-    let tokens = query
-        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-')
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>();
-    if tokens.is_empty() {
-        None
-    } else {
-        Some(tokens.join(" OR "))
-    }
-}
-
-fn persist_knowledge(
-    conn: &Connection,
-    embedder: &Embedder,
-    node: &KnowledgeNode,
-) -> Result<KnowledgeId> {
-    let id = node.id.clone().unwrap_or_default();
-    conn.execute(
-        "INSERT OR REPLACE INTO knowledge (id, category, content, confidence, created_at, updated_at, metadata)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            id.0,
-            node.category,
-            node.content,
-            node.confidence,
-            node.created_at.to_rfc3339(),
-            node.updated_at.to_rfc3339(),
-            serde_json::to_string(&node.metadata).map_err(to_storage)?,
-        ],
-    )
-    .map_err(to_storage)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO knowledge_id_map (knowledge_id) VALUES (?1)",
-        params![id.0],
-    )
-    .map_err(to_storage)?;
-    let rowid: i64 = conn
-        .query_row(
-            "SELECT rowid FROM knowledge_id_map WHERE knowledge_id = ?1",
-            params![id.0],
-            |row| row.get(0),
-        )
-        .map_err(to_storage)?;
-    let embedding = embedder.embed(&node.content);
-    let vector_json = embedding_json(&embedding);
-    let _ = conn.execute(
-        "INSERT OR REPLACE INTO knowledge_vec (rowid, embedding) VALUES (?1, vec_f32(?2))",
-        params![rowid, vector_json],
-    );
-    Ok(id)
-}
-
-fn persist_rule(conn: &Connection, rule: &ReflexiveRule) -> Result<RuleId> {
-    let id = rule.id.clone().unwrap_or_default();
-    conn.execute(
-        "INSERT OR REPLACE INTO reflexive_rules (id, name, condition_json, action_json, confidence, active, last_fired)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            id.0,
-            rule.name,
-            serde_json::to_string(&rule.condition).map_err(to_storage)?,
-            serde_json::to_string(&rule.action).map_err(to_storage)?,
-            rule.confidence,
-            if rule.active { 1 } else { 0 },
-            rule.last_fired.map(|value| value.to_rfc3339()),
-        ],
-    )
-    .map_err(to_storage)?;
-    Ok(id)
-}
-
-fn load_recent_experiences(conn: &Connection, limit: usize) -> Result<Vec<Experience>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, session_id, task_id, intent_id, action_summary, outcome, utility, created_at, metadata
-             FROM experiences
-             ORDER BY created_at DESC
-             LIMIT ?1",
-        )
-        .map_err(to_storage)?;
-    let rows = stmt
-        .query_map(params![limit as i64], row_to_experience)
-        .map_err(to_storage)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(to_storage)
-}
-
-fn load_knowledge_nodes(conn: &Connection) -> Result<Vec<KnowledgeNode>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, category, content, confidence, created_at, updated_at, metadata
-             FROM knowledge",
-        )
-        .map_err(to_storage)?;
-    let rows = stmt.query_map([], row_to_knowledge).map_err(to_storage)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(to_storage)
-}
-
-fn load_rules(conn: &Connection, active_only: bool) -> Result<Vec<ReflexiveRule>> {
-    let sql = if active_only {
-        "SELECT id, name, condition_json, action_json, confidence, active, last_fired
-         FROM reflexive_rules WHERE active = 1"
-    } else {
-        "SELECT id, name, condition_json, action_json, confidence, active, last_fired
-         FROM reflexive_rules"
-    };
-    let mut stmt = conn.prepare(sql).map_err(to_storage)?;
-    let rows = stmt.query_map([], row_to_rule).map_err(to_storage)?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(to_storage)
-}
-
-fn row_to_experience(row: &rusqlite::Row<'_>) -> rusqlite::Result<Experience> {
-    let metadata: String = row.get(8)?;
-    let created_at: String = row.get(7)?;
-    Ok(Experience {
-        id: Some(ExperienceId(row.get(0)?)),
-        session_id: SessionId(row.get(1)?),
-        task_id: TaskId(row.get(2)?),
-        intent_id: IntentId(row.get(3)?),
-        action_summary: row.get(4)?,
-        outcome: row.get(5)?,
-        utility: row.get(6)?,
-        created_at: parse_datetime(&created_at),
-        metadata: serde_json::from_str(&metadata).unwrap_or_else(|_| json!({})),
-    })
-}
-
-fn row_to_knowledge(row: &rusqlite::Row<'_>) -> rusqlite::Result<KnowledgeNode> {
-    let metadata: String = row.get(6)?;
-    let created_at: String = row.get(4)?;
-    let updated_at: String = row.get(5)?;
-    Ok(KnowledgeNode {
-        id: Some(KnowledgeId(row.get(0)?)),
-        category: row.get(1)?,
-        content: row.get(2)?,
-        confidence: row.get(3)?,
-        created_at: parse_datetime(&created_at),
-        updated_at: parse_datetime(&updated_at),
-        metadata: serde_json::from_str(&metadata).unwrap_or_else(|_| json!({})),
-    })
-}
-
-fn row_to_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReflexiveRule> {
-    let condition_json: String = row.get(2)?;
-    let action_json: String = row.get(3)?;
-    let last_fired: Option<String> = row.get(6)?;
-    Ok(ReflexiveRule {
-        id: Some(RuleId(row.get(0)?)),
-        name: row.get(1)?,
-        condition: serde_json::from_str(&condition_json).unwrap_or(RuleCondition::Always),
-        action: serde_json::from_str(&action_json)
-            .unwrap_or(RuleAction::AddNote("invalid".to_string())),
-        confidence: row.get(4)?,
-        active: row.get::<_, i64>(5)? == 1,
-        last_fired: last_fired.as_deref().map(parse_datetime),
-    })
-}
-
-fn row_to_timeline_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<TimelineEvent> {
-    let payload_json: String = row.get(12)?;
-    let event_type_json: String = row.get(5)?;
-    let timestamp: String = row.get(4)?;
-    Ok(TimelineEvent {
-        event_id: EventId(row.get(0)?),
-        session_id: SessionId(row.get(1)?),
-        task_id: TaskId(row.get(2)?),
-        agent_id: AgentId(row.get(3)?),
-        timestamp: parse_datetime(&timestamp),
-        event_type: serde_json::from_str(&event_type_json).unwrap_or(TimelineEventType::TaskFailed),
-        intent_id: row.get::<_, Option<String>>(6)?.map(IntentId),
-        action_id: row.get::<_, Option<String>>(7)?.map(ActionId),
-        pre_state_hash: row.get(8)?,
-        post_state_hash: row.get(9)?,
-        delta_summary: row.get(10)?,
-        duration_ms: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
-        payload_json: serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({})),
-    })
-}
-
-enum Embedder {
-    Fast(Box<TextEmbedding>),
-    Fallback,
-}
-
-impl Embedder {
-    fn new() -> Self {
-        let mut options = InitOptions::default();
-        options.model_name = EmbeddingModel::BGESmallENV15;
-        options.show_download_progress = false;
-        match TextEmbedding::try_new(options) {
-            Ok(model) => Self::Fast(Box::new(model)),
-            Err(_) => Self::Fallback,
-        }
-    }
-
-    fn embed(&self, input: &str) -> Vec<f32> {
-        match self {
-            Self::Fast(model) => model
-                .embed(vec![input], None)
-                .ok()
-                .and_then(|vectors| vectors.into_iter().next())
-                .unwrap_or_else(|| hashed_embedding(input)),
-            Self::Fallback => hashed_embedding(input),
-        }
-    }
-}
-
-fn hashed_embedding(input: &str) -> Vec<f32> {
-    let digest = blake3::hash(input.as_bytes());
-    let bytes = digest.as_bytes();
-    (0..384)
-        .map(|index| {
-            let byte = bytes[index % bytes.len()];
-            (byte as f32 / 255.0) * 2.0 - 1.0
-        })
-        .collect()
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ManifestFile {
-    agent_id: String,
-    domain: String,
-    status: String,
-    description: String,
-    created_at: String,
-    updated_at: String,
-    parent_agent_id: Option<String>,
-    capabilities: Vec<String>,
-    authority: AgentAuthority,
-    lifecycle: AgentLifecycle,
-    budget: AgentBudget,
-}
-
-pub fn write_manifest(path: PathBuf, manifest: &AgentManifest) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| KernelError::Configuration("manifest path missing parent".to_string()))?;
-    std::fs::create_dir_all(parent)?;
-    let file = ManifestFile {
-        agent_id: manifest.agent_id.0.clone(),
-        domain: manifest.domain.clone(),
-        status: format!("{:?}", manifest.status),
-        description: manifest.description.clone(),
-        created_at: manifest.created_at.to_rfc3339(),
-        updated_at: manifest.updated_at.to_rfc3339(),
-        parent_agent_id: manifest
-            .parent_agent_id
-            .as_ref()
-            .map(|value| value.0.clone()),
-        capabilities: manifest.capabilities.clone(),
-        authority: manifest.authority.clone(),
-        lifecycle: manifest.lifecycle.clone(),
-        budget: manifest.budget.clone(),
-    };
-    std::fs::write(path, toml::to_string_pretty(&file).map_err(to_storage)?)
-        .map_err(|error| KernelError::Storage(error.to_string()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1116,6 +672,22 @@ mod tests {
         must(memory.record_experience(&experience));
         assert!(!must(memory.recall_knowledge("verification", 5)).is_empty());
         assert!(!must(memory.recall_experiences("write", 5)).is_empty());
+    }
+
+    #[test]
+    fn hyphenated_recall_queries_do_not_break_fts() {
+        let memory = must(SqliteMemory::open_in_memory());
+        let knowledge = KnowledgeNode {
+            id: None,
+            category: "lesson".to_string(),
+            content: "Use retina cleanup check filenames safely.".to_string(),
+            confidence: 0.9,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            metadata: json!({}),
+        };
+        must(memory.store_knowledge(&knowledge));
+        assert!(must(memory.recall_knowledge("retina-cleanup-check.txt", 5)).len() <= 5);
     }
 
     #[test]

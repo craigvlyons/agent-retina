@@ -27,6 +27,7 @@ Research rules to preserve:
 - value-aware retrieval
 - memory should help, not bloat prompt context
 - repeated success should harden toward knowledge and reflex
+- memory should help the worker choose better paths, not turn into hidden routing logic
 
 ## Boundary
 
@@ -78,6 +79,9 @@ This includes:
 - useful helper scripts
 - lightweight transformation patterns
 
+Implementation rule:
+- recall should present compact useful priors, not force a memorized command path when the current environment suggests a better one
+
 ### Phase U5.4: compaction support for useful-worker tasks
 
 Ensure compaction preserves:
@@ -120,6 +124,7 @@ Improve operator surfaces so the human can inspect:
 - similarity-only retrieval with no utility weighting
 - hiding bad learning under opaque compaction
 - over-promoting brittle task-specific hacks into fake general rules
+- turning memory into a restrictive planner that overrides live reasoning
 
 ## Done Condition
 

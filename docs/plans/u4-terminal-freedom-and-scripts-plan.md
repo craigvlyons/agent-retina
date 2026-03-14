@@ -25,6 +25,7 @@ Research rules to preserve:
 - the harness should remove blockers rather than over-guide behavior
 - control, verification, and safety stay in the harness
 - the model should choose how to explore rather than being boxed into phrase-routed steps
+- only delete-like and kill-like actions are approval-gated for this v1 worker
 
 ## Boundary
 
@@ -32,12 +33,11 @@ What this plan changes:
 - command selection freedom
 - command execution policy
 - task-local script creation and execution
-- approval policy for local write/create behavior
+- approval policy for delete/kill boundaries only
 
 What this plan does not change:
-- network-heavy shell freedom by default
 - browser or desktop UI control
-- destructive unrestricted commands
+- delete/kill approval boundaries
 
 ## Desired Policy
 
@@ -45,9 +45,10 @@ Default worker policy for useful v1:
 - read, inspect, search: allowed
 - create, write, overwrite, append: allowed
 - normal local commands: allowed
+- networked commands when the worker chooses them: allowed
 - helper scripts for local work: allowed
-- delete/remove/destructive cleanup: approval required
-- kill/terminate processes not clearly owned by the task: approval required
+- delete/remove commands: approval required
+- kill/terminate commands: approval required
 
 ## Implementation Phases
 
@@ -86,9 +87,8 @@ Refine what requires approval.
 
 V1 useful worker should not be constantly blocked from doing normal local work.
 But it should still require approval for:
-- destructive delete/remove operations
-- dangerous cleanup
-- uncertain process termination outside task-owned subprocesses
+- delete/remove operations
+- kill/terminate operations
 
 ### Phase U4.5: command/script memory hooks
 
@@ -108,7 +108,7 @@ The worker should remember:
 - Add tests for:
   - command-chosen task solving
   - helper-script-created output
-  - denied delete/kill requiring approval
+  - delete/kill commands requiring approval
 
 ## Acceptance Tests
 
@@ -116,11 +116,11 @@ The worker should remember:
 - It can create a new file through that route and verify the result.
 - It does not require approval for normal local writes and modifications.
 - Delete/remove actions still require approval.
-- Kill-like actions still require approval unless clearly task-owned and safe.
+- Kill-like actions still require approval.
 
 ## Do Not Drift Into
 
-- unbounded destructive shell freedom
+- reintroducing broad shell bans that are not in the research
 - opaque command execution without result capture
 - special UI escape hatches instead of agent-owned action choice
 - replacing reasoning with handwritten command templates

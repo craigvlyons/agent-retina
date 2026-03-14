@@ -1,5 +1,7 @@
 use crate::chat::StreamingMemory;
-use crate::runtime::{open_memory, retina_home, root_agent_id, root_db_path, root_manifest};
+use crate::runtime::{
+    normalize_root_manifest, open_memory, retina_home, root_agent_id, root_db_path, root_manifest,
+};
 use retina_kernel::Kernel;
 use retina_llm_claude::ClaudeReasoner;
 use retina_memory_sqlite::{MemoryStats, SqliteMemory};
@@ -32,9 +34,11 @@ impl AgentController {
     ) -> Result<Self> {
         let memory = open_memory(root_db_path()?)?;
         let registry = memory.agent_registry()?;
-        let manifest = memory
-            .load_manifest(&root_agent_id())?
-            .unwrap_or(root_manifest()?);
+        let manifest = normalize_root_manifest(
+            memory
+                .load_manifest(&root_agent_id())?
+                .unwrap_or(root_manifest()?),
+        );
         let kernel = if stream_events {
             Kernel::new_with_registry(
                 Box::new(ScopedShell::new(
@@ -203,10 +207,11 @@ impl InspectController {
 
     pub fn worker_overview(&self) -> Result<WorkerOverview> {
         let db_path = root_db_path()?;
-        let manifest = self
-            .memory
-            .load_manifest(&root_agent_id())?
-            .unwrap_or(root_manifest()?);
+        let manifest = normalize_root_manifest(
+            self.memory
+                .load_manifest(&root_agent_id())?
+                .unwrap_or(root_manifest()?),
+        );
         let stats = self.memory.stats()?;
         let terminal_tasks = summarize_terminal_tasks(&self.memory.recent_states(200)?);
         let recent_events = self.memory.recent_states(500)?;

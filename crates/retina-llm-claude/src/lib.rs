@@ -1,11 +1,15 @@
+mod config;
+mod payload;
 mod planner;
+mod response;
 
+use config::{ClaudeContextManagement, ClaudePromptCaching, anthropic_beta_header_value};
+use payload::build_payload;
 use planner::plan_task;
 use reqwest::blocking::Client;
+use response::{ClaudeAction, ClaudeResponse, extract_json_blob, map_claude_error};
 use retina_traits::Reasoner;
 use retina_types::*;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::env;
 
 pub struct ClaudeReasoner {
@@ -87,27 +91,6 @@ impl ClaudeReasoner {
     }
 }
 
-fn map_claude_error(status: u16, body: &str, model_id: &str) -> KernelError {
-    if let Ok(payload) = serde_json::from_str::<ClaudeErrorResponse>(body) {
-        if payload.error.error_type == "not_found_error"
-            && payload.error.message.to_lowercase().contains("model:")
-        {
-            return KernelError::Reasoning(format!(
-                "Anthropic model '{model_id}' was not found. Set RETINA_CLAUDE_MODEL to a supported model, for example 'claude-sonnet-4-20250514'."
-            ));
-        }
-        return KernelError::Reasoning(format!(
-            "Anthropic API error (status {status}): {}",
-            payload.error.message
-        ));
-    }
-
-    KernelError::Reasoning(format!(
-        "Anthropic API error (status {status}): {}",
-        body.trim()
-    ))
-}
-
 impl Default for ClaudeReasoner {
     fn default() -> Self {
         Self::new()
@@ -141,474 +124,11 @@ impl Reasoner for ClaudeReasoner {
     }
 }
 
-fn build_payload(
-    model_id: &str,
-    request: &ReasonRequest,
-    reflection: bool,
-    prompt_caching: &ClaudePromptCaching,
-    context_management: &ClaudeContextManagement,
-) -> serde_json::Value {
-    let system_blocks = build_system_blocks(reflection, prompt_caching);
-    let user_content = build_user_content_blocks(request);
-    let mut payload = json!({
-        "model": model_id,
-        "max_tokens": request.max_tokens.unwrap_or(if reflection { 256 } else { 512 }),
-        "system": system_blocks,
-        "messages": [
-            {
-                "role": "user",
-                "content": user_content
-            }
-        ]
-    });
-
-    if let Some(edits) =
-        build_context_management_edits(model_id, request, reflection, context_management)
-    {
-        payload["context_management"] = json!({ "edits": edits });
-    }
-
-    payload
-}
-
-fn build_system_blocks(
-    reflection: bool,
-    prompt_caching: &ClaudePromptCaching,
-) -> Vec<serde_json::Value> {
-    let stable_instructions = build_stable_instructions(reflection);
-    let mut blocks = vec![json!({
-        "type": "text",
-        "text": "Return JSON only. Do not wrap the response in markdown fences."
-    })];
-
-    let mut stable_block = json!({
-        "type": "text",
-        "text": stable_instructions
-    });
-    if prompt_caching.enabled {
-        stable_block["cache_control"] = prompt_caching.cache_control_json();
-    }
-    blocks.push(stable_block);
-    blocks
-}
-
-fn build_user_content_blocks(request: &ReasonRequest) -> Vec<serde_json::Value> {
-    vec![
-        json!({
-            "type": "text",
-            "text": build_dynamic_context_block(request)
-        }),
-        json!({
-            "type": "text",
-            "text": request.context.render()
-        }),
-    ]
-}
-
-fn build_stable_instructions(reflection: bool) -> String {
-    format!(
-        "You are the Retina agent reasoner.\n\
-Reflection mode: {reflection}.\n\
-Choose exactly one action and return strict JSON with these fields:\n\
-- type\n\
-- command\n\
-- path\n\
-- root\n\
-- pattern\n\
-- query\n\
-- content\n\
-- include_content\n\
-- recursive\n\
-- max_entries\n\
-- max_results\n\
-- max_bytes\n\
-- max_chars\n\
-- overwrite\n\
-- require_approval\n\
-- expect_change\n\
-- note\n\
-- message\n\
-- task_complete\n\
-- reasoning\n\
-\n\
-Supported action types:\n\
-- run_command\n\
-- inspect_path\n\
-- list_directory\n\
-- find_files\n\
-- search_text\n\
-- read_file\n\
-- extract_document_text\n\
-- write_file\n\
-- append_file\n\
-- record_note\n\
-- respond\n\
-\n\
-Planning rules:\n\
-- The harness is your body. Explore through shell actions instead of guessing.\n\
-- Treat the task state artifact as the canonical compact continuity record for this task.\n\
-- Use the smallest useful next step.\n\
-- Prefer structured filesystem actions over shell commands when possible.\n\
-- Prefer readable text sources such as .md, .txt, code, and config files when multiple candidates could answer the task.\n\
-- Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
-- When a prior result already includes likely candidate paths, choose the best next read or document extraction step instead of searching again.\n\
-- When the last result already contains enough evidence to answer the user, respond directly instead of repeating exploration.\n\
-- If multiple files match, prefer the shallowest and most human-readable candidate unless the task explicitly asks for another one.\n\
-- If the user asks a question about content, gather the evidence first and then finish with respond once you can answer directly.\n\
-- If the last result already gave enough evidence, do not repeat the same exploratory step.\n\
-- If a request needs discovery first, choose the exploratory action and set task_complete=false.\n\
-- Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
-\n\
-Prefer structured filesystem actions over shell commands when possible.\n\
-Only use run_command for an explicit shell command or when no structured action fits.\n\
-Write and append actions should normally set require_approval=true.\n\
-You are allowed to explore the workspace in bounded steps.\n\
-Use find_files, list_directory, search_text, and read_file to discover what you need before acting.\n\
-Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
-If a request needs discovery first, choose the exploratory action and set task_complete=false.\n\
-Path hints like Desktop, Documents, Downloads, and ~/ refer to locations under the user's home directory."
-    )
-}
-
-fn build_dynamic_context_block(request: &ReasonRequest) -> String {
-    let constraints = if request.constraints.is_empty() {
-        "none".to_string()
-    } else {
-        request
-            .constraints
-            .iter()
-            .map(|constraint| format!("- {constraint}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-
-    format!(
-        "Constraints:\n{}\n\nDynamic task context follows in the next block. Use it as the mutable working set for this step.",
-        constraints
-    )
-}
-
-fn build_context_management_edits(
-    model_id: &str,
-    request: &ReasonRequest,
-    reflection: bool,
-    context_management: &ClaudeContextManagement,
-) -> Option<Vec<serde_json::Value>> {
-    let mut edits = Vec::new();
-
-    if context_management.tool_result_clearing_enabled {
-        edits.push(json!({
-            "type": "clear_tool_uses_20250919",
-            "trigger": {
-                "type": "input_tokens",
-                "value": context_management.tool_result_trigger_tokens
-            },
-            "clear_tool_inputs": false
-        }));
-    }
-
-    if context_management.server_side_compaction_enabled
-        && model_supports_server_compaction(model_id)
-    {
-        edits.push(json!({
-            "type": "compact_20260112",
-            "trigger": {
-                "type": "input_tokens",
-                "value": context_management.compaction_trigger_tokens
-            },
-            "pause_after_compaction": false,
-            "instructions": build_compaction_instructions(request, reflection)
-        }));
-    }
-
-    if edits.is_empty() { None } else { Some(edits) }
-}
-
-fn build_compaction_instructions(request: &ReasonRequest, reflection: bool) -> String {
-    format!(
-        "Write a compact continuation artifact for this Retina task. Preserve the task goal, progress, working sources, artifact references, blockers, failed paths, and next frontier. Prefer exact file paths, IDs, and evidence references over vague prose. Keep it concise and continuation-oriented. Reflection mode: {reflection}. Task: {}. Wrap the result in <summary></summary>.",
-        request.context.task
-    )
-}
-
-fn anthropic_beta_header_value(
-    model_id: &str,
-    context_management: &ClaudeContextManagement,
-) -> Option<String> {
-    let mut betas = Vec::new();
-
-    if context_management.tool_result_clearing_enabled {
-        betas.push("context-management-2025-06-27");
-    }
-
-    if context_management.server_side_compaction_enabled
-        && model_supports_server_compaction(model_id)
-    {
-        betas.push("compact-2026-01-12");
-    }
-
-    if betas.is_empty() {
-        None
-    } else {
-        Some(betas.join(","))
-    }
-}
-
-fn model_supports_server_compaction(model_id: &str) -> bool {
-    matches!(model_id, "claude-sonnet-4-6" | "claude-opus-4-6")
-}
-
-fn extract_json_blob(text: &str) -> Result<String> {
-    let trimmed = text.trim();
-    if trimmed.starts_with("```") {
-        let mut lines = trimmed.lines();
-        let _ = lines.next();
-        let body = lines
-            .take_while(|line| !line.trim_start().starts_with("```"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Ok(body.trim().to_string());
-    }
-
-    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
-        return Ok(trimmed.to_string());
-    }
-
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start < end {
-            let candidate = trimmed[start..=end].trim();
-            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-                return Ok(candidate.to_string());
-            }
-        }
-    }
-
-    Err(KernelError::Reasoning(format!(
-        "Claude did not return parseable JSON. Raw response: {}",
-        trimmed
-    )))
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeResponse {
-    content: Vec<ClaudeContentBlock>,
-    #[serde(default)]
-    usage: ClaudeUsage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeErrorResponse {
-    error: ClaudeErrorBody,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeErrorBody {
-    #[serde(rename = "type")]
-    error_type: String,
-    message: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ClaudeContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    text: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ClaudeUsage {
-    #[serde(default)]
-    input_tokens: u32,
-    #[serde(default)]
-    output_tokens: u32,
-    #[serde(default)]
-    cache_creation_input_tokens: u32,
-    #[serde(default)]
-    cache_read_input_tokens: u32,
-}
-
-impl From<ClaudeUsage> for TokenUsage {
-    fn from(value: ClaudeUsage) -> Self {
-        Self {
-            input_tokens: value.input_tokens,
-            output_tokens: value.output_tokens,
-            cache_creation_input_tokens: value.cache_creation_input_tokens,
-            cache_read_input_tokens: value.cache_read_input_tokens,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ClaudePromptCaching {
-    enabled: bool,
-}
-
-impl ClaudePromptCaching {
-    fn from_env() -> Self {
-        let enabled = env::var("RETINA_CLAUDE_PROMPT_CACHE")
-            .map(|value| {
-                let normalized = value.trim().to_ascii_lowercase();
-                !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
-            })
-            .unwrap_or(true);
-        Self { enabled }
-    }
-
-    fn cache_control_json(&self) -> serde_json::Value {
-        json!({ "type": "ephemeral" })
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ClaudeContextManagement {
-    tool_result_clearing_enabled: bool,
-    tool_result_trigger_tokens: u32,
-    server_side_compaction_enabled: bool,
-    compaction_trigger_tokens: u32,
-}
-
-impl ClaudeContextManagement {
-    fn from_env() -> Self {
-        Self {
-            tool_result_clearing_enabled: env_flag("RETINA_CLAUDE_CONTEXT_EDITING", true),
-            tool_result_trigger_tokens: env::var("RETINA_CLAUDE_TOOL_RESULT_TRIGGER_TOKENS")
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(100_000),
-            server_side_compaction_enabled: env_flag("RETINA_CLAUDE_SERVER_COMPACTION", true),
-            compaction_trigger_tokens: env::var("RETINA_CLAUDE_COMPACTION_TRIGGER_TOKENS")
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(120_000),
-        }
-    }
-}
-
-fn env_flag(name: &str, default: bool) -> bool {
-    env::var(name)
-        .map(|value| {
-            let normalized = value.trim().to_ascii_lowercase();
-            !matches!(normalized.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(default)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ClaudeAction {
-    #[serde(rename = "type")]
-    action_type: String,
-    command: Option<String>,
-    path: Option<String>,
-    root: Option<String>,
-    pattern: Option<String>,
-    query: Option<String>,
-    content: Option<String>,
-    include_content: Option<bool>,
-    recursive: Option<bool>,
-    max_entries: Option<usize>,
-    max_results: Option<usize>,
-    max_bytes: Option<usize>,
-    max_chars: Option<usize>,
-    overwrite: Option<bool>,
-    require_approval: Option<bool>,
-    expect_change: Option<bool>,
-    note: Option<String>,
-    message: Option<String>,
-    task_complete: Option<bool>,
-    reasoning: Option<String>,
-}
-
-impl ClaudeAction {
-    fn into_reason_response(self) -> ReasonResponse {
-        let action = match self.action_type.as_str() {
-            "run_command" => Action::RunCommand {
-                id: ActionId::new(),
-                command: self.command.unwrap_or_else(|| "pwd".to_string()),
-                cwd: None,
-                require_approval: self.require_approval.unwrap_or(false),
-                expect_change: self.expect_change.unwrap_or(false),
-                state_scope: HashScope {
-                    tracked_paths: Vec::new(),
-                    include_working_directory: true,
-                    include_last_command: true,
-                },
-            },
-            "inspect_path" => Action::InspectPath {
-                id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
-                include_content: self.include_content.unwrap_or(true),
-            },
-            "list_directory" => Action::ListDirectory {
-                id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
-                recursive: self.recursive.unwrap_or(false),
-                max_entries: self.max_entries.unwrap_or(100),
-            },
-            "find_files" => Action::FindFiles {
-                id: ActionId::new(),
-                root: self.root.unwrap_or_else(|| ".".to_string()).into(),
-                pattern: self.pattern.unwrap_or_else(|| "*".to_string()),
-                max_results: self.max_results.unwrap_or(50),
-            },
-            "search_text" => Action::SearchText {
-                id: ActionId::new(),
-                root: self.root.unwrap_or_else(|| ".".to_string()).into(),
-                query: self.query.unwrap_or_default(),
-                max_results: self.max_results.unwrap_or(25),
-            },
-            "read_file" => Action::ReadFile {
-                id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
-                max_bytes: self.max_bytes,
-            },
-            "extract_document_text" => Action::ExtractDocumentText {
-                id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
-                max_chars: self.max_chars,
-            },
-            "write_file" => Action::WriteFile {
-                id: ActionId::new(),
-                path: self
-                    .path
-                    .unwrap_or_else(|| "retina-output.txt".to_string())
-                    .into(),
-                content: self.content.unwrap_or_default(),
-                overwrite: self.overwrite.unwrap_or(false),
-                require_approval: self.require_approval.unwrap_or(true),
-            },
-            "append_file" => Action::AppendFile {
-                id: ActionId::new(),
-                path: self
-                    .path
-                    .unwrap_or_else(|| "retina-output.txt".to_string())
-                    .into(),
-                content: self.content.unwrap_or_default(),
-                require_approval: self.require_approval.unwrap_or(true),
-            },
-            "record_note" => Action::RecordNote {
-                id: ActionId::new(),
-                note: self.note.unwrap_or_else(|| "No note provided".to_string()),
-            },
-            _ => Action::Respond {
-                id: ActionId::new(),
-                message: self
-                    .message
-                    .unwrap_or_else(|| "I need a more specific task.".to_string()),
-            },
-        };
-
-        ReasonResponse {
-            action,
-            task_complete: self.task_complete.unwrap_or(true),
-            reasoning: self.reasoning,
-            tokens_used: TokenUsage::default(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::payload::build_stable_instructions;
+    use crate::response::ClaudeUsage;
 
     fn must_some<T>(value: Option<T>, message: &str) -> T {
         value.unwrap_or_else(|| panic!("{message}"))
@@ -632,12 +152,17 @@ mod tests {
                             success_criteria: Vec::new(),
                             constraints: Vec::new(),
                         },
+                        shape: TaskShape::default(),
                         progress: TaskProgress {
                             current_phase: "starting".to_string(),
                             current_step: 1,
                             max_steps: 4,
                             completed_checkpoints: Vec::new(),
                             verified_facts: Vec::new(),
+                            required_inputs: 0,
+                            satisfied_inputs: 0,
+                            output_written: false,
+                            output_verified: false,
                         },
                         frontier: TaskFrontier {
                             next_action_hint: None,
@@ -660,7 +185,7 @@ mod tests {
                     max_steps: 4,
                 },
                 tools: Vec::new(),
-                constraints: vec!["NoNetworkShellActions".to_string()],
+                constraints: vec!["DeleteOrKillRequireApproval".to_string()],
                 max_tokens: Some(256),
             },
             false,
@@ -795,5 +320,78 @@ mod tests {
             header.as_deref(),
             Some("context-management-2025-06-27,compact-2026-01-12")
         );
+    }
+
+    #[test]
+    fn stable_instructions_prefer_best_verifiable_step_over_timid_discovery_bias() {
+        let instructions = build_stable_instructions(false);
+        assert!(instructions.contains("best next verifiable step"));
+        assert!(instructions.contains("target those artifacts directly"));
+        assert!(!instructions.contains("smallest useful next step"));
+        assert!(!instructions.contains("Prefer structured filesystem actions over shell commands"));
+        assert!(!instructions.contains("Only use run_command for an explicit shell command"));
+    }
+
+    #[test]
+    fn write_and_append_actions_have_no_approval_field() {
+        let write = ClaudeAction {
+            action_type: "write_file".to_string(),
+            command: None,
+            path: Some("note.txt".to_string()),
+            root: None,
+            pattern: None,
+            query: None,
+            content: Some("hello".to_string()),
+            include_content: None,
+            recursive: None,
+            max_entries: None,
+            max_results: None,
+            max_bytes: None,
+            max_chars: None,
+            page_start: None,
+            page_end: None,
+            overwrite: Some(true),
+            require_approval: None,
+            expect_change: None,
+            note: None,
+            message: None,
+            task_complete: Some(false),
+            reasoning: None,
+        }
+        .into_reason_response();
+        let append = ClaudeAction {
+            action_type: "append_file".to_string(),
+            command: None,
+            path: Some("note.txt".to_string()),
+            root: None,
+            pattern: None,
+            query: None,
+            content: Some("more".to_string()),
+            include_content: None,
+            recursive: None,
+            max_entries: None,
+            max_results: None,
+            max_bytes: None,
+            max_chars: None,
+            page_start: None,
+            page_end: None,
+            overwrite: None,
+            require_approval: None,
+            expect_change: None,
+            note: None,
+            message: None,
+            task_complete: Some(false),
+            reasoning: None,
+        }
+        .into_reason_response();
+
+        match write.action {
+            Action::WriteFile { .. } => {}
+            other => panic!("expected write action, got {other:?}"),
+        }
+        match append.action {
+            Action::AppendFile { .. } => {}
+            other => panic!("expected append action, got {other:?}"),
+        }
     }
 }

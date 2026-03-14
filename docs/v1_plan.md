@@ -95,9 +95,9 @@ Done:
 
 Current behavior:
 - run and chat both go through the same CLI-to-agent path
-- the shell can list, find, read, search, write, append, inspect, and run controlled shell commands
+- the shell can list, find, read, search, write, append, inspect, and run shell commands directly
 - timeline events are persisted
-- approvals are enforced for writes and risky actions
+- approvals are enforced only for delete-like and kill-like commands
 - the kernel can take bounded follow-up steps for one task instead of stopping after one action
 - chat has a real control plane for stop/cancel and one-step operator guidance with `/guide <text>`
 - the root worker now persists specialist-ready manifest lifecycle and budget metadata
@@ -147,12 +147,19 @@ Good guidance:
 - clearer approvals and operator controls
 - compact memory recall
 - better review surfaces for what happened
+- cleaner module boundaries so crates stay understandable and adaptable instead of accumulating feature logic in one `lib.rs`
 
 Bad guidance:
 - brittle phrase routing
 - hard-coded task shortcuts
 - trying to predict every workflow in advance
 - hiding capability gaps behind local fallback logic
+
+### File boundaries matter
+
+- `lib.rs` should be reserved for exports, orchestration, and top-level wiring.
+- If a crate file grows to hold multiple responsibilities, split it before adding more behavior.
+- Structural refactors that improve module boundaries are part of keeping the research-aligned architecture healthy, not optional cleanup.
 
 The system should improve by:
 - observing the environment

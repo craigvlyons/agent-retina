@@ -1,0 +1,40 @@
+# Worker Check Summary
+
+This document combines information from startup.md and testing.md to provide a comprehensive overview of the Retina agent system.
+
+## Startup Information
+
+From startup.md:
+- Retina should be run from the project root directory: /Users/macc/Projects/gabanode_lab/agent-retina
+- The system uses Rust with Cargo for building and running
+- Key command: `cargo run -p retina-cli -- chat` to start the interactive chat interface
+- The project follows a modular structure with separate CLI and core components
+
+## Testing Capabilities
+
+From testing.md:
+- Retina V1 is a terminal-based worker designed for stress testing
+- Current capabilities include:
+  - File system operations (reading, writing, listing directories)
+  - Code analysis and manipulation
+  - Document processing and text extraction
+  - Command execution with safety constraints
+  - Multi-step task planning and execution
+
+## Key Features
+
+- Interactive chat interface for task execution
+- Structured action system with JSON-based communication
+- Safety mechanisms including approval requirements for destructive operations
+- Support for various file formats including markdown, code, and documents
+- Workspace exploration and file discovery capabilities
+- Task state management and progress tracking
+
+## Usage Workflow
+
+1. Navigate to project root directory
+2. Run `cargo run -p retina-cli -- chat` to start the system
+3. Interact through the chat interface for various tasks
+4. System will handle file operations, analysis, and task execution automatically
+
+This combined summary provides both startup instructions and testing capabilities overview for the Retina agent worker system.
