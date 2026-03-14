@@ -4,7 +4,19 @@ use retina_types::*;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn current_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
 
 #[derive(Clone, Default)]
 pub struct MockMemory {
@@ -17,17 +29,17 @@ pub struct MockMemory {
 
 impl Memory for MockMemory {
     fn append_timeline_event(&self, event: &TimelineEvent) -> Result<()> {
-        self.timeline.lock().unwrap().push(event.clone());
+        recover_mutex(&self.timeline).push(event.clone());
         Ok(())
     }
 
     fn record_experience(&self, exp: &Experience) -> Result<ExperienceId> {
-        self.experiences.lock().unwrap().push(exp.clone());
+        recover_mutex(&self.experiences).push(exp.clone());
         Ok(ExperienceId::new())
     }
 
     fn store_knowledge(&self, node: &KnowledgeNode) -> Result<KnowledgeId> {
-        self.knowledge.lock().unwrap().push(node.clone());
+        recover_mutex(&self.knowledge).push(node.clone());
         Ok(KnowledgeId::new())
     }
 
@@ -36,12 +48,12 @@ impl Memory for MockMemory {
     }
 
     fn store_rule(&self, rule: &ReflexiveRule) -> Result<RuleId> {
-        self.rules.lock().unwrap().push(rule.clone());
+        recover_mutex(&self.rules).push(rule.clone());
         Ok(RuleId::new())
     }
 
     fn register_tool(&self, tool: &ToolRecord) -> Result<ToolId> {
-        self.tools.lock().unwrap().push(tool.clone());
+        recover_mutex(&self.tools).push(tool.clone());
         Ok(ToolId::new())
     }
 
@@ -53,7 +65,7 @@ impl Memory for MockMemory {
         Ok(self
             .experiences
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .take(limit)
             .cloned()
@@ -64,7 +76,7 @@ impl Memory for MockMemory {
         Ok(self
             .knowledge
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .take(limit)
             .cloned()
@@ -72,18 +84,18 @@ impl Memory for MockMemory {
     }
 
     fn active_rules(&self) -> Result<Vec<ReflexiveRule>> {
-        Ok(self.rules.lock().unwrap().clone())
+        Ok(recover_mutex(&self.rules).clone())
     }
 
     fn find_tools(&self, _capability: &str) -> Result<Vec<ToolRecord>> {
-        Ok(self.tools.lock().unwrap().clone())
+        Ok(recover_mutex(&self.tools).clone())
     }
 
     fn recent_states(&self, limit: usize) -> Result<Vec<TimelineEvent>> {
         Ok(self
             .timeline
             .lock()
-            .unwrap()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
             .rev()
             .take(limit)
@@ -104,7 +116,7 @@ impl Memory for MockMemory {
     }
 
     fn consolidate(&self, config: &ConsolidationConfig) -> Result<ConsolidationReport> {
-        let experiences = self.experiences.lock().unwrap().clone();
+        let experiences = recover_mutex(&self.experiences).clone();
         let mut grouped: HashMap<(String, String), (Action, usize, f64)> = HashMap::new();
 
         for experience in experiences {
@@ -144,7 +156,7 @@ impl Memory for MockMemory {
         }
 
         let mut promoted = 0;
-        let mut rules = self.rules.lock().unwrap();
+        let mut rules = recover_mutex(&self.rules);
         for ((task, action_summary), (action, count, utility_total)) in grouped {
             if count < config.min_successful_repeats {
                 continue;
@@ -184,11 +196,11 @@ impl Memory for MockMemory {
 
 impl MockMemory {
     pub fn rule_count(&self) -> usize {
-        self.rules.lock().unwrap().len()
+        recover_mutex(&self.rules).len()
     }
 
     pub fn experiences(&self) -> Vec<Experience> {
-        self.experiences.lock().unwrap().clone()
+        recover_mutex(&self.experiences).clone()
     }
 }
 
@@ -225,7 +237,7 @@ impl MockReasoner {
 
 impl Reasoner for MockReasoner {
     fn reason(&self, _request: &ReasonRequest) -> Result<ReasonResponse> {
-        let mut responses = self.responses.lock().unwrap();
+        let mut responses = recover_mutex(&self.responses);
         let response = if responses.len() > 1 {
             responses.remove(0)
         } else {
@@ -286,7 +298,7 @@ impl MockShell {
 impl Shell for MockShell {
     fn observe(&self) -> Result<WorldState> {
         Ok(WorldState {
-            cwd: std::env::current_dir().unwrap(),
+            cwd: current_cwd(),
             files: Vec::new(),
             last_command: None,
             notes: Vec::new(),
@@ -296,7 +308,7 @@ impl Shell for MockShell {
     fn capture_state(&self, scope: &HashScope) -> Result<StateSnapshot> {
         Ok(StateSnapshot {
             scope: scope.clone(),
-            cwd: std::env::current_dir().unwrap(),
+            cwd: current_cwd(),
             cwd_hash: if self.force_unchanged {
                 "same".to_string()
             } else {
@@ -332,12 +344,14 @@ impl Shell for MockShell {
         match action {
             Action::RunCommand { command, .. } => Ok(ActionResult::Command(CommandResult {
                 command: command.clone(),
-                cwd: std::env::current_dir().unwrap(),
+                cwd: current_cwd(),
                 stdout: "ok".to_string(),
                 stderr: String::new(),
                 exit_code: Some(0),
                 success: true,
                 duration_ms: 1,
+                cancelled: false,
+                termination: None,
             })),
             Action::InspectPath { path, .. } => Ok(ActionResult::Inspection(WorldState {
                 cwd: path.clone(),
@@ -423,7 +437,7 @@ impl Shell for MockShell {
     }
 
     fn request_input(&self, _prompt: &str) -> Result<String> {
-        let mut inputs = self.inputs.lock().unwrap();
+        let mut inputs = recover_mutex(&self.inputs);
         if inputs.is_empty() {
             Ok("mock-input".to_string())
         } else {

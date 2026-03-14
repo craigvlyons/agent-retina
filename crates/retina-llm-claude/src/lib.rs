@@ -55,10 +55,14 @@ impl ClaudeReasoner {
             .text()
             .map_err(|error| KernelError::Reasoning(error.to_string()))?;
         if !status.is_success() {
-            return Err(map_claude_error(status.as_u16(), &body_text, &self.model_id));
+            return Err(map_claude_error(
+                status.as_u16(),
+                &body_text,
+                &self.model_id,
+            ));
         }
-        let body: ClaudeResponse =
-            serde_json::from_str(&body_text).map_err(|error| KernelError::Reasoning(error.to_string()))?;
+        let body: ClaudeResponse = serde_json::from_str(&body_text)
+            .map_err(|error| KernelError::Reasoning(error.to_string()))?;
         let text = body
             .content
             .iter()
@@ -78,11 +82,7 @@ impl ClaudeReasoner {
 fn map_claude_error(status: u16, body: &str, model_id: &str) -> KernelError {
     if let Ok(payload) = serde_json::from_str::<ClaudeErrorResponse>(body) {
         if payload.error.error_type == "not_found_error"
-            && payload
-                .error
-                .message
-                .to_lowercase()
-                .contains("model:")
+            && payload.error.message.to_lowercase().contains("model:")
         {
             return KernelError::Reasoning(format!(
                 "Anthropic model '{model_id}' was not found. Set RETINA_CLAUDE_MODEL to a supported model, for example 'claude-sonnet-4-20250514'."

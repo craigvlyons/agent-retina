@@ -124,7 +124,8 @@ fn score_experience(
     let mut score = 0.0;
     if !normalized_task.is_empty() {
         score += task_overlap * 4.0;
-        if normalized_task.contains(normalized_query) || normalized_query.contains(&normalized_task) {
+        if normalized_task.contains(normalized_query) || normalized_query.contains(&normalized_task)
+        {
             score += 1.5;
         }
         if !query_signature.is_empty() && query_signature == task_signature {
@@ -156,7 +157,8 @@ fn score_knowledge(normalized_query: &str, query_tokens: &[String], node: &Knowl
     let content_overlap = overlap_score(query_tokens, &tokens(&normalized_content));
     let task_overlap = overlap_score(query_tokens, &tokens(&normalized_task));
 
-    let mut score = (node.confidence.clamp(0.0, 1.0) * 2.0) + content_overlap * 2.5 + task_overlap * 3.0;
+    let mut score =
+        (node.confidence.clamp(0.0, 1.0) * 2.0) + content_overlap * 2.5 + task_overlap * 3.0;
     if normalized_content.contains(normalized_query) || normalized_task.contains(normalized_query) {
         score += 1.0;
     }
@@ -171,7 +173,11 @@ fn overlap_score(left: &[String], right: &[String]) -> f64 {
     let right = right.iter().cloned().collect::<HashSet<_>>();
     let intersection = left.intersection(&right).count() as f64;
     let union = left.union(&right).count() as f64;
-    if union == 0.0 { 0.0 } else { intersection / union }
+    if union == 0.0 {
+        0.0
+    } else {
+        intersection / union
+    }
 }
 
 fn tokens(input: &str) -> Vec<String> {
@@ -217,7 +223,7 @@ fn is_noise_token(token: &str) -> bool {
             | "in"
             | "on"
     ) || token.len() <= 2
-    }
+}
 
 fn recency_score(created_at: DateTime<Utc>) -> f64 {
     let age_seconds = (Utc::now() - created_at).num_seconds().max(0) as f64;
@@ -247,7 +253,11 @@ mod tests {
             }),
         };
 
-        let ranked = rank_experiences("open craig lyons resume.md and summarize it", vec![experience], 3);
+        let ranked = rank_experiences(
+            "open craig lyons resume.md and summarize it",
+            vec![experience],
+            3,
+        );
         assert_eq!(ranked.len(), 1);
     }
 }

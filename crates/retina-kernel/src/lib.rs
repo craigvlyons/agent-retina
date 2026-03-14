@@ -1,9 +1,12 @@
+mod router;
+
+use crate::router::Router;
 use chrono::Utc;
 use retina_traits::{Memory, Reasoner, Shell};
 use retina_types::*;
 use serde_json::json;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 pub struct Kernel {
     shell: Box<dyn Shell>,
@@ -20,6 +23,15 @@ impl Kernel {
         reasoner: Box<dyn Reasoner>,
         memory: Box<dyn Memory>,
     ) -> Result<Self> {
+        Self::new_with_registry(shell, reasoner, memory, AgentRegistrySnapshot::default())
+    }
+
+    pub fn new_with_registry(
+        shell: Box<dyn Shell>,
+        reasoner: Box<dyn Reasoner>,
+        memory: Box<dyn Memory>,
+        registry: AgentRegistrySnapshot,
+    ) -> Result<Self> {
         let active_rules = memory.active_rules().unwrap_or_default();
         Ok(Self {
             shell,
@@ -27,12 +39,12 @@ impl Kernel {
             memory,
             reflex_engine: ReflexEngine::new(active_rules),
             circuit_breaker: CircuitBreaker::default(),
-            router: Router,
+            router: Router::v1(registry),
         })
     }
 
     pub fn route_task(&self, _task: &Task) -> RoutingDecision {
-        self.router.route_task()
+        self.router.route_task(_task).effective_decision
     }
 
     pub fn execute_task(&self, task: Task) -> Result<Outcome> {
@@ -48,7 +60,9 @@ impl Kernel {
             json!({ "task": task.description }),
         ))?;
 
-        match self.route_task(&task) {
+        let routing = self.router.route_task(&task);
+
+        match routing.effective_decision.clone() {
             RoutingDecision::HandleDirectly => {}
             RoutingDecision::RouteToExisting(agent_id) => {
                 return Ok(Outcome::Blocked(format!(
@@ -75,7 +89,13 @@ impl Kernel {
             Some(&intent),
             None,
             TimelineEventType::TaskContextAssembled,
-            json!({ "route": "handle_directly" }),
+            json!({
+                "route": format!("{:?}", routing.effective_decision),
+                "recommended_route": format!("{:?}", routing.recommended_decision),
+                "routing_rationale": routing.rationale,
+                "routing_candidates": routing.candidates,
+                "network_enabled": routing.network_enabled
+            }),
         ))?;
         self.emit_event(EventSpec::new(
             &task,
@@ -122,15 +142,36 @@ impl Kernel {
                 return Ok(Outcome::Blocked(reason));
             }
 
+            if let Some(outcome) = self.check_cancellation(
+                &task,
+                Some(&intent),
+                None,
+                config.control.as_ref(),
+                "before planning",
+            )? {
+                return Ok(outcome);
+            }
+
             let step = self.select_action(
                 &task,
                 &intent,
                 next_reflex_action.take(),
                 &state,
+                config.control.as_ref(),
                 state.step_index + 1,
                 config.max_steps,
             )?;
-            let outcome = self.execute_action(&task, &mut intent, &step, true)?;
+            if let Some(outcome) = self.check_cancellation(
+                &task,
+                Some(&intent),
+                Some(&step.action),
+                config.control.as_ref(),
+                "before action dispatch",
+            )? {
+                return Ok(outcome);
+            }
+            let outcome =
+                self.execute_action(&task, &mut intent, &step, config.control.as_ref(), true)?;
             let progress = state.record_step(&step, &outcome)?;
 
             if progress.repeated_without_progress {
@@ -138,6 +179,7 @@ impl Kernel {
                     &task,
                     &mut intent,
                     &step.action,
+                    config.control.as_ref(),
                     "repeated the same step without discovering new information".to_string(),
                     true,
                 );
@@ -145,17 +187,6 @@ impl Kernel {
 
             if step.task_complete || matches!(outcome, Outcome::Failure(_) | Outcome::Blocked(_)) {
                 return Ok(outcome);
-            }
-
-            if config.pause_before_continuation && self.should_cancel_continuation()? {
-                self.emit_event(EventSpec::new(
-                    &task,
-                    Some(&intent),
-                    Some(&step.action),
-                    TimelineEventType::TaskCancelled,
-                    json!({ "reason": "cancelled by operator between steps" }),
-                ))?;
-                return Ok(Outcome::Blocked("task cancelled by operator".to_string()));
             }
         }
     }
@@ -166,6 +197,7 @@ impl Kernel {
         intent: &Intent,
         reflex_action: Option<Action>,
         state: &TaskLoopState,
+        control: Option<&ExecutionControlHandle>,
         current_step: usize,
         max_steps: usize,
     ) -> Result<StepDecision> {
@@ -188,6 +220,7 @@ impl Kernel {
             state.last_result_json.clone(),
             state.last_result_summary.clone(),
             state.recent_steps.clone(),
+            control.and_then(ExecutionControlHandle::take_guidance),
             current_step,
             max_steps,
         )?;
@@ -225,12 +258,23 @@ impl Kernel {
         task: &Task,
         intent: &mut Intent,
         step: &StepDecision,
+        control: Option<&ExecutionControlHandle>,
         allow_retry: bool,
     ) -> Result<Outcome> {
         let action = step.action.clone();
         intent.action = Some(action.clone());
         intent.expects_change = action.expects_change();
         intent.hash_scope = action.hash_scope();
+
+        if let Some(outcome) = self.check_cancellation(
+            task,
+            Some(intent),
+            Some(&action),
+            control,
+            "before pre-state capture",
+        )? {
+            return Ok(outcome);
+        }
 
         let pre = self.shell.capture_state(&intent.hash_scope)?;
         self.emit_event(
@@ -245,10 +289,27 @@ impl Kernel {
         )?;
 
         if action_requires_approval(&action) {
+            if let Some(outcome) = self.check_cancellation(
+                task,
+                Some(intent),
+                Some(&action),
+                control,
+                "before approval prompt",
+            )? {
+                return Ok(outcome);
+            }
             let response = self.shell.request_approval(&ApprovalRequest {
                 action: action_label(&action),
                 reason: approval_reason(&action),
             })?;
+            if matches!(response, ApprovalResponse::Cancelled) {
+                return Ok(self.cancel_outcome(
+                    task,
+                    Some(intent),
+                    Some(&action),
+                    "task cancelled by operator during approval",
+                )?);
+            }
             if matches!(response, ApprovalResponse::Denied) {
                 return Err(KernelError::ApprovalDenied(
                     "command denied by operator".to_string(),
@@ -264,11 +325,28 @@ impl Kernel {
             json!({ "action": action_label(&action) }),
         ))?;
 
-        let result = match self.shell.execute(&action) {
+        if let Some(outcome) = self.check_cancellation(
+            task,
+            Some(intent),
+            Some(&action),
+            control,
+            "before action execution",
+        )? {
+            return Ok(outcome);
+        }
+
+        let result = match self.shell.execute_controlled(&action, control) {
             Ok(result) => result,
             Err(error) => {
                 self.circuit_breaker.record_failure(intent);
-                return self.reflect_or_fail(task, intent, &action, error.to_string(), allow_retry);
+                return self.reflect_or_fail(
+                    task,
+                    intent,
+                    &action,
+                    control,
+                    error.to_string(),
+                    allow_retry,
+                );
             }
         };
 
@@ -279,6 +357,30 @@ impl Kernel {
             TimelineEventType::ActionResultReceived,
             json!({ "result": result }),
         ))?;
+
+        if let ActionResult::Command(command) = &result {
+            if command.cancelled {
+                return Ok(self.cancel_outcome(
+                    task,
+                    Some(intent),
+                    Some(&action),
+                    command
+                        .termination
+                        .clone()
+                        .unwrap_or_else(|| "task cancelled by operator".to_string()),
+                )?);
+            }
+        }
+
+        if let Some(outcome) = self.check_cancellation(
+            task,
+            Some(intent),
+            Some(&action),
+            control,
+            "after action result",
+        )? {
+            return Ok(outcome);
+        }
 
         let post = self.shell.capture_state(&intent.hash_scope)?;
         self.emit_event(
@@ -305,7 +407,8 @@ impl Kernel {
         )?;
 
         let utility = action_utility(&action, &result, &delta);
-        let experience_id = self.record_experience(task, intent, &action, &result, &delta, utility)?;
+        let experience_id =
+            self.record_experience(task, intent, &action, &result, &delta, utility)?;
         self.emit_event(EventSpec::new(
             task,
             Some(intent),
@@ -339,7 +442,7 @@ impl Kernel {
 
         if let Some(reason) = action_failure_reason(&result, &delta, &action) {
             self.circuit_breaker.record_failure(intent);
-            return self.reflect_or_fail(task, intent, &action, reason, allow_retry);
+            return self.reflect_or_fail(task, intent, &action, control, reason, allow_retry);
         }
 
         self.emit_event(EventSpec::new(
@@ -366,9 +469,19 @@ impl Kernel {
         task: &Task,
         intent: &mut Intent,
         action: &Action,
+        control: Option<&ExecutionControlHandle>,
         reason: String,
         allow_retry: bool,
     ) -> Result<Outcome> {
+        if let Some(outcome) = self.check_cancellation(
+            task,
+            Some(intent),
+            Some(action),
+            control,
+            "before reflection",
+        )? {
+            return Ok(outcome);
+        }
         self.emit_event(EventSpec::new(
             task,
             Some(intent),
@@ -382,6 +495,7 @@ impl Kernel {
             Some(reason.clone()),
             Some(reason.clone()),
             vec![format!("failed action: {}", action_label(action))],
+            control.and_then(ExecutionControlHandle::take_guidance),
             1,
             1,
         )?;
@@ -409,12 +523,22 @@ impl Kernel {
             }),
         ))?;
 
+        if let Some(outcome) = self.check_cancellation(
+            task,
+            Some(intent),
+            Some(action),
+            control,
+            "after reflection",
+        )? {
+            return Ok(outcome);
+        }
+
         if allow_retry && should_retry(action, &reflection.action) {
             let retry_step = StepDecision {
                 action: reflection.action,
                 task_complete: reflection.task_complete,
             };
-            return self.execute_action(task, intent, &retry_step, false);
+            return self.execute_action(task, intent, &retry_step, control, false);
         }
 
         self.emit_event(EventSpec::new(
@@ -463,6 +587,7 @@ impl Kernel {
         last_result: Option<String>,
         last_result_summary: Option<String>,
         recent_steps: Vec<String>,
+        operator_guidance: Option<String>,
         current_step: usize,
         max_steps: usize,
     ) -> Result<AssembledContext> {
@@ -503,20 +628,52 @@ impl Kernel {
             last_result,
             last_result_summary,
             recent_steps,
+            operator_guidance,
             current_step,
             max_steps,
         })
     }
 
-    fn should_cancel_continuation(&self) -> Result<bool> {
-        let input = self
-            .shell
-            .request_input("Press Enter to continue to the next step or type /stop to cancel")?;
-        let normalized = input.trim().to_lowercase();
-        Ok(matches!(
-            normalized.as_str(),
-            "/stop" | "stop" | "/cancel" | "cancel"
-        ))
+    fn check_cancellation(
+        &self,
+        task: &Task,
+        intent: Option<&Intent>,
+        action: Option<&Action>,
+        control: Option<&ExecutionControlHandle>,
+        checkpoint: &str,
+    ) -> Result<Option<Outcome>> {
+        if control
+            .map(ExecutionControlHandle::is_cancel_requested)
+            .unwrap_or(false)
+        {
+            return Ok(Some(self.cancel_outcome(task, intent, action, checkpoint)?));
+        }
+        Ok(None)
+    }
+
+    fn cancel_outcome(
+        &self,
+        task: &Task,
+        intent: Option<&Intent>,
+        action: Option<&Action>,
+        reason: impl Into<String>,
+    ) -> Result<Outcome> {
+        let reason = reason.into();
+        self.emit_event(EventSpec::new(
+            task,
+            intent,
+            action,
+            TimelineEventType::TaskCancelRequested,
+            json!({ "reason": reason }),
+        ))?;
+        self.emit_event(EventSpec::new(
+            task,
+            intent,
+            action,
+            TimelineEventType::TaskCancelled,
+            json!({ "reason": reason }),
+        ))?;
+        Ok(Outcome::Blocked("task cancelled by operator".to_string()))
     }
 
     fn emit_event(&self, spec: EventSpec<'_>) -> Result<()> {
@@ -571,8 +728,12 @@ impl TaskLoopState {
             Outcome::Success(result) if !matches!(step.action, Action::Respond { .. }) => {
                 let summary = summarize_action_result(result);
                 self.last_result_summary = Some(summary.clone());
-                self.recent_steps
-                    .push(format!("step {}: {} -> {}", self.step_index, action_label(&step.action), summary));
+                self.recent_steps.push(format!(
+                    "step {}: {} -> {}",
+                    self.step_index,
+                    action_label(&step.action),
+                    summary
+                ));
                 trim_recent_steps(&mut self.recent_steps);
                 if let Some(signature) = repeated_step_signature(&step.action, result) {
                     let count = self.seen_signatures.entry(signature).or_insert(0);
@@ -670,14 +831,6 @@ impl<'a> EventSpec<'a> {
     }
 }
 
-pub struct Router;
-
-impl Router {
-    fn route_task(&self) -> RoutingDecision {
-        RoutingDecision::HandleDirectly
-    }
-}
-
 pub struct ReflexEngine {
     rules: Mutex<Vec<ReflexiveRule>>,
 }
@@ -690,7 +843,7 @@ impl ReflexEngine {
     }
 
     pub fn check(&self, task: &Task, _intent: &Intent) -> Option<Action> {
-        for rule in &*self.rules.lock().expect("reflex engine mutex poisoned") {
+        for rule in &*recover_mutex(&self.rules) {
             if !rule.active {
                 continue;
             }
@@ -706,7 +859,7 @@ impl ReflexEngine {
     }
 
     pub fn promote(&self, rule: ReflexiveRule) {
-        let mut rules = self.rules.lock().expect("reflex engine mutex poisoned");
+        let mut rules = recover_mutex(&self.rules);
         let already_present = rules.iter().any(|existing| existing.name == rule.name);
         if !already_present {
             rules.push(rule);
@@ -714,7 +867,7 @@ impl ReflexEngine {
     }
 
     pub fn sync(&self, rules: Vec<ReflexiveRule>) {
-        *self.rules.lock().expect("reflex engine mutex poisoned") = rules;
+        *recover_mutex(&self.rules) = rules;
     }
 }
 
@@ -733,9 +886,7 @@ pub struct CircuitBreaker {
 impl CircuitBreaker {
     pub fn is_tripped(&self, intent: &Intent) -> bool {
         let key = intent.objective.clone();
-        self.failure_counts
-            .lock()
-            .expect("circuit breaker mutex poisoned")
+        recover_mutex(&self.failure_counts)
             .get(&key)
             .copied()
             .unwrap_or_default()
@@ -744,11 +895,15 @@ impl CircuitBreaker {
 
     pub fn record_failure(&self, intent: &Intent) {
         let key = intent.objective.clone();
-        let mut counts = self
-            .failure_counts
-            .lock()
-            .expect("circuit breaker mutex poisoned");
+        let mut counts = recover_mutex(&self.failure_counts);
         *counts.entry(key).or_insert(0) += 1;
+    }
+}
+
+fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -881,7 +1036,11 @@ fn summarize_action_result(result: &ActionResult) -> String {
     match result {
         ActionResult::Command(command) => format!(
             "command {} with exit {:?}",
-            if command.success { "succeeded" } else { "failed" },
+            if command.success {
+                "succeeded"
+            } else {
+                "failed"
+            },
             command.exit_code
         ),
         ActionResult::Inspection(world) => format!("inspected {} path(s)", world.files.len()),
@@ -1050,6 +1209,51 @@ fn action_label(action: &Action) -> String {
 mod tests {
     use super::*;
     use retina_test_utils::{MockMemory, MockReasoner, MockShell};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct GuidanceReasoner {
+        seen_guidance: Arc<Mutex<Vec<Option<String>>>>,
+        responses: Arc<Mutex<Vec<ReasonResponse>>>,
+    }
+
+    impl GuidanceReasoner {
+        fn new(responses: Vec<ReasonResponse>) -> Self {
+            Self {
+                seen_guidance: Arc::new(Mutex::new(Vec::new())),
+                responses: Arc::new(Mutex::new(responses)),
+            }
+        }
+
+        fn seen_guidance(&self) -> Vec<Option<String>> {
+            self.seen_guidance.lock().unwrap().clone()
+        }
+    }
+
+    impl retina_traits::Reasoner for GuidanceReasoner {
+        fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
+            self.seen_guidance
+                .lock()
+                .unwrap()
+                .push(request.context.operator_guidance.clone());
+            let mut responses = self.responses.lock().unwrap();
+            Ok(if responses.len() > 1 {
+                responses.remove(0)
+            } else {
+                responses.first().cloned().unwrap()
+            })
+        }
+
+        fn capabilities(&self) -> ReasonerCapabilities {
+            ReasonerCapabilities {
+                max_context_tokens: 1_000,
+                supports_tool_use: false,
+                supports_vision: false,
+                supports_caching: false,
+                model_id: "guidance-test".to_string(),
+            }
+        }
+    }
 
     #[test]
     fn router_defaults_to_handle_directly() {
@@ -1240,8 +1444,10 @@ mod tests {
 
     #[test]
     fn interactive_stop_cancels_continuation() {
+        let control = ExecutionControl::new();
+        control.handle().request_cancel();
         let kernel = Kernel::new(
-            Box::new(MockShell::default().with_inputs(vec!["/stop".to_string()])),
+            Box::new(MockShell::default()),
             Box::new(MockReasoner::for_response(ReasonResponse {
                 action: Action::FindFiles {
                     id: ActionId::new(),
@@ -1262,10 +1468,64 @@ mod tests {
                 Task::new(AgentId::new(), "find startup.md and read it"),
                 ExecutionConfig {
                     max_steps: 3,
-                    pause_before_continuation: true,
+                    control: Some(control.handle()),
                 },
             )
             .unwrap();
         assert!(matches!(outcome, Outcome::Blocked(reason) if reason.contains("cancelled")));
+    }
+
+    #[test]
+    fn guidance_is_applied_once_to_the_next_planning_step() {
+        let control = ExecutionControl::new();
+        let handle = control.handle();
+        handle.queue_guidance("prefer the markdown file");
+        let reasoner = GuidanceReasoner::new(vec![
+            ReasonResponse {
+                action: Action::FindFiles {
+                    id: ActionId::new(),
+                    root: ".".into(),
+                    pattern: "startup.md".to_string(),
+                    max_results: 5,
+                },
+                task_complete: false,
+                reasoning: Some("find it first".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                reasoning: Some("respond".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ]);
+        let inspector = reasoner.clone();
+        let kernel = Kernel::new(
+            Box::new(MockShell::default()),
+            Box::new(reasoner),
+            Box::new(MockMemory::default()),
+        )
+        .unwrap();
+
+        let outcome = kernel
+            .execute_task_with_config(
+                Task::new(AgentId::new(), "find startup.md and answer"),
+                ExecutionConfig {
+                    max_steps: 3,
+                    control: Some(handle),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Outcome::Success(ActionResult::Response { .. })
+        ));
+        let seen = inspector.seen_guidance();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].as_deref(), Some("prefer the markdown file"));
+        assert_eq!(seen[1], None);
     }
 }

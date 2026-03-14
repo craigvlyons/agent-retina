@@ -4,6 +4,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, Ordering},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -341,6 +345,8 @@ pub struct CommandResult {
     pub exit_code: Option<i32>,
     pub success: bool,
     pub duration_ms: u64,
+    pub cancelled: bool,
+    pub termination: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -426,18 +432,82 @@ pub enum Outcome {
     Blocked(String),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct ExecutionConfig {
     pub max_steps: usize,
-    pub pause_before_continuation: bool,
+    pub control: Option<ExecutionControlHandle>,
 }
 
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             max_steps: 4,
-            pause_before_continuation: false,
+            control: None,
         }
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionControlState {
+    cancel_requested: AtomicBool,
+    operator_guidance: Mutex<Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecutionControl {
+    state: Arc<ExecutionControlState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecutionControlHandle {
+    state: Arc<ExecutionControlState>,
+}
+
+impl ExecutionControl {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(ExecutionControlState {
+                cancel_requested: AtomicBool::new(false),
+                operator_guidance: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn handle(&self) -> ExecutionControlHandle {
+        ExecutionControlHandle {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl Default for ExecutionControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecutionControlHandle {
+    pub fn request_cancel(&self) {
+        self.state.cancel_requested.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancel_requested(&self) -> bool {
+        self.state.cancel_requested.load(Ordering::Relaxed)
+    }
+
+    pub fn queue_guidance(&self, guidance: impl Into<String>) {
+        *recover_mutex(&self.state.operator_guidance) = Some(guidance.into());
+    }
+
+    pub fn take_guidance(&self) -> Option<String> {
+        recover_mutex(&self.state.operator_guidance).take()
+    }
+}
+
+fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -525,6 +595,10 @@ pub enum TimelineEventType {
     IntentCreated,
     ReflexChecked,
     CircuitBreakerChecked,
+    TaskCancelRequested,
+    OperatorGuidanceQueued,
+    ApprovalPromptShown,
+    ApprovalPromptResolved,
     PreStateCaptured,
     ReasonerCalled,
     ReflexSelected,
@@ -553,6 +627,7 @@ pub struct ApprovalRequest {
 pub enum ApprovalResponse {
     Approved,
     Denied,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -564,6 +639,7 @@ pub struct AssembledContext {
     pub last_result: Option<String>,
     pub last_result_summary: Option<String>,
     pub recent_steps: Vec<String>,
+    pub operator_guidance: Option<String>,
     pub current_step: usize,
     pub max_steps: usize,
 }
@@ -582,8 +658,12 @@ impl AssembledContext {
         } else {
             self.recent_steps.join("\n")
         };
+        let operator_guidance = self
+            .operator_guidance
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
         format!(
-            "Identity:\n{}\n\nTask:\n{}\n\nStep:\n{} / {}\n\nTools:\n{}\n\nMemory:\n{}\n\nRecent steps:\n{}\n\nLast result summary:\n{}\n\nLast result:\n{}",
+            "Identity:\n{}\n\nTask:\n{}\n\nStep:\n{} / {}\n\nTools:\n{}\n\nMemory:\n{}\n\nRecent steps:\n{}\n\nOperator guidance:\n{}\n\nLast result summary:\n{}\n\nLast result:\n{}",
             self.identity,
             self.task,
             self.current_step,
@@ -591,6 +671,7 @@ impl AssembledContext {
             tools,
             memory,
             recent_steps,
+            operator_guidance,
             self.last_result_summary
                 .clone()
                 .unwrap_or_else(|| "none".to_string()),
@@ -664,23 +745,115 @@ pub enum RoutingDecision {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoutingCandidate {
+    pub agent_id: AgentId,
+    pub domain: String,
+    pub status: AgentStatus,
+    pub capability_match: f64,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoutingAssessment {
+    pub effective_decision: RoutingDecision,
+    pub recommended_decision: RoutingDecision,
+    pub candidates: Vec<RoutingCandidate>,
+    pub rationale: String,
+    pub network_enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentManifest {
     pub agent_id: AgentId,
     pub domain: String,
     pub status: AgentStatus,
     pub description: String,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub parent_agent_id: Option<AgentId>,
     pub capabilities: Vec<String>,
     pub authority: AgentAuthority,
+    pub lifecycle: AgentLifecycle,
+    pub budget: AgentBudget,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AgentStatus {
     Spawned,
     Running,
     Idle,
     Archived,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentLifecyclePhase {
+    Bootstrapping,
+    Ready,
+    Busy,
+    CoolingDown,
+    Archived,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentLifecycle {
+    pub phase: AgentLifecyclePhase,
+    pub last_active_at: Option<DateTime<Utc>>,
+    pub last_task_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<DateTime<Utc>>,
+    pub status_reason: Option<String>,
+}
+
+impl AgentLifecycle {
+    pub fn ready() -> Self {
+        Self {
+            phase: AgentLifecyclePhase::Ready,
+            last_active_at: None,
+            last_task_at: None,
+            archived_at: None,
+            status_reason: None,
+        }
+    }
+
+    pub fn transition(
+        &mut self,
+        phase: AgentLifecyclePhase,
+        timestamp: DateTime<Utc>,
+        reason: Option<String>,
+    ) {
+        self.phase = phase.clone();
+        self.last_active_at = Some(timestamp);
+        if matches!(
+            phase,
+            AgentLifecyclePhase::Busy | AgentLifecyclePhase::CoolingDown
+        ) {
+            self.last_task_at = Some(timestamp);
+        }
+        if matches!(phase, AgentLifecyclePhase::Archived) {
+            self.archived_at = Some(timestamp);
+        }
+        if let Some(reason) = reason {
+            self.status_reason = Some(reason);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentBudget {
+    pub max_steps_per_task: usize,
+    pub max_reasoner_calls_per_task: usize,
+    pub max_tokens_per_task: u32,
+    pub idle_archive_after_hours: Option<u64>,
+}
+
+impl Default for AgentBudget {
+    fn default() -> Self {
+        Self {
+            max_steps_per_task: 8,
+            max_reasoner_calls_per_task: 8,
+            max_tokens_per_task: 8_192,
+            idle_archive_after_hours: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -812,6 +985,27 @@ pub enum MessageKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentCard {
     pub agent_id: AgentId,
+    pub domain: String,
+    pub description: String,
     pub capabilities: Vec<String>,
     pub status: AgentStatus,
+    pub lifecycle_phase: AgentLifecyclePhase,
+    pub last_active_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentRegistrySnapshot {
+    pub updated_at: DateTime<Utc>,
+    pub active_agents: Vec<AgentCard>,
+    pub archived_agents: Vec<AgentCard>,
+}
+
+impl Default for AgentRegistrySnapshot {
+    fn default() -> Self {
+        Self {
+            updated_at: Utc::now(),
+            active_agents: Vec::new(),
+            archived_agents: Vec::new(),
+        }
+    }
 }

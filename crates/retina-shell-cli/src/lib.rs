@@ -9,9 +9,12 @@ use retina_traits::Shell;
 use retina_types::*;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, MutexGuard};
+use std::thread;
 use std::time::Instant;
 
 const DEFAULT_MAX_READ_BYTES: usize = 32 * 1024;
@@ -21,6 +24,12 @@ const DEFAULT_MAX_SEARCH_RESULTS: usize = 50;
 pub struct CliShell {
     last_command: Mutex<Option<CommandResult>>,
     notes: Mutex<Vec<String>>,
+}
+
+fn lock_state<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
+    mutex
+        .lock()
+        .map_err(|_| KernelError::Execution("cli shell state mutex poisoned".to_string()))
 }
 
 impl Default for CliShell {
@@ -286,7 +295,10 @@ impl CliShell {
         Ok((String::from_utf8_lossy(&buffer).to_string(), truncated))
     }
 
-    fn extract_document_text(path: &Path, max_chars: Option<usize>) -> Result<(String, bool, String)> {
+    fn extract_document_text(
+        path: &Path,
+        max_chars: Option<usize>,
+    ) -> Result<(String, bool, String)> {
         let path = Self::resolve_path(path)?;
         let extension = path
             .extension()
@@ -296,8 +308,7 @@ impl CliShell {
 
         let (content, format) = match extension.as_str() {
             "pdf" => (
-                extract_text(&path)
-                    .map_err(|error| KernelError::Execution(error.to_string()))?,
+                extract_text(&path).map_err(|error| KernelError::Execution(error.to_string()))?,
                 "pdf".to_string(),
             ),
             "md" | "txt" | "rs" | "toml" | "json" | "yaml" | "yml" => {
@@ -347,6 +358,142 @@ impl CliShell {
         file.write_all(content.as_bytes())?;
         Ok(content.len())
     }
+
+    fn run_command(
+        command: &str,
+        cwd: Option<PathBuf>,
+        control: Option<&ExecutionControlHandle>,
+    ) -> Result<CommandResult> {
+        let workdir = cwd.unwrap_or(std::env::current_dir()?);
+        let start = Instant::now();
+        let mut child = build_shell_command(command, &workdir)?.spawn()?;
+        let mut cancelled = false;
+        let mut termination = None;
+
+        loop {
+            if let Some(status) = child.try_wait()? {
+                let (stdout, stderr) = read_child_output(&mut child)?;
+                let success = status.success() && !cancelled;
+                let result = CommandResult {
+                    command: command.to_string(),
+                    cwd: workdir,
+                    stdout,
+                    stderr,
+                    exit_code: status.code(),
+                    success,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    cancelled,
+                    termination,
+                };
+                return Ok(result);
+            }
+
+            if control
+                .map(ExecutionControlHandle::is_cancel_requested)
+                .unwrap_or(false)
+            {
+                cancelled = true;
+                terminate_child_gracefully(&mut child)?;
+                if wait_for_exit(&mut child, 1_000)? {
+                    termination = Some("terminated gracefully after cancellation".to_string());
+                } else {
+                    force_kill_child(&mut child)?;
+                    let _ = child.wait();
+                    termination = Some("force killed after cancellation".to_string());
+                }
+                continue;
+            }
+
+            thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+fn build_shell_command(command: &str, workdir: &Path) -> Result<Command> {
+    let mut process = Command::new("sh");
+    process
+        .arg("-lc")
+        .arg(command)
+        .current_dir(workdir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+    Ok(process)
+}
+
+fn read_child_output(child: &mut Child) -> Result<(String, String)> {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        pipe.read_to_string(&mut stdout)?;
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    Ok((stdout, stderr))
+}
+
+fn wait_for_exit(child: &mut Child, timeout_ms: u64) -> Result<bool> {
+    let started = Instant::now();
+    while started.elapsed().as_millis() < timeout_ms as u128 {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    Ok(false)
+}
+
+fn terminate_child_gracefully(child: &mut Child) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        let result = unsafe { libc::kill(-pid, libc::SIGTERM) };
+        if result == 0 {
+            return Ok(());
+        }
+        let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+        if result == 0 {
+            return Ok(());
+        }
+        return Err(KernelError::Execution(
+            io::Error::last_os_error().to_string(),
+        ));
+    }
+
+    #[cfg(not(unix))]
+    {
+        child.kill()?;
+        Ok(())
+    }
+}
+
+fn force_kill_child(child: &mut Child) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        let result = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+        child.kill()?;
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        child.kill()?;
+        Ok(())
+    }
 }
 
 impl Shell for CliShell {
@@ -354,8 +501,8 @@ impl Shell for CliShell {
         Ok(WorldState {
             cwd: std::env::current_dir()?,
             files: Vec::new(),
-            last_command: self.last_command.lock().unwrap().clone(),
-            notes: self.notes.lock().unwrap().clone(),
+            last_command: lock_state(&self.last_command)?.clone(),
+            notes: lock_state(&self.notes)?.clone(),
         })
     }
 
@@ -376,7 +523,7 @@ impl Shell for CliShell {
             },
             files,
             last_command: if scope.include_last_command {
-                self.last_command.lock().unwrap().clone()
+                lock_state(&self.last_command)?.clone()
             } else {
                 None
             },
@@ -438,6 +585,14 @@ impl Shell for CliShell {
     }
 
     fn execute(&self, action: &Action) -> Result<ActionResult> {
+        self.execute_controlled(action, None)
+    }
+
+    fn execute_controlled(
+        &self,
+        action: &Action,
+        control: Option<&ExecutionControlHandle>,
+    ) -> Result<ActionResult> {
         match action {
             Action::RunCommand {
                 command,
@@ -456,23 +611,8 @@ impl Shell for CliShell {
                     ));
                 }
 
-                let workdir = cwd.clone().unwrap_or(std::env::current_dir()?);
-                let start = Instant::now();
-                let output = Command::new("sh")
-                    .arg("-lc")
-                    .arg(command)
-                    .current_dir(&workdir)
-                    .output()?;
-                let result = CommandResult {
-                    command: command.clone(),
-                    cwd: workdir,
-                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                    exit_code: output.status.code(),
-                    success: output.status.success(),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                };
-                *self.last_command.lock().unwrap() = Some(result.clone());
+                let result = Self::run_command(command, cwd.clone(), control)?;
+                *lock_state(&self.last_command)? = Some(result.clone());
                 Ok(ActionResult::Command(result))
             }
             Action::InspectPath {
@@ -482,8 +622,8 @@ impl Shell for CliShell {
             } => Ok(ActionResult::Inspection(WorldState {
                 cwd: std::env::current_dir()?,
                 files: vec![Self::inspect_path_state(path, *include_content)?],
-                last_command: self.last_command.lock().unwrap().clone(),
-                notes: self.notes.lock().unwrap().clone(),
+                last_command: lock_state(&self.last_command)?.clone(),
+                notes: lock_state(&self.notes)?.clone(),
             })),
             Action::InspectWorkingDirectory { .. } => self.observe().map(ActionResult::Inspection),
             Action::ListDirectory {
@@ -540,8 +680,7 @@ impl Shell for CliShell {
             Action::ExtractDocumentText {
                 path, max_chars, ..
             } => {
-                let (content, truncated, format) =
-                    Self::extract_document_text(path, *max_chars)?;
+                let (content, truncated, format) = Self::extract_document_text(path, *max_chars)?;
                 Ok(ActionResult::DocumentText {
                     path: Self::resolve_path(path)?,
                     content,
@@ -571,7 +710,7 @@ impl Shell for CliShell {
                 })
             }
             Action::RecordNote { note, .. } => {
-                self.notes.lock().unwrap().push(note.clone());
+                lock_state(&self.notes)?.push(note.clone());
                 Ok(ActionResult::NoteRecorded { note: note.clone() })
             }
             Action::Respond { message, .. } => Ok(ActionResult::Response {
@@ -658,7 +797,12 @@ fn expand_homeish_path(path: &Path) -> Option<PathBuf> {
         return dirs::home_dir().map(|home| home.join(stripped));
     }
 
-    let first = path.components().next()?.as_os_str().to_str()?.to_lowercase();
+    let first = path
+        .components()
+        .next()?
+        .as_os_str()
+        .to_str()?
+        .to_lowercase();
     let base = match first.as_str() {
         "desktop" => dirs::home_dir().map(|home| home.join("Desktop")),
         "documents" => dirs::home_dir().map(|home| home.join("Documents")),
@@ -690,6 +834,8 @@ mod tests {
     use super::*;
     use lopdf::content::{Content, Operation};
     use lopdf::{Document, Object, Stream, dictionary};
+    use std::thread;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -711,6 +857,38 @@ mod tests {
         assert_eq!(result.stdout, "hello");
         assert_eq!(result.exit_code, Some(0));
         assert!(result.duration_ms <= 5_000);
+    }
+
+    #[test]
+    fn controlled_command_can_be_cancelled() {
+        let shell = CliShell::new();
+        let control = ExecutionControl::new();
+        let handle = control.handle();
+        let cancel_handle = handle.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancel_handle.request_cancel();
+        });
+
+        let result = shell
+            .execute_controlled(
+                &Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "sleep 5".to_string(),
+                    cwd: None,
+                    require_approval: false,
+                    expect_change: false,
+                    state_scope: HashScope::default(),
+                },
+                Some(&handle),
+            )
+            .unwrap();
+        let ActionResult::Command(result) = result else {
+            panic!("expected command result");
+        };
+        assert!(result.cancelled);
+        assert!(!result.success);
+        assert!(result.termination.is_some());
     }
 
     #[test]
@@ -845,7 +1023,10 @@ mod tests {
                 max_chars: None,
             })
             .unwrap();
-        let ActionResult::DocumentText { content, format, .. } = result else {
+        let ActionResult::DocumentText {
+            content, format, ..
+        } = result
+        else {
             panic!("expected document text");
         };
         assert_eq!(format, "pdf");

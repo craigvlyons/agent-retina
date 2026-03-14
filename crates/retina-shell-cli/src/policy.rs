@@ -40,6 +40,15 @@ impl<S: Shell> Shell for ScopedShell<S> {
         self.inner.execute(action)
     }
 
+    fn execute_controlled(
+        &self,
+        action: &Action,
+        control: Option<&ExecutionControlHandle>,
+    ) -> Result<ActionResult> {
+        validate_action(&self.authority, action)?;
+        self.inner.execute_controlled(action, control)
+    }
+
     fn constraints(&self) -> &[HardConstraint] {
         self.inner.constraints()
     }
@@ -47,7 +56,8 @@ impl<S: Shell> Shell for ScopedShell<S> {
     fn capabilities(&self) -> ShellCapabilities {
         let inner = self.inner.capabilities();
         ShellCapabilities {
-            can_execute_commands: inner.can_execute_commands && self.authority.allow_command_execution,
+            can_execute_commands: inner.can_execute_commands
+                && self.authority.allow_command_execution,
             can_read_files: inner.can_read_files && self.authority.allow_file_reads,
             can_write_files: inner.can_write_files && self.authority.allow_file_writes,
             can_search_files: inner.can_search_files && self.authority.allow_file_search,

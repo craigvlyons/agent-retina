@@ -94,7 +94,9 @@ Current behavior:
 - timeline events are persisted
 - approvals are enforced for writes and risky actions
 - the kernel can take bounded follow-up steps for one task instead of stopping after one action
-- chat can stop a continuing task between steps with `/stop`
+- chat has a real control plane for stop/cancel and one-step operator guidance with `/guide <text>`
+- the root worker now persists specialist-ready manifest lifecycle and budget metadata
+- the CLI can inspect the current agent registry with `retina inspect agents`
 
 ### Phase 3: learning primitives
 
@@ -118,7 +120,7 @@ These are not v1 blockers if the single-agent harness remains strong, but they a
 
 - deeper autonomous planning for complex repo workflows
 - richer repeated-task reuse beyond the first consolidation lifecycle
-- specialist lifecycle and routing seams beyond the first scoped-authority layer
+- full specialist lifecycle orchestration, reactivation, and spawn execution
 - browser shell
 - hardware and device shells
 - Wasm fabrication loop
@@ -169,7 +171,7 @@ The next work inside v1 should be:
 1. improve autonomous shell planning for real repo work
 2. refine learning quality and reuse beyond the first consolidation lifecycle
 3. strengthen multi-step task quality for more complex tasks
-4. deepen specialist-ready seams: scoped manifests, authority, lifecycle metadata, and routing inputs
+4. harden specialist-ready seams: lifecycle transitions, registry quality, and routing confidence
 5. add richer stop and cancel handling for long-running or background execution later
 
 This keeps the project aligned with the research without jumping early into the colony phase.

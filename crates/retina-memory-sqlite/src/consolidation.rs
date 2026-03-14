@@ -87,9 +87,9 @@ pub(crate) fn build_experience_patterns(
             }
 
             let average_utility = item.utility_total / item.observation_count as f64;
-            let repeat_score =
-                (item.observation_count as f64 / (config.min_successful_repeats as f64 + 2.0))
-                    .min(1.0);
+            let repeat_score = (item.observation_count as f64
+                / (config.min_successful_repeats as f64 + 2.0))
+                .min(1.0);
             let success_ratio = item.success_count as f64 / item.observation_count as f64;
             let confidence = ((average_utility.clamp(0.0, 1.0) * 0.45)
                 + (repeat_score * 0.20)
@@ -128,7 +128,8 @@ pub(crate) fn should_promote_rule(
     pattern: &ExperiencePattern,
     config: &ConsolidationConfig,
 ) -> bool {
-    pattern.confidence >= config.min_rule_confidence && pattern.success_count > pattern.failure_count
+    pattern.confidence >= config.min_rule_confidence
+        && pattern.success_count > pattern.failure_count
 }
 
 pub(crate) fn rule_matches_pattern(rule: &ReflexiveRule, pattern: &ExperiencePattern) -> bool {

@@ -212,7 +212,10 @@ mod tests {
         })
         .unwrap();
         let response = plan_task("find the resume and read it", Some(&previous)).unwrap();
-        assert!(matches!(response.action, Action::ExtractDocumentText { .. }));
+        assert!(matches!(
+            response.action,
+            Action::ExtractDocumentText { .. }
+        ));
     }
 
     #[test]
@@ -233,6 +236,12 @@ mod tests {
 
     #[test]
     fn concrete_task_without_prior_result_is_not_short_circuited() {
-        assert!(plan_task("find the resume file on desktop and tell me what is in it", None).is_none());
+        assert!(
+            plan_task(
+                "find the resume file on desktop and tell me what is in it",
+                None
+            )
+            .is_none()
+        );
     }
 }

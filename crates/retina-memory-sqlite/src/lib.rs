@@ -1,4 +1,5 @@
 mod consolidation;
+mod registry;
 mod retrieval;
 
 use chrono::{DateTime, Utc};
@@ -6,11 +7,12 @@ use consolidation::{
     build_experience_patterns, knowledge_content, metadata_key, metadata_success_count,
     pattern_metadata, rule_matches_pattern, rule_name, should_promote_rule,
 };
-use retrieval::{rank_experiences, rerank_knowledge};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use refinery::embed_migrations;
+use registry::registry_snapshot;
 use retina_traits::Memory;
 use retina_types::*;
+use retrieval::{rank_experiences, rerank_knowledge};
 use rusqlite::{Connection, DatabaseName, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -79,7 +81,10 @@ impl SqliteMemory {
     }
 
     fn with_conn<T>(&self, func: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| KernelError::Storage("sqlite connection mutex poisoned".to_string()))?;
         func(&conn)
     }
 
@@ -91,17 +96,20 @@ impl SqliteMemory {
         self.with_conn(|conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO agent_manifest
-                 (agent_id, domain, status, description, created_at, parent_agent_id, capabilities_json, authority_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (agent_id, domain, status, description, created_at, updated_at, parent_agent_id, capabilities_json, authority_json, lifecycle_json, budget_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     manifest.agent_id.0,
                     manifest.domain,
                     serde_json::to_string(&manifest.status).map_err(to_storage)?,
                     manifest.description,
                     manifest.created_at.to_rfc3339(),
+                    manifest.updated_at.to_rfc3339(),
                     manifest.parent_agent_id.as_ref().map(|value| value.0.clone()),
                     serde_json::to_string(&manifest.capabilities).map_err(to_storage)?,
                     serde_json::to_string(&manifest.authority).map_err(to_storage)?,
+                    serde_json::to_string(&manifest.lifecycle).map_err(to_storage)?,
+                    serde_json::to_string(&manifest.budget).map_err(to_storage)?,
                 ],
             )
             .map_err(to_storage)?;
@@ -112,31 +120,105 @@ impl SqliteMemory {
     pub fn load_manifest(&self, agent_id: &AgentId) -> Result<Option<AgentManifest>> {
         self.with_conn(|conn| {
             conn.query_row(
-                "SELECT domain, status, description, created_at, parent_agent_id, capabilities_json, authority_json
+                "SELECT domain, status, description, created_at, updated_at, parent_agent_id, capabilities_json, authority_json, lifecycle_json, budget_json
                  FROM agent_manifest WHERE agent_id = ?1",
                 params![agent_id.0],
                 |row| {
                     let status_json: String = row.get(1)?;
                     let created_at: String = row.get(3)?;
-                    let capabilities_json: String = row.get(5)?;
-                    let authority_json: String = row.get(6)?;
+                    let updated_at: String = row.get(4)?;
+                    let capabilities_json: String = row.get(6)?;
+                    let authority_json: String = row.get(7)?;
+                    let lifecycle_json: String = row.get(8)?;
+                    let budget_json: String = row.get(9)?;
                     Ok(AgentManifest {
                         agent_id: agent_id.clone(),
                         domain: row.get(0)?,
                         status: serde_json::from_str(&status_json).unwrap_or(AgentStatus::Spawned),
                         description: row.get(2)?,
                         created_at: parse_datetime(&created_at),
-                        parent_agent_id: row.get::<_, Option<String>>(4)?.map(AgentId),
+                        updated_at: parse_datetime(&updated_at),
+                        parent_agent_id: row.get::<_, Option<String>>(5)?.map(AgentId),
                         capabilities: serde_json::from_str(&capabilities_json)
                             .unwrap_or_else(|_| Vec::new()),
                         authority: serde_json::from_str(&authority_json)
                             .unwrap_or_else(|_| AgentAuthority::default()),
+                        lifecycle: serde_json::from_str(&lifecycle_json)
+                            .unwrap_or_else(|_| AgentLifecycle::ready()),
+                        budget: serde_json::from_str(&budget_json)
+                            .unwrap_or_else(|_| AgentBudget::default()),
                     })
                 },
             )
             .optional()
             .map_err(to_storage)
         })
+    }
+
+    pub fn list_manifests(&self) -> Result<Vec<AgentManifest>> {
+        self.with_conn(|conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT agent_id, domain, status, description, created_at, updated_at, parent_agent_id, capabilities_json, authority_json, lifecycle_json, budget_json
+                     FROM agent_manifest
+                     ORDER BY domain, agent_id",
+                )
+                .map_err(to_storage)?;
+            let rows = statement
+                .query_map([], |row| {
+                    let status_json: String = row.get(2)?;
+                    let created_at: String = row.get(4)?;
+                    let updated_at: String = row.get(5)?;
+                    let capabilities_json: String = row.get(7)?;
+                    let authority_json: String = row.get(8)?;
+                    let lifecycle_json: String = row.get(9)?;
+                    let budget_json: String = row.get(10)?;
+                    Ok(AgentManifest {
+                        agent_id: AgentId(row.get(0)?),
+                        domain: row.get(1)?,
+                        status: serde_json::from_str(&status_json).unwrap_or(AgentStatus::Spawned),
+                        description: row.get(3)?,
+                        created_at: parse_datetime(&created_at),
+                        updated_at: parse_datetime(&updated_at),
+                        parent_agent_id: row.get::<_, Option<String>>(6)?.map(AgentId),
+                        capabilities: serde_json::from_str(&capabilities_json)
+                            .unwrap_or_else(|_| Vec::new()),
+                        authority: serde_json::from_str(&authority_json)
+                            .unwrap_or_else(|_| AgentAuthority::default()),
+                        lifecycle: serde_json::from_str(&lifecycle_json)
+                            .unwrap_or_else(|_| AgentLifecycle::ready()),
+                        budget: serde_json::from_str(&budget_json)
+                            .unwrap_or_else(|_| AgentBudget::default()),
+                    })
+                })
+                .map_err(to_storage)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(to_storage)
+        })
+    }
+
+    pub fn agent_registry(&self) -> Result<AgentRegistrySnapshot> {
+        Ok(registry_snapshot(self.list_manifests()?))
+    }
+
+    pub fn update_manifest_lifecycle(
+        &self,
+        agent_id: &AgentId,
+        status: AgentStatus,
+        phase: AgentLifecyclePhase,
+        reason: Option<&str>,
+    ) -> Result<Option<AgentManifest>> {
+        let Some(mut manifest) = self.load_manifest(agent_id)? else {
+            return Ok(None);
+        };
+        let now = Utc::now();
+        manifest.status = status;
+        manifest.updated_at = now;
+        manifest
+            .lifecycle
+            .transition(phase, now, reason.map(str::to_string));
+        self.save_manifest(&manifest)?;
+        Ok(Some(manifest))
     }
 
     pub fn stats(&self) -> Result<MemoryStats> {
@@ -211,9 +293,7 @@ impl Memory for SqliteMemory {
     }
 
     fn store_knowledge(&self, node: &KnowledgeNode) -> Result<KnowledgeId> {
-        self.with_conn(|conn| {
-            persist_knowledge(conn, &self.embedder, node)
-        })
+        self.with_conn(|conn| persist_knowledge(conn, &self.embedder, node))
     }
 
     fn link_knowledge(&self, from: KnowledgeId, to: KnowledgeId, relation: &str) -> Result<()> {
@@ -228,9 +308,7 @@ impl Memory for SqliteMemory {
     }
 
     fn store_rule(&self, rule: &ReflexiveRule) -> Result<RuleId> {
-        self.with_conn(|conn| {
-            persist_rule(conn, rule)
-        })
+        self.with_conn(|conn| persist_rule(conn, rule))
     }
 
     fn register_tool(&self, tool: &ToolRecord) -> Result<ToolId> {
@@ -891,9 +969,12 @@ struct ManifestFile {
     status: String,
     description: String,
     created_at: String,
+    updated_at: String,
     parent_agent_id: Option<String>,
     capabilities: Vec<String>,
     authority: AgentAuthority,
+    lifecycle: AgentLifecycle,
+    budget: AgentBudget,
 }
 
 pub fn write_manifest(path: PathBuf, manifest: &AgentManifest) -> Result<()> {
@@ -907,9 +988,15 @@ pub fn write_manifest(path: PathBuf, manifest: &AgentManifest) -> Result<()> {
         status: format!("{:?}", manifest.status),
         description: manifest.description.clone(),
         created_at: manifest.created_at.to_rfc3339(),
-        parent_agent_id: manifest.parent_agent_id.as_ref().map(|value| value.0.clone()),
+        updated_at: manifest.updated_at.to_rfc3339(),
+        parent_agent_id: manifest
+            .parent_agent_id
+            .as_ref()
+            .map(|value| value.0.clone()),
         capabilities: manifest.capabilities.clone(),
         authority: manifest.authority.clone(),
+        lifecycle: manifest.lifecycle.clone(),
+        budget: manifest.budget.clone(),
     };
     std::fs::write(path, toml::to_string_pretty(&file).map_err(to_storage)?)
         .map_err(|error| KernelError::Storage(error.to_string()))
@@ -1029,7 +1116,8 @@ mod tests {
                 session_id: SessionId::new(),
                 task_id: TaskId::new(),
                 intent_id: IntentId::new(),
-                action_summary: "read_file:/Users/macc/Desktop/resume/Craig Lyons resume.md".to_string(),
+                action_summary: "read_file:/Users/macc/Desktop/resume/Craig Lyons resume.md"
+                    .to_string(),
                 outcome: "success".to_string(),
                 utility: 0.8,
                 created_at: Utc::now(),
@@ -1074,6 +1162,53 @@ mod tests {
         memory.append_timeline_event(&event).unwrap();
         memory.backup(&backup).unwrap();
         assert!(backup.exists());
+    }
+
+    #[test]
+    fn manifests_persist_lifecycle_and_registry_snapshot() {
+        let memory = SqliteMemory::open_in_memory().unwrap();
+        let now = Utc::now();
+        memory
+            .save_manifest(&AgentManifest {
+                agent_id: AgentId("root".to_string()),
+                domain: "orchestrator".to_string(),
+                status: AgentStatus::Idle,
+                description: "root".to_string(),
+                created_at: now,
+                updated_at: now,
+                parent_agent_id: None,
+                capabilities: vec!["cli".to_string()],
+                authority: AgentAuthority::default(),
+                lifecycle: AgentLifecycle::ready(),
+                budget: AgentBudget::default(),
+            })
+            .unwrap();
+        let mut archived_lifecycle = AgentLifecycle::ready();
+        archived_lifecycle.transition(
+            AgentLifecyclePhase::Archived,
+            now,
+            Some("idle timeout".to_string()),
+        );
+        memory
+            .save_manifest(&AgentManifest {
+                agent_id: AgentId("research-a1".to_string()),
+                domain: "research".to_string(),
+                status: AgentStatus::Archived,
+                description: "research specialist".to_string(),
+                created_at: now,
+                updated_at: now,
+                parent_agent_id: Some(AgentId("root".to_string())),
+                capabilities: vec!["web".to_string(), "documents".to_string()],
+                authority: AgentAuthority::default(),
+                lifecycle: archived_lifecycle,
+                budget: AgentBudget::default(),
+            })
+            .unwrap();
+
+        let registry = memory.agent_registry().unwrap();
+        assert_eq!(registry.active_agents.len(), 1);
+        assert_eq!(registry.archived_agents.len(), 1);
+        assert_eq!(registry.archived_agents[0].domain, "research");
     }
 
     #[test]

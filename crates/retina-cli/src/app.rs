@@ -2,7 +2,8 @@ use crate::chat::ChatSession;
 use crate::cli::{Cli, Commands, InspectCommands};
 use crate::controller::{AgentController, InspectController};
 use crate::output::{
-    render_action_result, render_memory_inspection, render_stats, render_timeline,
+    render_action_result, render_agent_registry, render_memory_inspection, render_stats,
+    render_timeline,
 };
 use crate::runtime::init_runtime;
 use clap::Parser;
@@ -43,6 +44,10 @@ pub fn inspect(command: InspectCommands) -> Result<()> {
         InspectCommands::Timeline => {
             let events = inspector.recent_timeline(50)?;
             print!("{}", render_timeline(&events));
+        }
+        InspectCommands::Agents => {
+            let registry = inspector.agent_registry()?;
+            print!("{}", render_agent_registry(&registry));
         }
         InspectCommands::Memory { query } => {
             let (knowledge, experiences) = inspector.memory_lookup(&query, 10)?;

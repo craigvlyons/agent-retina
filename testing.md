@@ -109,12 +109,17 @@ Ask the same resume task multiple ways:
 
 While using `retina chat`:
 
-- `/s` stops the current task between steps
-- `/stop` also stops the current task between steps
+- `/s` stops the current task through the harness control path
+- `/stop` also stops the current task through the harness control path
+- `/guide <text>` adds one hint for the next planning step without turning it into task text
 - `/help` shows chat help
 - `/timeline` shows recent timeline events
 - `/memory <query>` shows recalled memory
 - `/debug` toggles raw event output
+
+Outside chat:
+
+- `cargo run -p retina-cli -- inspect agents` shows the current registry and manifest lifecycle state
 
 ## Suggested Testing Order
 

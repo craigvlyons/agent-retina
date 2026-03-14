@@ -4,10 +4,20 @@ use serde_json::Value;
 
 pub fn render_action_result(result: &ActionResult) -> String {
     match result {
-        ActionResult::Command(result) => format!(
-            "Command completed (exit={:?})\nstdout:\n{}\nstderr:\n{}",
-            result.exit_code, result.stdout, result.stderr
-        ),
+        ActionResult::Command(result) => {
+            let status = if result.cancelled {
+                result
+                    .termination
+                    .clone()
+                    .unwrap_or_else(|| "command cancelled".to_string())
+            } else {
+                format!("Command completed (exit={:?})", result.exit_code)
+            };
+            format!(
+                "{status}\nstdout:\n{}\nstderr:\n{}",
+                result.stdout, result.stderr
+            )
+        }
         ActionResult::Inspection(state) => {
             format!("Inspection complete for cwd {}", state.cwd.display())
         }
@@ -136,16 +146,37 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
     }
 
     let line = match event.event_type {
-        TimelineEventType::TaskReceived => {
-            event.payload_json.get("task").and_then(Value::as_str).map(|task| {
-                format!("task: {task}")
-            })
-        }
+        TimelineEventType::TaskReceived => event
+            .payload_json
+            .get("task")
+            .and_then(Value::as_str)
+            .map(|task| format!("task: {task}")),
+        TimelineEventType::TaskCancelRequested => event
+            .payload_json
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|reason| format!("stop requested: {reason}")),
+        TimelineEventType::OperatorGuidanceQueued => event
+            .payload_json
+            .get("guidance")
+            .and_then(Value::as_str)
+            .map(|guidance| format!("guide: {guidance}")),
+        TimelineEventType::ApprovalPromptShown => event
+            .payload_json
+            .get("action")
+            .and_then(Value::as_str)
+            .map(|action| format!("approval: {}", humanize_action_label(action))),
+        TimelineEventType::ApprovalPromptResolved => event
+            .payload_json
+            .get("resolution")
+            .and_then(Value::as_str)
+            .map(|resolution| format!("approval resolved: {resolution}")),
         TimelineEventType::ReasonerCalled => {
             if let Some(action) = event.payload_json.get("action").and_then(Value::as_str) {
                 Some(format!("plan: {}", humanize_action_label(action)))
             } else {
-                event.payload_json
+                event
+                    .payload_json
                     .get("reasoning")
                     .and_then(Value::as_str)
                     .map(|reasoning| format!("thinking: {reasoning}"))
@@ -244,6 +275,41 @@ pub fn render_memory_inspection(knowledge: &[KnowledgeNode], experiences: &[Expe
             "- {} => {} ({:.2})\n",
             item.action_summary, item.outcome, item.utility
         ));
+    }
+    output
+}
+
+pub fn render_agent_registry(registry: &AgentRegistrySnapshot) -> String {
+    let mut output = format!("updated_at: {}\n", registry.updated_at.to_rfc3339());
+    output.push_str("active_agents:\n");
+    if registry.active_agents.is_empty() {
+        output.push_str("- (none)\n");
+    } else {
+        for agent in &registry.active_agents {
+            output.push_str(&format!(
+                "- {} [{}] {:?}/{:?} capabilities={}\n",
+                agent.agent_id.0,
+                agent.domain,
+                agent.status,
+                agent.lifecycle_phase,
+                agent.capabilities.join(", ")
+            ));
+        }
+    }
+    output.push_str("archived_agents:\n");
+    if registry.archived_agents.is_empty() {
+        output.push_str("- (none)\n");
+    } else {
+        for agent in &registry.archived_agents {
+            output.push_str(&format!(
+                "- {} [{}] {:?}/{:?} capabilities={}\n",
+                agent.agent_id.0,
+                agent.domain,
+                agent.status,
+                agent.lifecycle_phase,
+                agent.capabilities.join(", ")
+            ));
+        }
     }
     output
 }

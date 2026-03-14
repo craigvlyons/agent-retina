@@ -12,6 +12,14 @@ pub trait Shell: Send + Sync {
         action: Option<&Action>,
     ) -> Result<StateDelta>;
     fn execute(&self, action: &Action) -> Result<ActionResult>;
+    fn execute_controlled(
+        &self,
+        action: &Action,
+        control: Option<&ExecutionControlHandle>,
+    ) -> Result<ActionResult> {
+        let _ = control;
+        self.execute(action)
+    }
     fn constraints(&self) -> &[HardConstraint];
     fn capabilities(&self) -> ShellCapabilities;
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalResponse>;

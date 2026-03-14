@@ -25,6 +25,7 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum InspectCommands {
     Timeline,
+    Agents,
     Memory {
         #[arg(default_value = "")]
         query: String,
