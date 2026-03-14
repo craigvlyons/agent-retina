@@ -6,6 +6,13 @@
 
 This document defines the corrected boundary for **functional v1**.
 
+Implementation plans for this boundary:
+- [docs/plans/u1-task-shape-and-completion-plan.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/plans/u1-task-shape-and-completion-plan.md)
+- [docs/plans/u2-document-and-data-ingestion-plan.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/plans/u2-document-and-data-ingestion-plan.md)
+- [docs/plans/u3-synthesis-and-output-plan.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/plans/u3-synthesis-and-output-plan.md)
+- [docs/plans/u4-terminal-freedom-and-scripts-plan.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/plans/u4-terminal-freedom-and-scripts-plan.md)
+- [docs/plans/u5-memory-and-reuse-plan.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/plans/u5-memory-and-reuse-plan.md)
+
 Retina v1 is still:
 - one private worker
 - one kernel
