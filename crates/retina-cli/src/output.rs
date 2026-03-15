@@ -209,8 +209,8 @@ pub fn render_task_state(task_state: &TaskState) -> String {
         .as_ref()
         .map(|output| {
             format!(
-                "{} [{}|exists={}|verified={}]",
-                output.locator_hint, output.kind, output.exists, output.verified
+                "{} [{}|intent={}|exists={}|verified={}]",
+                output.locator_hint, output.kind, output.intent, output.exists, output.verified
             )
         })
         .unwrap_or_else(|| "(none)".to_string());
@@ -219,10 +219,12 @@ pub fn render_task_state(task_state: &TaskState) -> String {
         .as_ref()
         .map(|artifact| {
             format!(
-                "{} [{}|exists={}|written_this_run={}|verified={}|last_write_step={}|last_write_action={}]",
+                "{} [{}|intent={}|exists={}|current_content_ingested={}|written_this_run={}|verified={}|last_write_step={}|last_write_action={}]",
                 artifact.locator_hint,
                 artifact.kind,
+                artifact.intent,
                 artifact.exists,
+                artifact.current_content_ingested,
                 artifact.written_this_run,
                 artifact.verified,
                 artifact

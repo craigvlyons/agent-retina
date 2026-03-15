@@ -99,14 +99,25 @@ pub(crate) fn build_task_frontier(
         }));
     }
 
+    blockers.extend(unsupported_input_blockers(shape));
+
+    if let Some(output) = shape.requested_output.as_ref() {
+        if !output_kind_supported(output) {
+            blockers.push(format!(
+                "unsupported output type: {} ({})",
+                output.locator_hint, output.kind
+            ));
+        }
+    }
+
     if let Some(output) = shape
         .requested_output
         .as_ref()
         .filter(|output| !output.verified)
     {
-        let target_content_needed =
-            output_intent_needs_current_content(output.intent.clone())
-                && !output_target_content_is_ingested(state, output);
+        let target_content_needed = output.exists
+            && output_intent_needs_current_content(output.intent.clone())
+            && !output_target_content_is_ingested(state, output);
         if target_content_needed {
             open_questions.push(format!(
                 "Need the current content of {} before it can be {}",
@@ -134,6 +145,21 @@ pub(crate) fn build_task_frontier(
                 output.locator_hint,
                 output.intent
             ));
+            if output_mapping_gap(state, output) {
+                blockers.push(format!(
+                    "evidence is already ingested but not yet mapped into the requested artifact: {}",
+                    output.locator_hint
+                ));
+            }
+            if ambiguous_source_mapping(state, output) {
+                blockers.push(format!(
+                    "ambiguous source mapping: multiple ingested sources could feed {} and the worker has not selected a concrete mapping yet",
+                    output.locator_hint
+                ));
+            }
+            if let Some(reason) = recent_output_failure_reason(state, output) {
+                blockers.push(reason);
+            }
         }
     }
 
@@ -185,6 +211,8 @@ pub(crate) fn build_task_frontier(
                 "Ingest the current content of the target artifact before {} it: {}",
                 output.intent, output.locator_hint
             ))
+        } else if let Some(strategy_hint) = preferred_output_strategy_hint(state, output) {
+            Some(strategy_hint)
         } else {
             Some(format!(
                 "{} the requested output artifact: {}",
@@ -431,7 +459,10 @@ fn infer_requested_output(
         .collect::<Vec<_>>();
 
     file_mentions.iter().rev().find_map(|(index, hint)| {
-        let start = index.saturating_sub(4);
+        // Look farther back than the immediate neighboring tokens so prompts like
+        // "append ... in temp/worker_notes.md" still bind the later file mention
+        // as the output target without hardcoding the phrase shape.
+        let start = index.saturating_sub(8);
         let cue_window = tokens
             .get(start..=*index)
             .unwrap_or(&[])
@@ -545,7 +576,13 @@ fn infer_requested_output_status(hint: &str, state: &TaskLoopState) -> (bool, bo
         if !locator_matches_hint(&source.locator, hint) {
             continue;
         }
-        exists = true;
+        if matches!(
+            source.status.as_str(),
+            "read" | "excerpted" | "ingested" | "matched_text" | "written" | "appended"
+        ) || source.role == "generated"
+        {
+            exists = true;
+        }
         if source.role == "generated" || matches!(source.status.as_str(), "written" | "appended") {
             verified = true;
         }
@@ -555,7 +592,20 @@ fn infer_requested_output_status(hint: &str, state: &TaskLoopState) -> (bool, bo
         if !locator_matches_hint(&artifact.locator, hint) {
             continue;
         }
-        exists = true;
+        if matches!(
+            artifact.status.as_str(),
+            "read"
+                | "structured_read"
+                | "extracted"
+                | "searched"
+                | "created"
+                | "written"
+                | "overwritten"
+                | "appended"
+                | "command_changed"
+        ) {
+            exists = true;
+        }
         if matches!(
             artifact.status.as_str(),
             "created" | "written" | "overwritten" | "appended" | "command_changed"
@@ -596,6 +646,48 @@ fn output_target_content_is_ingested(state: &TaskLoopState, output: &RequestedOu
     })
 }
 
+fn preferred_output_strategy_hint(
+    state: &TaskLoopState,
+    output: &RequestedOutput,
+) -> Option<String> {
+    if !output_kind_supported(output) {
+        return None;
+    }
+
+    let normalized_kind = output.kind.to_ascii_lowercase();
+    let has_structured_sources = state
+        .working_sources
+        .iter()
+        .any(|source| source.kind == "structured_data");
+    let has_command_output = state
+        .working_sources
+        .iter()
+        .any(|source| source.role == "generated" && source.extraction_method.as_deref() == Some("run_command"));
+
+    if matches!(normalized_kind.as_str(), "txt" | "md") {
+        return Some(format!(
+            "Synthesize the gathered evidence directly into {} with write_file unless a shell command is clearly better",
+            output.locator_hint
+        ));
+    }
+
+    if matches!(normalized_kind.as_str(), "csv" | "tsv") {
+        return Some(if has_structured_sources || has_command_output {
+            format!(
+                "Map the gathered structured evidence into {}. Use write_file for a small direct output, or run_command if a shell transformation is cleaner",
+                output.locator_hint
+            )
+        } else {
+            format!(
+                "Prepare the rows for {} and choose the clearest local write path",
+                output.locator_hint
+            )
+        });
+    }
+
+    None
+}
+
 fn classify_locator_kind(locator: &str) -> String {
     Path::new(locator)
         .extension()
@@ -624,6 +716,13 @@ fn is_file_like_hint(hint: &str) -> bool {
             | "pdf"
             | "csv"
             | "tsv"
+            | "xlsx"
+            | "xls"
+            | "docx"
+            | "pages"
+            | "png"
+            | "jpg"
+            | "jpeg"
             | "json"
             | "toml"
             | "yaml"
@@ -678,6 +777,125 @@ fn describe_output_result(intent: OutputIntent) -> &'static str {
 
 fn output_intent_needs_current_content(intent: OutputIntent) -> bool {
     matches!(intent, OutputIntent::Modify | OutputIntent::Append)
+}
+
+fn output_mapping_gap(state: &TaskLoopState, output: &RequestedOutput) -> bool {
+    if state.step_index < 2 {
+        return false;
+    }
+
+    let normalized_hint = normalize_locator(&output.locator_hint);
+    !state.recent_action_summaries.iter().any(|summary| {
+        summary.action.starts_with("write_file:")
+            || summary.action.starts_with("append_file:")
+            || (summary.action.starts_with("run_command:")
+                && summary.artifact_refs.iter().any(|artifact| {
+                    normalize_locator(&artifact.locator).contains(&normalized_hint)
+                        && artifact.status == "command_changed"
+                }))
+    })
+}
+
+fn unsupported_input_blockers(shape: &TaskShape) -> Vec<String> {
+    shape.required_inputs
+        .iter()
+        .filter(|input| !input_kind_supported(input))
+        .map(|input| {
+            format!(
+                "unsupported source type: {} ({})",
+                input.locator_hint, input.kind
+            )
+        })
+        .collect()
+}
+
+fn input_kind_supported(input: &RequiredInput) -> bool {
+    matches!(
+        input.kind.as_str(),
+        "txt"
+            | "md"
+            | "pdf"
+            | "csv"
+            | "tsv"
+            | "json"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "rs"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "py"
+            | "sh"
+            | "sql"
+            | "file"
+    )
+}
+
+fn output_kind_supported(output: &RequestedOutput) -> bool {
+    matches!(
+        output.kind.as_str(),
+        "txt" | "md" | "csv" | "tsv" | "file"
+    )
+}
+
+fn ambiguous_source_mapping(state: &TaskLoopState, output: &RequestedOutput) -> bool {
+    if state.step_index < 2 {
+        return false;
+    }
+
+    let ingested_source_count = state
+        .working_sources
+        .iter()
+        .filter(|source| {
+            matches!(
+                source.status.as_str(),
+                "read" | "excerpted" | "ingested" | "matched_text"
+            ) && source.role != "generated"
+        })
+        .count();
+    let normalized_hint = normalize_locator(&output.locator_hint);
+    let has_write_attempt = state.recent_action_summaries.iter().any(|summary| {
+        summary.action.starts_with("write_file:")
+            || summary.action.starts_with("append_file:")
+            || (summary.action.starts_with("run_command:")
+                && summary.artifact_refs.iter().any(|artifact| {
+                    normalize_locator(&artifact.locator).contains(&normalized_hint)
+                        && artifact.status == "command_changed"
+                }))
+    });
+
+    ingested_source_count > 1 && !has_write_attempt
+}
+
+fn recent_output_failure_reason(state: &TaskLoopState, output: &RequestedOutput) -> Option<String> {
+    let normalized_hint = normalize_locator(&output.locator_hint);
+    state.avoid_rules
+        .iter()
+        .rev()
+        .find(|rule| {
+            rule.label.starts_with("write_file:")
+                || rule.label.starts_with("append_file:")
+                || rule.label.starts_with("run_command:")
+        })
+        .map(|rule| {
+            if rule.label.starts_with("run_command:") {
+                format!(
+                    "command-assisted output path recently failed for {}: {}",
+                    output.locator_hint, rule.reason
+                )
+            } else if normalize_locator(&rule.label).contains(&normalized_hint) {
+                format!(
+                    "write or verification recently failed for {}: {}",
+                    output.locator_hint, rule.reason
+                )
+            } else {
+                format!(
+                    "recent output-path failure may still block {}: {}",
+                    output.locator_hint, rule.reason
+                )
+            }
+        })
 }
 
 fn uppercase_first(value: &str) -> String {

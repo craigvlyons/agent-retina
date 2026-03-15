@@ -48,6 +48,15 @@ Implemented:
   so output verification has more exact local evidence than a generic “write succeeded”
 - command-assisted output flows can now verify target artifacts when `run_command` names a target path
 - command-side file changes now enter task state as generated artifacts instead of disappearing into a generic command result
+- output frontiers now surface soft strategy hints such as:
+  - prefer direct `write_file` for small local text/markdown outputs when evidence is ready
+  - allow either direct write or `run_command` for small structured csv/tsv outputs
+- output frontiers now surface an explicit blocker when evidence is already ingested but still has not been mapped into the requested artifact
+- output frontiers now surface explicit blocker classes for:
+  - unsupported source type
+  - unsupported output type
+  - ambiguous source mapping once evidence is ingested
+  - recent write or verification failure on the output path
 - operator/task-state rendering now shows output artifact state directly
 - regression coverage exists for:
   - output artifact state appearing in assembled task state
@@ -58,14 +67,18 @@ Implemented:
   - structured-input tasks creating CSV output artifacts
   - command-assisted modification tasks verifying changed target artifacts
   - command-assisted structured-output tasks verifying created CSV artifacts
+  - text-output frontiers preferring direct write once evidence is ready
+  - csv-output frontiers allowing either direct write or command-assisted generation when evidence is ready
+  - unsupported source types surfacing explicit blockers
+  - unsupported output types surfacing explicit blockers
+  - ambiguous source mapping surfacing explicit blockers
+  - recent output failure surfacing explicit blockers
 
 Still left in this plan:
 - stronger multi-source synthesis context beyond the first compact source/output block
-- clearer command/script selection quality for real edit/update tasks once the harness can verify both direct writes and command-assisted outputs
-- clearer synthesis-aware failure surfaces
 - broader output-task acceptance coverage such as:
-  - choosing when command/script-assisted modification is actually better than direct write
-  - choosing when command/script-assisted generation of structured outputs is actually better than direct write
+  - command-assisted append flows
+  - broader verification coverage on additional output classes
 
 ## Research Basis
 
@@ -162,8 +175,8 @@ Status:
   - write results now preserve create-vs-overwrite-vs-append semantics for verification and memory
   - command-assisted output flows can now preserve changed target paths as verified generated artifacts
 Still left:
-- better decision quality for when to use direct write vs command/script-assisted output paths
 - broader regression coverage for command-assisted append flows
+- deeper decision quality for harder transformations, not just small local text/csv outputs
 
 ### Phase U3.4: output verification and completion
 
@@ -194,7 +207,12 @@ If synthesis is blocked, the worker should say why:
 The failure should still preserve gathered evidence and working state.
 
 Status:
-- not started as a distinct pass
+- started:
+  - output frontiers can now say when evidence is ingested but not yet mapped into the requested artifact
+  - output frontiers now surface explicit blockers for unsupported source/output types, ambiguous mapping, and recent write/verification failure
+Still left:
+- broader acceptance coverage for append-style and other multi-step output failures
+- any future blocker classes real usage proves we need
 
 ## Implementation Tasks
 
@@ -209,6 +227,7 @@ Status:
   - create a CSV-like output from extracted data
   - distinguish created vs overwritten outputs in task-state evidence
   - preserve command-assisted target paths in task-state evidence
+  - explicit blocker classes for unsupported or ambiguous output situations
 
 ## Acceptance Tests
 
@@ -216,6 +235,8 @@ Status:
 - The worker can update an existing text file from gathered local evidence and preserve that it was overwritten rather than newly created.
 - The worker can ingest structured data and produce a CSV-like output artifact.
 - The worker can use `run_command` with a named target path and still verify that the requested artifact changed.
+- The worker can surface a real blocker when the requested input or output type is unsupported.
+- The worker can surface a real blocker when evidence is ingested but source-to-output mapping is still ambiguous.
 - A task requesting a named output file is only complete when that file exists or a real blocker is surfaced.
 - Task state shows the produced artifact clearly.
 - Output verification is recorded in the timeline.
@@ -234,8 +255,7 @@ This plan is done when the worker can reliably produce new local text/markdown/C
 ## Resume Point
 
 If we continue `u3`, the next best step is:
-- improve decision quality so the worker can choose between direct writes and command/script-based edits for the right reasons once the evidence is ready
 - add regression coverage for:
   - command-assisted append flows
-  - modify tasks where direct write is better than a command path
-- improve synthesis-aware blocker output when evidence is present but not yet mapped cleanly into the requested artifact
+  - broader verification on additional output classes
+- do a real end-to-end local smoke run of the strongest U3 paths before deciding whether to close U3

@@ -120,6 +120,8 @@ Planning rules:\n\
 - If task_state includes a requested output intent such as create, modify, append, or overwrite, preserve that intent when choosing the next step and when deciding whether the task is complete.\n\
 - For modify or append tasks, if the current content of the target artifact matters and has not been ingested yet, ingest it before changing it.\n\
 - If you use run_command to create or modify a specific artifact, set path to the target file so the harness can verify the change.\n\
+- For small local text or markdown outputs, prefer direct file writes when the evidence is already ready; use run_command when a shell transformation is clearly the cleaner local path.\n\
+- For structured outputs such as csv/tsv, direct write is fine for small row sets, but run_command is appropriate when a shell pipeline or script is the clearer transformation path.\n\
 - Use whichever action gives the clearest verifiable progress: structured file actions, document extraction, or run_command for local shell pipelines, text processing, or small local scripts.\n\
 - Use ingest_structured_data for CSV/TSV-style local data when headers, rows, or sample records matter more than plain prose.\n\
 - Prefer readable text sources such as .md, .txt, code, and config files when multiple candidates could answer the task.\n\

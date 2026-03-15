@@ -773,6 +773,85 @@ fn edit_style_task_infers_existing_file_as_requested_output() {
 }
 
 #[test]
+fn append_style_task_infers_output_target_in_nested_path() {
+    let shape = infer_task_shape(
+        "in your working directory look for startup.md and append a short note about it in a temp/worker_notes.md file also in the working directory",
+        &TaskLoopState::new(7),
+    );
+
+    assert_eq!(shape.kind, TaskKind::Output);
+    assert_eq!(
+        shape
+            .requested_output
+            .as_ref()
+            .map(|output| output.locator_hint.as_str()),
+        Some("temp/worker_notes.md")
+    );
+    assert_eq!(
+        shape
+            .requested_output
+            .as_ref()
+            .map(|output| output.intent.clone()),
+        Some(OutputIntent::Append)
+    );
+    assert_eq!(shape.required_inputs.len(), 1);
+    assert_eq!(shape.required_inputs[0].locator_hint, "startup.md");
+}
+
+#[test]
+fn append_task_with_missing_target_does_not_require_current_content() {
+    let mut state = TaskLoopState::new(8);
+    state.step_index = 3;
+    state.working_sources = vec![
+        WorkingSource {
+            locator: "startup.md".to_string(),
+            kind: "file".to_string(),
+            role: "authoritative".to_string(),
+            status: "read".to_string(),
+            why_it_matters: "source".to_string(),
+            last_used_step: 2,
+            evidence_refs: vec!["startup.md".to_string()],
+            page_reference: None,
+            extraction_method: Some("text_read".to_string()),
+            structured_summary: None,
+        },
+        WorkingSource {
+            locator: "temp/worker_notes.md".to_string(),
+            kind: "path".to_string(),
+            role: "supporting".to_string(),
+            status: "inspected".to_string(),
+            why_it_matters: "observed while inspecting target path".to_string(),
+            last_used_step: 3,
+            evidence_refs: vec!["temp/worker_notes.md".to_string()],
+            page_reference: None,
+            extraction_method: None,
+            structured_summary: None,
+        },
+    ];
+    state.artifact_references = vec![ArtifactReference {
+        locator: "temp/worker_notes.md".to_string(),
+        kind: "path".to_string(),
+        status: "inspected".to_string(),
+    }];
+
+    let shape = infer_task_shape(
+        "in your working directory look for startup.md and append a short note about it in a temp/worker_notes.md file also in the working directory",
+        &state,
+    );
+    let output = must_some(shape.requested_output.clone(), "expected output target");
+    assert!(!output.exists);
+
+    let (open_questions, blockers, next_action_hint) = build_task_frontier(&shape, None, &state);
+
+    assert!(!open_questions.iter().any(|item| item.contains("current content of temp/worker_notes.md")));
+    assert!(!blockers.iter().any(|item| item.contains("requested append target has not been ingested")));
+    assert!(matches!(
+        next_action_hint.as_deref(),
+        Some(value) if value.contains("temp/worker_notes.md")
+    ));
+}
+
+#[test]
 fn modify_task_frontier_requests_current_target_content() {
     let shape = infer_task_shape(
         "update startup.md using testing.md and save the revised startup.md",
@@ -788,6 +867,198 @@ fn modify_task_frontier_requests_current_target_content() {
         Some(value) if value.contains("testing.md")
     ));
     assert!(blockers.iter().any(|item| item.contains("testing.md")));
+}
+
+#[test]
+fn text_output_frontier_prefers_direct_write_when_evidence_is_ready() {
+    let mut state = TaskLoopState::new(6);
+    state.step_index = 2;
+    state.working_sources = vec![
+        WorkingSource {
+            locator: "startup.md".to_string(),
+            kind: "file".to_string(),
+            role: "authoritative".to_string(),
+            status: "read".to_string(),
+            why_it_matters: "input".to_string(),
+            last_used_step: 1,
+            evidence_refs: vec!["startup.md".to_string()],
+            page_reference: None,
+            extraction_method: Some("text_read".to_string()),
+            structured_summary: None,
+        },
+        WorkingSource {
+            locator: "testing.md".to_string(),
+            kind: "file".to_string(),
+            role: "authoritative".to_string(),
+            status: "read".to_string(),
+            why_it_matters: "input".to_string(),
+            last_used_step: 2,
+            evidence_refs: vec!["testing.md".to_string()],
+            page_reference: None,
+            extraction_method: Some("text_read".to_string()),
+            structured_summary: None,
+        },
+    ];
+    let shape = infer_task_shape(
+        "use startup.md and testing.md to create summary.md",
+        &state,
+    );
+
+    let (_open_questions, blockers, next_action_hint) = build_task_frontier(&shape, None, &state);
+
+    assert!(matches!(
+        next_action_hint.as_deref(),
+        Some(value) if value.contains("summary.md") && value.contains("write_file")
+    ));
+    assert!(
+        blockers
+            .iter()
+            .any(|item| item.contains("not yet mapped into the requested artifact"))
+    );
+}
+
+#[test]
+fn csv_output_frontier_allows_direct_write_or_command_when_data_is_ready() {
+    let mut state = TaskLoopState::new(6);
+    state.step_index = 2;
+    state.working_sources = vec![WorkingSource {
+        locator: "people.csv".to_string(),
+        kind: "structured_data".to_string(),
+        role: "authoritative".to_string(),
+        status: "ingested".to_string(),
+        why_it_matters: "input".to_string(),
+        last_used_step: 1,
+        evidence_refs: vec!["people.csv".to_string()],
+        page_reference: None,
+        extraction_method: Some("mock_structured_read".to_string()),
+        structured_summary: Some(StructuredSourceSummary {
+            headers: vec!["name".to_string(), "value".to_string()],
+            sample_rows: 1,
+            total_rows: 1,
+        }),
+    }];
+    let shape = infer_task_shape("use people.csv to create people_summary.csv", &state);
+
+    let (_open_questions, _blockers, next_action_hint) = build_task_frontier(&shape, None, &state);
+
+    assert!(matches!(
+        next_action_hint.as_deref(),
+        Some(value)
+            if value.contains("people_summary.csv")
+                && value.contains("write_file")
+                && value.contains("run_command")
+    ));
+}
+
+#[test]
+fn unsupported_output_type_surfaces_explicit_blocker() {
+    let shape = infer_task_shape(
+        "use dominican.txt to create filled_form.pdf",
+        &TaskLoopState::new(6),
+    );
+
+    let (_open_questions, blockers, _next_action_hint) =
+        build_task_frontier(&shape, None, &TaskLoopState::new(6));
+
+    assert!(
+        blockers
+            .iter()
+            .any(|item| item.contains("unsupported output type") && item.contains("filled_form.pdf"))
+    );
+}
+
+#[test]
+fn unsupported_source_type_surfaces_explicit_blocker() {
+    let shape = infer_task_shape(
+        "use payroll.xlsx to create summary.md",
+        &TaskLoopState::new(6),
+    );
+
+    let (_open_questions, blockers, _next_action_hint) =
+        build_task_frontier(&shape, None, &TaskLoopState::new(6));
+
+    assert!(
+        blockers
+            .iter()
+            .any(|item| item.contains("unsupported source type") && item.contains("payroll.xlsx"))
+    );
+}
+
+#[test]
+fn ambiguous_source_mapping_surfaces_explicit_blocker() {
+    let mut state = TaskLoopState::new(6);
+    state.step_index = 3;
+    state.working_sources = vec![
+        WorkingSource {
+            locator: "dominican.txt".to_string(),
+            kind: "file".to_string(),
+            role: "authoritative".to_string(),
+            status: "read".to_string(),
+            why_it_matters: "source".to_string(),
+            last_used_step: 1,
+            evidence_refs: vec!["dominican.txt".to_string()],
+            page_reference: None,
+            extraction_method: Some("text_read".to_string()),
+            structured_summary: None,
+        },
+        WorkingSource {
+            locator: "people.csv".to_string(),
+            kind: "structured_data".to_string(),
+            role: "authoritative".to_string(),
+            status: "ingested".to_string(),
+            why_it_matters: "source".to_string(),
+            last_used_step: 2,
+            evidence_refs: vec!["people.csv".to_string()],
+            page_reference: None,
+            extraction_method: Some("mock_structured_read".to_string()),
+            structured_summary: Some(StructuredSourceSummary {
+                headers: vec!["name".to_string(), "value".to_string()],
+                sample_rows: 1,
+                total_rows: 1,
+            }),
+        },
+    ];
+    let shape = infer_task_shape(
+        "use dominican.txt and people.csv to create output.md",
+        &state,
+    );
+
+    let (_open_questions, blockers, _next_action_hint) = build_task_frontier(&shape, None, &state);
+
+    assert!(
+        blockers
+            .iter()
+            .any(|item| item.contains("ambiguous source mapping") && item.contains("output.md"))
+    );
+}
+
+#[test]
+fn recent_output_failure_surfaces_explicit_blocker() {
+    let mut state = TaskLoopState::new(6);
+    state.step_index = 3;
+    state.working_sources = vec![WorkingSource {
+        locator: "dominican.txt".to_string(),
+        kind: "file".to_string(),
+        role: "authoritative".to_string(),
+        status: "read".to_string(),
+        why_it_matters: "source".to_string(),
+        last_used_step: 1,
+        evidence_refs: vec!["dominican.txt".to_string()],
+        page_reference: None,
+        extraction_method: Some("text_read".to_string()),
+        structured_summary: None,
+    }];
+    state.avoid_rules = vec![AvoidRule {
+        label: "write_file:output.md".to_string(),
+        reason: "verification failed because content did not change".to_string(),
+    }];
+    let shape = infer_task_shape("use dominican.txt to create output.md", &state);
+
+    let (_open_questions, blockers, _next_action_hint) = build_task_frontier(&shape, None, &state);
+
+    assert!(blockers.iter().any(|item| {
+        item.contains("write or verification recently failed") && item.contains("output.md")
+    }));
 }
 
 #[test]
