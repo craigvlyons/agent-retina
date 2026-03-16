@@ -22,7 +22,9 @@ pub use tasking::*;
 
 #[cfg(test)]
 mod tests {
-    use crate::{Action, ActionId, HashScope, PrivilegedCommandKind, classify_privileged_command};
+    use crate::{
+        Action, ActionId, HashScope, PrivilegedCommandKind, classify_privileged_command,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -63,5 +65,11 @@ mod tests {
 
         assert!(delete.approval_required_by_policy());
         assert!(!write.approval_required_by_policy());
+    }
+
+    #[test]
+    fn task_state_defaults_to_no_intent_hint() {
+        let state = crate::TaskState::default();
+        assert!(state.intent_hint.is_none());
     }
 }

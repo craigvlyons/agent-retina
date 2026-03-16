@@ -366,9 +366,13 @@ mod tests {
     #[test]
     fn command_execution_captures_output() {
         let shell = CliShell::new();
+        #[cfg(unix)]
+        let command = "printf 'hello'";
+        #[cfg(windows)]
+        let command = "[Console]::Out.Write('hello')";
         let result = must(shell.execute(&Action::RunCommand {
             id: ActionId::new(),
-            command: "printf 'hello'".to_string(),
+            command: command.to_string(),
             cwd: None,
             require_approval: false,
             expect_change: false,
@@ -409,11 +413,15 @@ mod tests {
             thread::sleep(Duration::from_millis(100));
             cancel_handle.request_cancel();
         });
+        #[cfg(unix)]
+        let command = "sleep 5";
+        #[cfg(windows)]
+        let command = "Start-Sleep -Seconds 5";
 
         let result = must(shell.execute_controlled(
             &Action::RunCommand {
                 id: ActionId::new(),
-                command: "sleep 5".to_string(),
+                command: command.to_string(),
                 cwd: None,
                 require_approval: false,
                 expect_change: false,

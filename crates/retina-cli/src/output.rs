@@ -192,52 +192,6 @@ pub fn render_timeline_event(event: &TimelineEvent) -> String {
 }
 
 pub fn render_task_state(task_state: &TaskState) -> String {
-    let required_inputs = if task_state.shape.required_inputs.is_empty() {
-        "(none)".to_string()
-    } else {
-        task_state
-            .shape
-            .required_inputs
-            .iter()
-            .map(|input| format!("- {} [{}|{}]", input.locator_hint, input.kind, input.status))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let requested_output = task_state
-        .shape
-        .requested_output
-        .as_ref()
-        .map(|output| {
-            format!(
-                "{} [{}|intent={}|exists={}|verified={}]",
-                output.locator_hint, output.kind, output.intent, output.exists, output.verified
-            )
-        })
-        .unwrap_or_else(|| "(none)".to_string());
-    let output_artifact = task_state
-        .output_artifact
-        .as_ref()
-        .map(|artifact| {
-            format!(
-                "{} [{}|intent={}|exists={}|current_content_ingested={}|written_this_run={}|verified={}|last_write_step={}|last_write_action={}]",
-                artifact.locator_hint,
-                artifact.kind,
-                artifact.intent,
-                artifact.exists,
-                artifact.current_content_ingested,
-                artifact.written_this_run,
-                artifact.verified,
-                artifact
-                    .last_write_step
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "none".to_string()),
-                artifact
-                    .last_write_action
-                    .clone()
-                    .unwrap_or_else(|| "none".to_string())
-            )
-        })
-        .unwrap_or_else(|| "(none)".to_string());
     let open_questions = if task_state.frontier.open_questions.is_empty() {
         "(none)".to_string()
     } else {
@@ -325,18 +279,18 @@ pub fn render_task_state(task_state: &TaskState) -> String {
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "goal: {}\nkind: {}\nphase: {}\nstep: {} / {}\nrequired_inputs: {} / {}\noutput_written: {}\noutput_verified: {}\noutput_target: {}\noutput_artifact: {}\nnext: {}\nopen_questions:\n{}\nblockers:\n{}\n\nrequired_source_set:\n{}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
+        "goal: {}\nintent_hint: {}\nphase: {}\nstep: {} / {}\noutput_written: {}\noutput_verified: {}\nnext: {}\nopen_questions:\n{}\nblockers:\n{}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
         task_state.goal.objective,
-        task_state.shape.kind,
+        task_state
+            .intent_hint
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "none".to_string()),
         task_state.progress.current_phase,
         task_state.progress.current_step,
         task_state.progress.max_steps,
-        task_state.progress.satisfied_inputs,
-        task_state.progress.required_inputs,
         task_state.progress.output_written,
         task_state.progress.output_verified,
-        requested_output,
-        output_artifact,
         task_state
             .frontier
             .next_action_hint
@@ -352,7 +306,6 @@ pub fn render_task_state(task_state: &TaskState) -> String {
         } else {
             format!("- {blockers}")
         },
-        required_inputs,
         sources,
         artifacts,
         compaction
@@ -437,13 +390,14 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .get("task_state")
             .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
             .map(|task_state| {
-                let output = task_state
-                    .shape
-                    .requested_output
-                    .as_ref()
-                    .map(|output| output.locator_hint.clone())
-                    .unwrap_or_else(|| "none".to_string());
-                format!("shape: {} -> {}", task_state.shape.kind, output)
+                format!(
+                    "intent: {}",
+                    task_state
+                        .intent_hint
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "none".to_string())
+                )
             }),
         TimelineEventType::TaskStepCompleted => event
             .payload_json
@@ -730,18 +684,11 @@ mod tests {
                 max_steps: 6,
                 completed_checkpoints: vec![],
                 verified_facts: vec![],
-                satisfied_inputs: 1,
-                required_inputs: 2,
                 output_written: false,
                 output_verified: false,
             },
-            output_artifact: None,
-            shape: TaskShape {
-                kind: TaskKind::Output,
-                required_inputs: vec![],
-                requested_output: None,
-                success_markers: vec![],
-            },
+            intent_hint: Some(TaskKind::Output),
+            reasoner_framing: None,
             frontier: TaskFrontier {
                 open_questions: vec!["Need to gather the PDF text".to_string()],
                 blockers: vec!["required input still not ingested: dominican_Med.pdf".to_string()],

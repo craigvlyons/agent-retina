@@ -16,11 +16,12 @@ pub(crate) struct TaskLoopState {
     pub(crate) working_sources: Vec<WorkingSource>,
     pub(crate) artifact_references: Vec<ArtifactReference>,
     pub(crate) avoid_rules: Vec<AvoidRule>,
+    pub(crate) last_reasoner_framing: Option<ReasonerTaskFraming>,
     pub(crate) compaction_count: usize,
     pub(crate) last_compaction_reason: Option<String>,
     pub(crate) last_compaction_snapshot: Option<CompactionSnapshot>,
     seen_signatures: HashMap<String, usize>,
-    low_value_output_discovery_steps: usize,
+    low_value_discovery_steps: usize,
 }
 
 impl TaskLoopState {
@@ -34,11 +35,12 @@ impl TaskLoopState {
             working_sources: Vec::new(),
             artifact_references: Vec::new(),
             avoid_rules: Vec::new(),
+            last_reasoner_framing: None,
             compaction_count: 0,
             last_compaction_reason: None,
             last_compaction_snapshot: None,
             seen_signatures: HashMap::new(),
-            low_value_output_discovery_steps: 0,
+            low_value_discovery_steps: 0,
         }
     }
 
@@ -141,23 +143,24 @@ impl TaskLoopState {
                 | Action::FindFiles { .. }
                 | Action::SearchText { .. }
         );
-        let inputs_ready = task_state.progress.required_inputs == 0
-            || task_state.progress.required_inputs == task_state.progress.satisfied_inputs;
+        let has_any_evidence = !task_state.working_sources.is_empty()
+            || !task_state.artifact_references.is_empty()
+            || !task_state.progress.verified_facts.is_empty();
         let should_count = discovery_action
-            && inputs_ready
+            && has_any_evidence
             && task_state_needs_terminal_result(task_state)
-            && matches!(
-                task_state.shape.kind,
-                TaskKind::Answer | TaskKind::Transform | TaskKind::Output
-            );
+            && task_state
+                .recent_actions
+                .iter()
+                .any(|summary| !summary.action.starts_with("respond:"));
 
         if should_count {
-            self.low_value_output_discovery_steps += 1;
+            self.low_value_discovery_steps += 1;
         } else {
-            self.low_value_output_discovery_steps = 0;
+            self.low_value_discovery_steps = 0;
         }
 
-        self.low_value_output_discovery_steps > 1
+        self.low_value_discovery_steps > 1
     }
 
     pub(crate) fn apply_live_compaction(&mut self) -> Option<CompactionDecision> {

@@ -220,6 +220,7 @@ impl MockReasoner {
         Self::for_response(ReasonResponse {
             action,
             task_complete: true,
+            framing: None,
             reasoning: Some("mock reasoning".to_string()),
             tokens_used: TokenUsage {
                 input_tokens: 10,
@@ -255,6 +256,7 @@ impl Reasoner for MockReasoner {
                     message: "mock response".to_string(),
                 },
                 task_complete: true,
+                framing: None,
                 reasoning: Some("mock reasoning".to_string()),
                 tokens_used: TokenUsage {
                     input_tokens: 10,
@@ -591,3 +593,4 @@ pub fn sample_knowledge() -> KnowledgeNode {
         metadata: json!({}),
     }
 }
+

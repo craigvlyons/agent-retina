@@ -1,4 +1,4 @@
-use crate::{Action, AgentId, TaskState};
+use crate::{Action, AgentId, TaskKind, TaskState};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -77,8 +77,17 @@ pub struct ReasonRequest {
 pub struct ReasonResponse {
     pub action: Action,
     pub task_complete: bool,
+    #[serde(default)]
+    pub framing: Option<ReasonerTaskFraming>,
     pub reasoning: Option<String>,
     pub tokens_used: TokenUsage,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReasonerTaskFraming {
+    pub intent_kind: Option<TaskKind>,
+    pub deliverable: Option<String>,
+    pub completion_basis: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

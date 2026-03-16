@@ -154,19 +154,17 @@ mod tests {
                             success_criteria: Vec::new(),
                             constraints: Vec::new(),
                         },
-                        shape: TaskShape::default(),
+                        intent_hint: None,
+                        reasoner_framing: None,
                         progress: TaskProgress {
                             current_phase: "starting".to_string(),
                             current_step: 1,
                             max_steps: 4,
                             completed_checkpoints: Vec::new(),
                             verified_facts: Vec::new(),
-                            required_inputs: 0,
-                            satisfied_inputs: 0,
                             output_written: false,
                             output_verified: false,
                         },
-                        output_artifact: None,
                         frontier: TaskFrontier {
                             next_action_hint: None,
                             open_questions: Vec::new(),
@@ -330,9 +328,97 @@ mod tests {
         let instructions = build_stable_instructions(false);
         assert!(instructions.contains("best next verifiable step"));
         assert!(instructions.contains("target those artifacts directly"));
+        assert!(instructions.contains("the harness can verify the change"));
+        assert!(instructions.contains("keep root as a real directory path"));
+        assert!(instructions.contains("Desktop plus a PDF name"));
         assert!(!instructions.contains("smallest useful next step"));
         assert!(!instructions.contains("Prefer structured filesystem actions over shell commands"));
         assert!(!instructions.contains("Only use run_command for an explicit shell command"));
+    }
+
+    #[test]
+    fn answer_task_payload_no_longer_serializes_required_input_hints() {
+        let request = ReasonRequest {
+            context: AssembledContext {
+                identity: "retina".to_string(),
+                task: "read the Patent Center.pdf on Desktop and tell me what it's about"
+                    .to_string(),
+                task_state: TaskState {
+                    goal: TaskGoal {
+                        objective: "read the Patent Center.pdf on Desktop and tell me what it's about"
+                            .to_string(),
+                        success_criteria: vec![
+                            "final response is grounded in gathered evidence".to_string()
+                        ],
+                        constraints: Vec::new(),
+                    },
+                    intent_hint: Some(TaskKind::Answer),
+                    reasoner_framing: None,
+                    progress: TaskProgress {
+                        current_phase: "planning".to_string(),
+                        current_step: 1,
+                        max_steps: 6,
+                        completed_checkpoints: Vec::new(),
+                        verified_facts: Vec::new(),
+                        output_written: false,
+                        output_verified: false,
+                    },
+                    frontier: TaskFrontier {
+                        next_action_hint: Some("Verify the best Desktop path candidate for Patent Center.pdf".to_string()),
+                        open_questions: vec![
+                            "Need evidence from Patent Center.pdf before a grounded answer can be returned".to_string(),
+                        ],
+                        blockers: Vec::new(),
+                    },
+                    recent_actions: Vec::new(),
+                    working_sources: Vec::new(),
+                    artifact_references: Vec::new(),
+                    avoid: Vec::new(),
+                    compaction: None,
+                },
+                tools: Vec::new(),
+                memory_slice: Vec::new(),
+                last_result: None,
+                last_result_summary: None,
+                recent_steps: Vec::new(),
+                operator_guidance: None,
+                current_step: 1,
+                max_steps: 6,
+            },
+            tools: Vec::new(),
+            constraints: Vec::new(),
+            max_tokens: Some(256),
+        };
+
+        let payload = build_payload(
+            "claude-sonnet-4-6",
+            &request,
+            false,
+            &ClaudePromptCaching { enabled: false },
+            &ClaudeContextManagement {
+                tool_result_clearing_enabled: false,
+                tool_result_trigger_tokens: 90_000,
+                server_side_compaction_enabled: false,
+                compaction_trigger_tokens: 120_000,
+            },
+        );
+
+        let content = must_some(
+            payload
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|messages| messages.first())
+                .and_then(|message| message.get("content"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|content| content.first())
+                .and_then(|block| block.get("text"))
+                .and_then(serde_json::Value::as_str),
+            "payload text block",
+        );
+        assert!(content.contains("Observed state snapshot"));
+        assert!(content.contains("output_written"));
+        assert!(!content.contains("- required inputs:"));
+        assert!(!content.contains("named source hints"));
     }
 
     #[test]
@@ -360,6 +446,9 @@ mod tests {
             note: None,
             message: None,
             task_complete: Some(false),
+            intent_kind: None,
+            deliverable: None,
+            completion_basis: None,
             reasoning: None,
         }
         .into_reason_response();
@@ -386,6 +475,9 @@ mod tests {
             note: None,
             message: None,
             task_complete: Some(false),
+            intent_kind: None,
+            deliverable: None,
+            completion_basis: None,
             reasoning: None,
         }
         .into_reason_response();
@@ -425,6 +517,9 @@ mod tests {
             note: None,
             message: None,
             task_complete: Some(false),
+            intent_kind: None,
+            deliverable: None,
+            completion_basis: None,
             reasoning: None,
         }
         .into_reason_response();
@@ -443,4 +538,46 @@ mod tests {
             other => panic!("expected run_command action, got {other:?}"),
         }
     }
+
+    #[test]
+    fn claude_action_can_map_reasoner_framing_fields() {
+        let response = ClaudeAction {
+            action_type: "respond".to_string(),
+            command: None,
+            path: None,
+            root: None,
+            pattern: None,
+            query: None,
+            content: None,
+            include_content: None,
+            recursive: None,
+            max_entries: None,
+            max_results: None,
+            max_bytes: None,
+            max_rows: None,
+            max_chars: None,
+            page_start: None,
+            page_end: None,
+            overwrite: None,
+            require_approval: None,
+            expect_change: None,
+            note: None,
+            message: Some("done".to_string()),
+            task_complete: Some(true),
+            intent_kind: Some("answer".to_string()),
+            deliverable: Some("summary of startup.md".to_string()),
+            completion_basis: Some("read startup.md and extracted relevant lines".to_string()),
+            reasoning: Some("responding from gathered evidence".to_string()),
+        }
+        .into_reason_response();
+
+        let framing = response.framing.expect("expected framing");
+        assert_eq!(framing.intent_kind, Some(TaskKind::Answer));
+        assert_eq!(framing.deliverable.as_deref(), Some("summary of startup.md"));
+        assert_eq!(
+            framing.completion_basis.as_deref(),
+            Some("read startup.md and extracted relevant lines")
+        );
+    }
 }
+

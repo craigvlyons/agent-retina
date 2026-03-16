@@ -58,10 +58,25 @@ impl CliShell {
 }
 
 fn build_shell_command(command: &str, workdir: &Path) -> Result<Command> {
-    let mut process = Command::new("sh");
+    #[cfg(unix)]
+    let mut process = {
+        let mut process = Command::new("sh");
+        process.arg("-lc").arg(command);
+        process
+    };
+
+    #[cfg(windows)]
+    let mut process = {
+        let mut process = Command::new("powershell");
+        process
+            .arg("-NoProfile")
+            .arg("-NonInteractive")
+            .arg("-Command")
+            .arg(command);
+        process
+    };
+
     process
-        .arg("-lc")
-        .arg(command)
         .current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

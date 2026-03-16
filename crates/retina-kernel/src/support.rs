@@ -7,6 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 pub(crate) struct StepDecision {
     pub(crate) action: Action,
     pub(crate) task_complete: bool,
+    pub(crate) framing: Option<ReasonerTaskFraming>,
 }
 
 pub(crate) struct StepSelectionContext<'a> {

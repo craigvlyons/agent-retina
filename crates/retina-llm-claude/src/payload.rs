@@ -95,6 +95,9 @@ Choose exactly one action and return strict JSON with these fields:\n\
 - note\n\
 - message\n\
 - task_complete\n\
+- intent_kind\n\
+- deliverable\n\
+- completion_basis\n\
 - reasoning\n\
 \n\
 Supported action types:\n\
@@ -113,34 +116,29 @@ Supported action types:\n\
 \n\
 Planning rules:\n\
 - The harness is your body. Explore through shell actions instead of guessing.\n\
-- Treat the task state artifact as the canonical compact continuity record for this task.\n\
-- Respect the task shape in task_state. Discovery tasks, answer tasks, transform tasks, and output tasks should be handled differently.\n\
 - Choose the best next verifiable step that most reduces uncertainty or advances the requested result.\n\
 - If the task already names likely source files, directories, or output paths, target those artifacts directly instead of broad parent-directory listing unless location is genuinely uncertain.\n\
-- If task_state includes a requested output intent such as create, modify, append, or overwrite, preserve that intent when choosing the next step and when deciding whether the task is complete.\n\
-- For modify or append tasks, if the current content of the target artifact matters and has not been ingested yet, ingest it before changing it.\n\
 - If you use run_command to create or modify a specific artifact, set path to the target file so the harness can verify the change.\n\
-- For small local text or markdown outputs, prefer direct file writes when the evidence is already ready; use run_command when a shell transformation is clearly the cleaner local path.\n\
-- For structured outputs such as csv/tsv, direct write is fine for small row sets, but run_command is appropriate when a shell pipeline or script is the clearer transformation path.\n\
 - Use whichever action gives the clearest verifiable progress: structured file actions, document extraction, or run_command for local shell pipelines, text processing, or small local scripts.\n\
 - Use ingest_structured_data for CSV/TSV-style local data when headers, rows, or sample records matter more than plain prose.\n\
 - Prefer readable text sources such as .md, .txt, code, and config files when multiple candidates could answer the task.\n\
 - Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
 - If the task asks for specific PDF pages, set page_start and page_end so the shell extracts only that page range.\n\
+- For find_files, keep root as a real directory path and keep pattern limited to a filename or glob; do not pack path fragments into pattern.\n\
+- For search_text, keep root as the directory scope and keep query limited to search terms; do not combine them into one field.\n\
 - When a prior result already includes likely candidate paths, choose the best next ingest, transform, or write step instead of searching again.\n\
+- When a task names a likely alias-plus-filename target such as Desktop plus a PDF name, prefer verifying that exact candidate path before broad recursive search.\n\
 - When the last result already contains enough evidence to answer the user, respond directly instead of repeating exploration.\n\
 - If multiple files match, prefer the shallowest and most human-readable candidate unless the task explicitly asks for another one.\n\
 - If the user asks a question about content, gather the evidence first and then finish with respond once you can answer directly.\n\
 - If the last result already gave enough evidence, do not repeat the same exploratory step.\n\
-- If a request genuinely needs discovery first, choose the exploratory action and set task_complete=false.\n\
 - Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
-- For transform or output tasks, do not mark task_complete=true while required inputs remain un-ingested.\n\
-- For tasks with a requested output artifact in task_state, do not mark task_complete=true until that output exists and is verified, unless you are explicitly surfacing a real blocker.\n\
+- If task_state shows an explicit output artifact that still needs verification, do not mark task_complete=true until that artifact is verified, unless you are surfacing a grounded blocker.\n\
+- `intent_kind`, `deliverable`, and `completion_basis` are optional continuity metadata. When useful, keep `intent_kind` to: answer, output, or unknown.\n\
 \n\
 Set require_approval=true only for delete-like or kill-like commands that need explicit operator approval.\n\
 You are allowed to explore the workspace in bounded steps.\n\
-Do not confuse discovery with progress toward a requested output; move from locating sources to ingesting them, then to synthesis or output creation when the evidence is ready.\n\
-Path hints like Desktop, Documents, Downloads, and ~/ refer to locations under the user's home directory."
+Path hints like Desktop, Documents, Downloads, and ~/ are user-facing aliases; rely on shell verification rather than assuming a fixed underlying path."
     )
 }
 
@@ -155,50 +153,6 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let required_inputs = if request.context.task_state.shape.required_inputs.is_empty() {
-        "- none".to_string()
-    } else {
-        request
-            .context
-            .task_state
-            .shape
-            .required_inputs
-            .iter()
-            .map(|input| format!("- {} [{}]", input.locator_hint, input.status))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let requested_output = request
-        .context
-        .task_state
-        .shape
-        .requested_output
-        .as_ref()
-        .map(|output| {
-            format!(
-                "- {} [intent={}, exists={}, verified={}]",
-                output.locator_hint, output.intent, output.exists, output.verified
-            )
-        })
-        .unwrap_or_else(|| "- none".to_string());
-    let output_artifact = request
-        .context
-        .task_state
-        .output_artifact
-        .as_ref()
-        .map(|artifact| {
-            format!(
-                "- {} [{}|intent={}|exists={}|current_content_ingested={}|written_this_run={}|verified={}]",
-                artifact.locator_hint,
-                artifact.kind,
-                artifact.intent,
-                artifact.exists,
-                artifact.current_content_ingested,
-                artifact.written_this_run,
-                artifact.verified
-            )
-        })
-        .unwrap_or_else(|| "- none".to_string());
     let source_set = if request.context.task_state.working_sources.is_empty() {
         "- none".to_string()
     } else {
@@ -242,12 +196,10 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
     };
 
     format!(
-        "Constraints:\n{}\n\nTask shape:\n- kind: {}\n- required inputs:\n{}\n- requested output:\n{}\n- output artifact state:\n{}\n- compact source set:\n{}\n- blockers:\n{}\n\nDynamic task context follows in the next block. Use it as the mutable working set for this step.",
+        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n- compact source set:\n{}\n- blockers:\n{}\n\nDynamic task context follows in the next block. Observations and verified tool results are the source of truth for this step.",
         constraints,
-        request.context.task_state.shape.kind,
-        required_inputs,
-        requested_output,
-        output_artifact,
+        request.context.task_state.progress.output_written,
+        request.context.task_state.progress.output_verified,
         source_set,
         blockers
     )

@@ -73,9 +73,17 @@ pub(crate) fn expand_homeish_path(path: &Path) -> Option<PathBuf> {
         return dirs::home_dir();
     }
     if let Some(stripped) = raw.strip_prefix("~/") {
+        let stripped_path = Path::new(stripped);
+        if let Some(resolved_alias) = resolve_known_folder_alias(stripped_path) {
+            return Some(resolved_alias);
+        }
         return dirs::home_dir().map(|home| home.join(stripped));
     }
 
+    resolve_known_folder_alias(path)
+}
+
+fn resolve_known_folder_alias(path: &Path) -> Option<PathBuf> {
     let first = path
         .components()
         .next()?
@@ -83,9 +91,11 @@ pub(crate) fn expand_homeish_path(path: &Path) -> Option<PathBuf> {
         .to_str()?
         .to_lowercase();
     let base = match first.as_str() {
-        "desktop" => dirs::home_dir().map(|home| home.join("Desktop")),
-        "documents" => dirs::home_dir().map(|home| home.join("Documents")),
-        "downloads" => dirs::home_dir().map(|home| home.join("Downloads")),
+        // Resolve user-facing aliases through OS-aware directory lookup instead of
+        // guessing they live directly under the home directory.
+        "desktop" => dirs::desktop_dir(),
+        "documents" => dirs::document_dir(),
+        "downloads" => dirs::download_dir(),
         _ => None,
     }?;
 
@@ -154,4 +164,88 @@ pub(crate) fn normalize_requested_page_range(
 
 pub(crate) fn looks_binary(bytes: &[u8]) -> bool {
     bytes.contains(&0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tilde_expands_from_home_directory() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+
+        assert_eq!(expand_homeish_path(Path::new("~")), Some(home.clone()));
+        assert_eq!(
+            expand_homeish_path(Path::new("~/notes.txt")),
+            Some(home.join("notes.txt"))
+        );
+    }
+
+    #[test]
+    fn tilde_known_folder_aliases_follow_os_directory_lookup() {
+        if let Some(desktop) = dirs::desktop_dir() {
+            assert_eq!(expand_homeish_path(Path::new("~/Desktop")), Some(desktop.clone()));
+            assert_eq!(
+                expand_homeish_path(Path::new("~/Desktop/report.txt")),
+                Some(desktop.join("report.txt"))
+            );
+        }
+
+        if let Some(documents) = dirs::document_dir() {
+            assert_eq!(
+                expand_homeish_path(Path::new("~/Documents")),
+                Some(documents.clone())
+            );
+            assert_eq!(
+                expand_homeish_path(Path::new("~/Documents/spec.md")),
+                Some(documents.join("spec.md"))
+            );
+        }
+
+        if let Some(downloads) = dirs::download_dir() {
+            assert_eq!(
+                expand_homeish_path(Path::new("~/Downloads")),
+                Some(downloads.clone())
+            );
+            assert_eq!(
+                expand_homeish_path(Path::new("~/Downloads/archive.zip")),
+                Some(downloads.join("archive.zip"))
+            );
+        }
+    }
+
+    #[test]
+    fn known_folder_aliases_follow_os_directory_lookup() {
+        if let Some(desktop) = dirs::desktop_dir() {
+            assert_eq!(expand_homeish_path(Path::new("Desktop")), Some(desktop.clone()));
+            assert_eq!(
+                expand_homeish_path(Path::new("Desktop/report.txt")),
+                Some(desktop.join("report.txt"))
+            );
+        }
+
+        if let Some(documents) = dirs::document_dir() {
+            assert_eq!(
+                expand_homeish_path(Path::new("Documents")),
+                Some(documents.clone())
+            );
+            assert_eq!(
+                expand_homeish_path(Path::new("Documents/spec.md")),
+                Some(documents.join("spec.md"))
+            );
+        }
+
+        if let Some(downloads) = dirs::download_dir() {
+            assert_eq!(
+                expand_homeish_path(Path::new("Downloads")),
+                Some(downloads.clone())
+            );
+            assert_eq!(
+                expand_homeish_path(Path::new("Downloads/archive.zip")),
+                Some(downloads.join("archive.zip"))
+            );
+        }
+    }
 }

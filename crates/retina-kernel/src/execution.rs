@@ -3,99 +3,13 @@ use crate::support::{
     ContextAssemblyInput, EventSpec, StepDecision, StepSelectionContext, action_failure_reason,
     action_requires_approval, action_utility, approval_reason, default_tool_descriptors,
 };
-use crate::task_shape::{
-    build_task_frontier, describe_task_phase, infer_task_shape, required_input_is_satisfied,
-};
+use crate::task_shape::{build_task_frontier, current_intent_hint, describe_task_phase};
 use crate::{Kernel, TaskLoopState, action_label};
 use chrono::Utc;
 use retina_types::*;
 use serde_json::json;
 
 impl Kernel {
-    fn build_output_artifact_state(
-        &self,
-        shape: &TaskShape,
-        state: &TaskLoopState,
-    ) -> Option<OutputArtifactState> {
-        let output = shape.requested_output.as_ref()?;
-        let normalized_hint = output.locator_hint.to_lowercase();
-        let current_content_ingested = state.working_sources.iter().any(|source| {
-            source.locator.to_lowercase().contains(&normalized_hint)
-                && matches!(
-                    source.status.as_str(),
-                    "read" | "excerpted" | "ingested" | "matched_text"
-                )
-        }) || state.artifact_references.iter().any(|artifact| {
-            artifact.locator.to_lowercase().contains(&normalized_hint)
-                && matches!(
-                    artifact.status.as_str(),
-                    "read" | "structured_read" | "extracted" | "searched"
-                )
-        }) || state.recent_action_summaries.iter().any(|summary| {
-            summary
-                .artifact_refs
-                .iter()
-                .any(|artifact| artifact.locator.to_lowercase().contains(&normalized_hint))
-                && matches!(
-                    summary.action.as_str(),
-                    action if action.starts_with("read_file:")
-                        || action.starts_with("extract_document_text:")
-                        || action.starts_with("ingest_structured_data:")
-                        || action.starts_with("search_text:")
-                )
-        });
-
-        let generated_source = state
-            .working_sources
-            .iter()
-            .filter(|source| {
-                source.role == "generated"
-                    && source.locator.to_lowercase().contains(&normalized_hint)
-            })
-            .max_by_key(|source| source.last_used_step);
-
-        let last_write_action = state
-            .recent_action_summaries
-            .iter()
-            .rev()
-            .find(|summary| {
-                matches!(
-                    summary.action.as_str(),
-                    action if action.starts_with("write_file:") || action.starts_with("append_file:")
-                ) && summary.artifact_refs.iter().any(|artifact| {
-                    artifact.locator.to_lowercase().contains(&normalized_hint)
-                })
-            })
-            .map(|summary| summary.action.clone());
-
-        let last_write_step = generated_source
-            .map(|source| source.last_used_step)
-            .or_else(|| {
-                state
-                    .recent_action_summaries
-                    .iter()
-                    .rev()
-                    .find(|summary| {
-                        summary.artifact_refs.iter().any(|artifact| {
-                            artifact.locator.to_lowercase().contains(&normalized_hint)
-                        })
-                    })
-                    .map(|summary| summary.step)
-            });
-
-        Some(OutputArtifactState {
-            locator_hint: output.locator_hint.clone(),
-            kind: output.kind.clone(),
-            intent: output.intent.clone(),
-            exists: output.exists,
-            current_content_ingested,
-            written_this_run: generated_source.is_some(),
-            verified: output.verified,
-            last_write_step,
-            last_write_action,
-        })
-    }
-
     pub(crate) fn select_action(
         &self,
         selection: StepSelectionContext<'_>,
@@ -120,6 +34,7 @@ impl Kernel {
             return Ok(StepDecision {
                 action,
                 task_complete: true,
+                framing: None,
             });
         }
 
@@ -151,6 +66,7 @@ impl Kernel {
             json!({
                 "action": action_label(&response.action),
                 "reasoning": response.reasoning,
+                "framing": response.framing,
                 "tokens": response.tokens_used,
                 "task_complete": response.task_complete
             }),
@@ -158,6 +74,7 @@ impl Kernel {
         Ok(StepDecision {
             action: response.action,
             task_complete: response.task_complete,
+            framing: response.framing,
         })
     }
 
@@ -428,6 +345,7 @@ impl Kernel {
             json!({
                 "action": action_label(&reflection.action),
                 "reasoning": reflection.reasoning,
+                "framing": reflection.framing,
                 "retry": allow_retry,
                 "task_complete": reflection.task_complete
             }),
@@ -447,6 +365,7 @@ impl Kernel {
             let retry_step = StepDecision {
                 action: reflection.action,
                 task_complete: reflection.task_complete,
+                framing: reflection.framing,
             };
             return self.execute_action(task, intent, &retry_step, control, false);
         }
@@ -579,39 +498,38 @@ impl Kernel {
         max_steps: usize,
         last_result_summary: Option<String>,
     ) -> TaskState {
-        let shape = infer_task_shape(&task.description, state);
+        let intent_hint = current_intent_hint(state);
         let (open_questions, blockers, next_action_hint) =
-            build_task_frontier(&shape, last_result_summary.clone(), state);
-        let output_artifact = self.build_output_artifact_state(&shape, state);
+            build_task_frontier(last_result_summary.clone(), state);
+        let output_written = state.artifact_references.iter().any(|artifact| {
+            matches!(
+                artifact.status.as_str(),
+                "created" | "written" | "overwritten" | "appended" | "command_changed"
+            )
+        });
+        let output_verified = state.artifact_references.iter().any(|artifact| {
+            matches!(
+                artifact.status.as_str(),
+                "created" | "written" | "overwritten" | "appended" | "command_changed"
+            )
+        });
         TaskState {
             goal: TaskGoal {
                 objective: task.description.clone(),
-                success_criteria: Vec::new(),
+                success_criteria: vec!["completion is grounded in observed evidence".to_string()],
                 constraints: Vec::new(),
             },
-            shape: shape.clone(),
+            intent_hint,
+            reasoner_framing: state.last_reasoner_framing.clone(),
             progress: TaskProgress {
                 current_phase: describe_task_phase(state, current_step, max_steps),
                 current_step,
                 max_steps,
                 completed_checkpoints: state.recent_steps.clone(),
                 verified_facts: summarize_verified_facts(&state.artifact_references),
-                required_inputs: shape.required_inputs.len(),
-                satisfied_inputs: shape
-                    .required_inputs
-                    .iter()
-                    .filter(|input| required_input_is_satisfied(input))
-                    .count(),
-                output_written: output_artifact
-                    .as_ref()
-                    .map(|artifact| artifact.written_this_run)
-                    .unwrap_or(false),
-                output_verified: output_artifact
-                    .as_ref()
-                    .map(|artifact| artifact.verified)
-                    .unwrap_or(false),
+                output_written,
+                output_verified,
             },
-            output_artifact,
             frontier: TaskFrontier {
                 next_action_hint,
                 open_questions,

@@ -9,12 +9,14 @@ blake3.workspace = true
 chrono.workspace = true
 csv.workspace = true
 dirs.workspace = true
-libc.workspace = true
 pdf-extract.workspace = true
 retina-traits = { path = "../retina-traits" }
 retina-types = { path = "../retina-types" }
 serde_json.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 lopdf.workspace = true

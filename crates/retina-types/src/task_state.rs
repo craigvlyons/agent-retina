@@ -1,3 +1,4 @@
+use crate::ReasonerTaskFraming;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -5,9 +6,9 @@ use std::fmt::{Display, Formatter};
 #[serde(default)]
 pub struct TaskState {
     pub goal: TaskGoal,
-    pub shape: TaskShape,
+    pub intent_hint: Option<TaskKind>,
+    pub reasoner_framing: Option<ReasonerTaskFraming>,
     pub progress: TaskProgress,
-    pub output_artifact: Option<OutputArtifactState>,
     pub frontier: TaskFrontier,
     pub recent_actions: Vec<RecentActionSummary>,
     pub working_sources: Vec<WorkingSource>,
@@ -29,10 +30,32 @@ impl TaskState {
         let verified = render_list(&self.progress.verified_facts);
         let open_questions = render_list(&self.frontier.open_questions);
         let blockers = render_list(&self.frontier.blockers);
-        let output_artifact = self
-            .output_artifact
+        let framing_hint = self
+            .intent_hint
             .as_ref()
-            .map(OutputArtifactState::render)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "none".to_string());
+        let reasoner_framing = self
+            .reasoner_framing
+            .as_ref()
+            .map(|framing| {
+                format!(
+                    "- intent_kind: {}\n- deliverable: {}\n- completion_basis: {}",
+                    framing
+                        .intent_kind
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "none".to_string()),
+                    framing
+                        .deliverable
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string()),
+                    framing
+                        .completion_basis
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string())
+                )
+            })
             .unwrap_or_else(|| "none".to_string());
         let next_action = self
             .frontier
@@ -82,21 +105,19 @@ impl TaskState {
             .unwrap_or_else(|| "none".to_string());
 
         format!(
-            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nTask shape:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- completed:\n{}\n- verified_facts:\n{}\n- required_inputs_satisfied: {} / {}\n- output_written: {}\n- output_verified: {}\n\nOutput artifact:\n{}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
+            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nIntent hint:\n- {}\n\nReasoner framing:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
             self.goal.objective,
             success_criteria,
             constraints,
-            self.shape.render(),
+            framing_hint,
+            reasoner_framing,
             self.progress.current_phase,
             self.progress.current_step,
             self.progress.max_steps,
             completed,
             verified,
-            self.progress.satisfied_inputs,
-            self.progress.required_inputs,
             self.progress.output_written,
             self.progress.output_verified,
-            output_artifact,
             next_action,
             open_questions,
             blockers,
@@ -117,47 +138,11 @@ pub struct TaskGoal {
     pub constraints: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TaskShape {
-    pub kind: TaskKind,
-    pub required_inputs: Vec<RequiredInput>,
-    pub requested_output: Option<RequestedOutput>,
-    pub success_markers: Vec<String>,
-}
-
-impl TaskShape {
-    pub fn render(&self) -> String {
-        let required_inputs = if self.required_inputs.is_empty() {
-            "  - none".to_string()
-        } else {
-            self.required_inputs
-                .iter()
-                .map(RequiredInput::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let requested_output = self
-            .requested_output
-            .as_ref()
-            .map(RequestedOutput::render)
-            .unwrap_or_else(|| "  - none".to_string());
-        let success_markers = render_list(&self.success_markers);
-
-        format!(
-            "- kind: {}\n- required_inputs:\n{}\n- requested_output:\n{}\n- success_markers:\n{}",
-            self.kind, required_inputs, requested_output, success_markers
-        )
-    }
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TaskKind {
     #[default]
     Unknown,
-    Discovery,
     Answer,
-    Transform,
     Output,
 }
 
@@ -165,66 +150,8 @@ impl Display for TaskKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let label = match self {
             Self::Unknown => "unknown",
-            Self::Discovery => "discovery",
             Self::Answer => "answer",
-            Self::Transform => "transform",
             Self::Output => "output",
-        };
-        f.write_str(label)
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RequiredInput {
-    pub locator_hint: String,
-    pub kind: String,
-    pub status: String,
-}
-
-impl RequiredInput {
-    pub fn render(&self) -> String {
-        format!("  - {} [{}|{}]", self.locator_hint, self.kind, self.status)
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RequestedOutput {
-    pub locator_hint: String,
-    pub kind: String,
-    pub intent: OutputIntent,
-    pub exists: bool,
-    pub verified: bool,
-}
-
-impl RequestedOutput {
-    pub fn render(&self) -> String {
-        format!(
-            "  - {} [{}|intent={}|exists={}|verified={}]",
-            self.locator_hint, self.kind, self.intent, self.exists, self.verified
-        )
-    }
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub enum OutputIntent {
-    #[default]
-    Unknown,
-    Create,
-    Modify,
-    Append,
-    Overwrite,
-}
-
-impl Display for OutputIntent {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let label = match self {
-            Self::Unknown => "unknown",
-            Self::Create => "create",
-            Self::Modify => "modify",
-            Self::Append => "append",
-            Self::Overwrite => "overwrite",
         };
         f.write_str(label)
     }
@@ -238,45 +165,8 @@ pub struct TaskProgress {
     pub max_steps: usize,
     pub completed_checkpoints: Vec<String>,
     pub verified_facts: Vec<String>,
-    pub required_inputs: usize,
-    pub satisfied_inputs: usize,
     pub output_written: bool,
     pub output_verified: bool,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct OutputArtifactState {
-    pub locator_hint: String,
-    pub kind: String,
-    pub intent: OutputIntent,
-    pub exists: bool,
-    pub current_content_ingested: bool,
-    pub written_this_run: bool,
-    pub verified: bool,
-    pub last_write_step: Option<usize>,
-    pub last_write_action: Option<String>,
-}
-
-impl OutputArtifactState {
-    pub fn render(&self) -> String {
-        format!(
-            "- {} [{}|intent={}|exists={}|current_content_ingested={}|written_this_run={}|verified={}|last_write_step={}|last_write_action={}]",
-            self.locator_hint,
-            self.kind,
-            self.intent,
-            self.exists,
-            self.current_content_ingested,
-            self.written_this_run,
-            self.verified,
-            self.last_write_step
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".to_string()),
-            self.last_write_action
-                .clone()
-                .unwrap_or_else(|| "none".to_string())
-        )
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

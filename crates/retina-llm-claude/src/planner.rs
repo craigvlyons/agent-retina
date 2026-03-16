@@ -32,6 +32,7 @@ fn with_reasoning(action: Action, task_complete: bool, reasoning: &str) -> Reaso
     ReasonResponse {
         action,
         task_complete,
+        framing: None,
         reasoning: Some(reasoning.to_string()),
         tokens_used: TokenUsage::default(),
     }
@@ -485,3 +486,4 @@ mod tests {
         assert!(response.task_complete);
     }
 }
+

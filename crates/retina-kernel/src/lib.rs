@@ -10,7 +10,7 @@ mod task_shape;
 pub(crate) use crate::loop_state::{TaskLoopState, action_label};
 use crate::router::Router;
 pub(crate) use crate::support::{CircuitBreaker, EventSpec, ReflexEngine, StepSelectionContext};
-use crate::task_shape::{completion_guard, infer_task_shape, suggested_step_budget};
+use crate::task_shape::completion_guard;
 use retina_traits::{Memory, Reasoner, Shell};
 use retina_types::*;
 use serde_json::json;
@@ -59,8 +59,7 @@ impl Kernel {
     }
 
     pub fn execute_task_with_config(&self, task: Task, config: ExecutionConfig) -> Result<Outcome> {
-        let initial_shape = infer_task_shape(&task.description, &TaskLoopState::new(0));
-        let max_steps = suggested_step_budget(config.max_steps, &initial_shape);
+        let max_steps = config.max_steps;
         self.emit_event(EventSpec::new(
             &task,
             None,
@@ -209,6 +208,7 @@ impl Kernel {
             let outcome =
                 self.execute_action(&task, &mut intent, &step, config.control.as_ref(), true)?;
             let progress = state.record_step(&step.action, &outcome)?;
+            state.last_reasoner_framing = step.framing.clone();
             let compaction = state.apply_live_compaction();
             let task_state = self.build_task_state(
                 &task,
@@ -262,7 +262,7 @@ impl Kernel {
                     &mut intent,
                     &step.action,
                     config.control.as_ref(),
-                    "continued low-value exploration after the task already had enough context to answer, synthesize, or produce the requested result"
+                    "continued low-value exploration after enough observed evidence existed to make a verifiable next move"
                         .to_string(),
                     true,
                 );

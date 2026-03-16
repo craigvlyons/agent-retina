@@ -127,6 +127,9 @@ pub(crate) struct ClaudeAction {
     pub(crate) note: Option<String>,
     pub(crate) message: Option<String>,
     pub(crate) task_complete: Option<bool>,
+    pub(crate) intent_kind: Option<String>,
+    pub(crate) deliverable: Option<String>,
+    pub(crate) completion_basis: Option<String>,
     pub(crate) reasoning: Option<String>,
 }
 
@@ -226,8 +229,32 @@ impl ClaudeAction {
         ReasonResponse {
             action,
             task_complete: self.task_complete.unwrap_or(true),
+            framing: if self.intent_kind.is_some()
+                || self.deliverable.is_some()
+                || self.completion_basis.is_some()
+            {
+                Some(ReasonerTaskFraming {
+                    intent_kind: self
+                        .intent_kind
+                        .as_deref()
+                        .and_then(parse_task_kind_hint),
+                    deliverable: self.deliverable,
+                    completion_basis: self.completion_basis,
+                })
+            } else {
+                None
+            },
             reasoning: self.reasoning,
             tokens_used: TokenUsage::default(),
         }
+    }
+}
+
+fn parse_task_kind_hint(value: &str) -> Option<TaskKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "answer" => Some(TaskKind::Answer),
+        "output" => Some(TaskKind::Output),
+        "unknown" => Some(TaskKind::Unknown),
+        _ => None,
     }
 }
