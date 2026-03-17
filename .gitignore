@@ -6,6 +6,7 @@ Cargo.lock
 # Runtime data
 .retina
 .fastembed_cache
+rustup-init.exe
 *.db
 *.db-shm
 *.db-wal
