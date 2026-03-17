@@ -19,7 +19,7 @@ rustup-init.exe
 
 # Secrets
 .env
-.env.*
+
 
 # OS
 .DS_Store
