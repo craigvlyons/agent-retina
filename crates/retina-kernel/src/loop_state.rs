@@ -1,6 +1,7 @@
 use crate::result_helpers::{
     artifact_references_for_result, compact_action_result_for_context,
-    compact_last_result_for_compacted_context, repeated_step_signature, summarize_action_result,
+    compact_last_result_for_compacted_context, prioritized_artifact_references,
+    prioritized_working_sources, repeated_step_signature, summarize_action_result,
     working_sources_for_result,
 };
 use crate::task_shape::task_state_needs_terminal_result;
@@ -305,18 +306,18 @@ fn trim_recent_action_summaries_for_compacted_state(recent_actions: &mut Vec<Rec
 
 fn trim_working_sources_for_compacted_state(working_sources: &mut Vec<WorkingSource>) {
     const MAX_COMPACTED_WORKING_SOURCES: usize = 6;
-    if working_sources.len() > MAX_COMPACTED_WORKING_SOURCES {
-        let excess = working_sources.len() - MAX_COMPACTED_WORKING_SOURCES;
-        working_sources.drain(0..excess);
-    }
+    *working_sources = prioritized_working_sources(working_sources)
+        .into_iter()
+        .take(MAX_COMPACTED_WORKING_SOURCES)
+        .collect();
 }
 
 fn trim_artifact_references_for_compacted_state(artifact_refs: &mut Vec<ArtifactReference>) {
     const MAX_COMPACTED_ARTIFACT_REFS: usize = 8;
-    if artifact_refs.len() > MAX_COMPACTED_ARTIFACT_REFS {
-        let excess = artifact_refs.len() - MAX_COMPACTED_ARTIFACT_REFS;
-        artifact_refs.drain(0..excess);
-    }
+    *artifact_refs = prioritized_artifact_references(artifact_refs)
+        .into_iter()
+        .take(MAX_COMPACTED_ARTIFACT_REFS)
+        .collect();
 }
 
 fn build_compaction_score_explanations(state: &TaskLoopState) -> Vec<CompactionScoreExplanation> {

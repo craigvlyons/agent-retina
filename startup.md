@@ -6,6 +6,8 @@ Run Retina from the project root:
 
 ```bash
 cd /path/to/agent-retina
+mac
+cd /Users/macc/projects/personal/agent-retina
 ```
 
 ## Environment

@@ -3,7 +3,7 @@ use crate::runtime::{
     normalize_root_manifest, open_memory, retina_home, root_agent_id, root_db_path, root_manifest,
 };
 use retina_kernel::Kernel;
-use retina_llm_claude::ClaudeReasoner;
+use retina_llm_claude::{ClaudeReasoner, ClaudeRuntimeConfigSnapshot};
 use retina_memory_sqlite::{MemoryStats, SqliteMemory};
 use retina_shell_cli::{CliShell, ScopedShell};
 use retina_traits::{Memory, Shell};
@@ -152,6 +152,7 @@ pub struct WorkerOverview {
     pub terminal_tasks: TerminalTaskStats,
     pub active_rules: Vec<ReflexiveRule>,
     pub compaction_stats: CompactionStats,
+    pub claude_runtime: ClaudeRuntimeConfigSnapshot,
 }
 
 pub struct TerminalTaskStats {
@@ -228,6 +229,7 @@ impl InspectController {
             terminal_tasks,
             active_rules,
             compaction_stats: summarize_compaction_stats(&recent_events),
+            claude_runtime: ClaudeReasoner::runtime_config_snapshot(),
         })
     }
 

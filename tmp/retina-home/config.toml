@@ -1,0 +1,2 @@
+default_agent = "root"
+reasoner = "claude"

@@ -612,7 +612,7 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
     };
 
     format!(
-        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\ncompaction:\n- task_compactions: {}\n- cache_reads: {}\n- cache_creations: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
+        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\ncompaction:\n- task_compactions: {}\n- cache_reads: {}\n- cache_creations: {}\n\nclaude_runtime:\n- model: {}\n- prompt_caching: {}\n- context_editing: {}\n- tool_result_trigger_tokens: {}\n- server_compaction_requested: {}\n- server_compaction_supported: {}\n- server_compaction_effective: {}\n- compaction_trigger_tokens: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
         overview.manifest.agent_id.0,
         overview.manifest.domain,
         overview.manifest.status,
@@ -643,6 +643,14 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
         overview.compaction_stats.compaction_events,
         overview.compaction_stats.cache_reads,
         overview.compaction_stats.cache_creations,
+        overview.claude_runtime.model_id,
+        overview.claude_runtime.prompt_caching_enabled,
+        overview.claude_runtime.context_editing_enabled,
+        overview.claude_runtime.tool_result_trigger_tokens,
+        overview.claude_runtime.server_side_compaction_requested,
+        overview.claude_runtime.server_side_compaction_supported,
+        overview.claude_runtime.server_side_compaction_effective,
+        overview.claude_runtime.compaction_trigger_tokens,
         overview.manifest.budget.max_steps_per_task,
         overview.manifest.budget.max_reasoner_calls_per_task,
         overview.manifest.budget.max_tokens_per_task,

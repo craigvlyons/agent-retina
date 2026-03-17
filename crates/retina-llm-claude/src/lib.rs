@@ -14,6 +14,18 @@ use retina_traits::Reasoner;
 use retina_types::*;
 use std::env;
 
+#[derive(Clone, Debug)]
+pub struct ClaudeRuntimeConfigSnapshot {
+    pub model_id: String,
+    pub prompt_caching_enabled: bool,
+    pub context_editing_enabled: bool,
+    pub tool_result_trigger_tokens: u32,
+    pub server_side_compaction_requested: bool,
+    pub server_side_compaction_supported: bool,
+    pub server_side_compaction_effective: bool,
+    pub compaction_trigger_tokens: u32,
+}
+
 pub struct ClaudeReasoner {
     client: Client,
     model_id: String,
@@ -31,6 +43,25 @@ impl ClaudeReasoner {
             api_key: env::var("ANTHROPIC_API_KEY").ok(),
             prompt_caching: ClaudePromptCaching::from_env(),
             context_management: ClaudeContextManagement::from_env(),
+        }
+    }
+
+    pub fn runtime_config_snapshot() -> ClaudeRuntimeConfigSnapshot {
+        let model_id =
+            env::var("RETINA_CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        let prompt_caching = ClaudePromptCaching::from_env();
+        let context_management = ClaudeContextManagement::from_env();
+        let server_side_compaction_supported = config::model_supports_server_compaction(&model_id);
+        ClaudeRuntimeConfigSnapshot {
+            model_id,
+            prompt_caching_enabled: prompt_caching.enabled,
+            context_editing_enabled: context_management.tool_result_clearing_enabled,
+            tool_result_trigger_tokens: context_management.tool_result_trigger_tokens,
+            server_side_compaction_requested: context_management.server_side_compaction_enabled,
+            server_side_compaction_supported,
+            server_side_compaction_effective: context_management.server_side_compaction_enabled
+                && server_side_compaction_supported,
+            compaction_trigger_tokens: context_management.compaction_trigger_tokens,
         }
     }
 
@@ -580,4 +611,3 @@ mod tests {
         );
     }
 }
-

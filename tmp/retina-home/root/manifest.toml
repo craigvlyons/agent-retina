@@ -1,0 +1,33 @@
+agent_id = "root"
+domain = "orchestrator"
+status = "Idle"
+description = "Retina root agent running in independent v1 mode."
+created_at = "2026-03-17T17:18:26.639270+00:00"
+updated_at = "2026-03-17T17:42:09.204951+00:00"
+capabilities = [
+    "cli",
+    "filesystem",
+    "search",
+    "command",
+    "memory",
+]
+
+[authority]
+allow_command_execution = true
+allow_file_reads = true
+allow_file_writes = true
+allow_file_search = true
+allow_notes = true
+allow_text_responses = true
+accessible_roots = []
+
+[lifecycle]
+phase = "CoolingDown"
+last_active_at = "2026-03-17T17:42:09.204951Z"
+last_task_at = "2026-03-17T17:42:09.204951Z"
+status_reason = "waiting for next task"
+
+[budget]
+max_steps_per_task = 8
+max_reasoner_calls_per_task = 8
+max_tokens_per_task = 8192

@@ -341,22 +341,106 @@ pub(crate) fn compact_last_result_for_compacted_context(
     serde_json::to_string(&compact)
 }
 
-pub(crate) fn summarize_verified_facts(references: &[ArtifactReference]) -> Vec<String> {
-    references
-        .iter()
-        .take(8)
-        .map(|reference| match reference.status.as_str() {
-            "read" => format!("read {}", reference.locator),
-            "structured_read" => format!("ingested structured data from {}", reference.locator),
-            "extracted" => format!("extracted text from {}", reference.locator),
-            "matched" => format!("matched candidate {}", reference.locator),
-            "searched" => format!("searched and found evidence in {}", reference.locator),
-            "listed" => format!("listed directory {}", reference.locator),
-            "written" => format!("wrote {}", reference.locator),
-            "appended" => format!("appended {}", reference.locator),
+pub(crate) fn summarize_verified_facts(
+    working_sources: &[WorkingSource],
+    references: &[ArtifactReference],
+) -> Vec<String> {
+    let mut facts = Vec::new();
+
+    for source in prioritized_working_sources(working_sources).into_iter().take(5) {
+        let fact = match (source.role.as_str(), source.status.as_str()) {
+            ("authoritative", "read") => format!("authoritative file read from {}", source.locator),
+            ("authoritative", "excerpted") => {
+                format!("authoritative document text extracted from {}", source.locator)
+            }
+            ("authoritative", "ingested") => {
+                format!("authoritative structured data ingested from {}", source.locator)
+            }
+            ("generated", status) => format!("produced artifact {} ({status})", source.locator),
+            (_, "matched") => format!("candidate source identified at {}", source.locator),
+            (_, "matched_text") => format!("text evidence identified in {}", source.locator),
+            (_, "listed") => format!("directory explored at {}", source.locator),
+            (_, "inspected") => format!("path inspected at {}", source.locator),
+            _ => format!("{} {} [{}]", source.status, source.locator, source.role),
+        };
+        push_unique(&mut facts, fact);
+    }
+
+    for reference in prioritized_artifact_references(references).into_iter().take(5) {
+        let fact = match reference.status.as_str() {
+            "read" => format!("exact evidence kept for {}", reference.locator),
+            "structured_read" => format!("exact structured evidence kept for {}", reference.locator),
+            "extracted" => format!("exact extracted evidence kept for {}", reference.locator),
+            "matched" => format!("candidate artifact reference kept for {}", reference.locator),
+            "searched" => format!("search evidence kept for {}", reference.locator),
+            "created" | "written" | "overwritten" | "appended" | "command_changed" => {
+                format!("output or changed artifact tracked at {}", reference.locator)
+            }
             _ => format!("{} {}", reference.status, reference.locator),
-        })
-        .collect()
+        };
+        push_unique(&mut facts, fact);
+    }
+
+    facts.into_iter().take(8).collect()
+}
+
+pub(crate) fn prioritized_working_sources(sources: &[WorkingSource]) -> Vec<WorkingSource> {
+    let mut sources = sources.to_vec();
+    sources.sort_by(|left, right| {
+        working_source_rank(right)
+            .cmp(&working_source_rank(left))
+            .then_with(|| right.last_used_step.cmp(&left.last_used_step))
+            .then_with(|| left.locator.cmp(&right.locator))
+    });
+    sources
+}
+
+pub(crate) fn prioritized_artifact_references(
+    references: &[ArtifactReference],
+) -> Vec<ArtifactReference> {
+    let mut references = references.to_vec();
+    references.sort_by(|left, right| {
+        artifact_reference_rank(right)
+            .cmp(&artifact_reference_rank(left))
+            .then_with(|| left.locator.cmp(&right.locator))
+    });
+    references
+}
+
+fn working_source_rank(source: &WorkingSource) -> u8 {
+    let role_rank = match source.role.as_str() {
+        "authoritative" => 4,
+        "generated" => 3,
+        "supporting" => 2,
+        "candidate" => 1,
+        _ => 0,
+    };
+    let status_rank = match source.status.as_str() {
+        "read" | "excerpted" | "ingested" => 4,
+        "created" | "written" | "overwritten" | "appended" | "command_changed" => 4,
+        "matched_text" => 3,
+        "matched" => 2,
+        "listed" | "inspected" => 1,
+        _ => 0,
+    };
+    role_rank * 10 + status_rank
+}
+
+fn artifact_reference_rank(reference: &ArtifactReference) -> u8 {
+    match reference.status.as_str() {
+        "read" | "structured_read" | "extracted" => 5,
+        "created" | "written" | "overwritten" | "appended" | "command_changed" => 4,
+        "searched" => 3,
+        "matched" => 2,
+        "listed" | "inspected" => 1,
+        _ => 0,
+    }
+}
+
+fn push_unique(items: &mut Vec<String>, value: String) {
+    if !items.contains(&value) {
+        items.push(value);
+    }
 }
 
 pub(crate) fn artifact_references_for_result(result: &ActionResult) -> Vec<ArtifactReference> {

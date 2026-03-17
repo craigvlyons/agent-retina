@@ -133,6 +133,9 @@ Planning rules:\n\
 - If the user asks a question about content, gather the evidence first and then finish with respond once you can answer directly.\n\
 - If the last result already gave enough evidence, do not repeat the same exploratory step.\n\
 - Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
+- Discovery-only steps such as inspect_path, list_directory, find_files, and search_text are intermediate progress when the request still asks you to read, answer, summarize, extract, or create output.\n\
+- For multi-step requests, keep working toward the original objective one concrete action at a time; do not stop after locating the likely source if reading, synthesis, or output creation is still required.\n\
+- In general, intermediate shell steps should not be marked task_complete=true. Use task_complete=true when you are returning a grounded final response or when a verified output/state change satisfies the task.\n\
 - If task_state shows an explicit output artifact that still needs verification, do not mark task_complete=true until that artifact is verified, unless you are surfacing a grounded blocker.\n\
 - `intent_kind`, `deliverable`, and `completion_basis` are optional continuity metadata. When useful, keep `intent_kind` to: answer, output, or unknown.\n\
 \n\

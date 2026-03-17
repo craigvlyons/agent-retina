@@ -513,10 +513,11 @@ impl Kernel {
                 "created" | "written" | "overwritten" | "appended" | "command_changed"
             )
         });
+        let success_criteria = derive_success_criteria(state, output_written, output_verified);
         TaskState {
             goal: TaskGoal {
                 objective: task.description.clone(),
-                success_criteria: vec!["completion is grounded in observed evidence".to_string()],
+                success_criteria,
                 constraints: Vec::new(),
             },
             intent_hint,
@@ -526,7 +527,10 @@ impl Kernel {
                 current_step,
                 max_steps,
                 completed_checkpoints: state.recent_steps.clone(),
-                verified_facts: summarize_verified_facts(&state.artifact_references),
+                verified_facts: summarize_verified_facts(
+                    &state.working_sources,
+                    &state.artifact_references,
+                ),
                 output_written,
                 output_verified,
             },
@@ -603,4 +607,47 @@ impl Kernel {
         };
         self.memory.append_timeline_event(&event)
     }
+}
+
+fn derive_success_criteria(
+    state: &TaskLoopState,
+    output_written: bool,
+    output_verified: bool,
+) -> Vec<String> {
+    let mut criteria = vec!["completion is grounded in observed evidence".to_string()];
+    let has_authoritative_source = state
+        .working_sources
+        .iter()
+        .any(|source| source.role == "authoritative");
+    let has_candidate_sources = state
+        .working_sources
+        .iter()
+        .any(|source| matches!(source.role.as_str(), "candidate" | "supporting"));
+    let has_generated_output = state.working_sources.iter().any(|source| source.role == "generated")
+        || state.artifact_references.iter().any(|artifact| {
+            matches!(
+                artifact.status.as_str(),
+                "created" | "written" | "overwritten" | "appended" | "command_changed"
+            )
+        });
+
+    if has_candidate_sources && !has_authoritative_source {
+        criteria.push("at least one discovered candidate is promoted into authoritative evidence".to_string());
+    }
+
+    if has_authoritative_source && !has_generated_output {
+        criteria.push("authoritative evidence is used to complete the next meaningful task obligation".to_string());
+    }
+
+    if output_written || has_generated_output {
+        criteria.push("any produced artifact or state change is explicitly verified".to_string());
+    } else {
+        criteria.push("the next step should reduce the main unresolved obligation rather than repeat shallow discovery".to_string());
+    }
+
+    if output_verified {
+        criteria.push("verified outputs remain consistent with the task goal".to_string());
+    }
+
+    criteria
 }
