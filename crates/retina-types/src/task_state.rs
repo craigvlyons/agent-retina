@@ -218,6 +218,7 @@ pub struct WorkingSource {
     pub page_reference: Option<String>,
     pub extraction_method: Option<String>,
     pub structured_summary: Option<StructuredSourceSummary>,
+    pub preview_excerpt: Option<String>,
 }
 
 impl WorkingSource {
@@ -237,9 +238,14 @@ impl WorkingSource {
             .as_ref()
             .map(|value| format!(" {}", value.render()))
             .unwrap_or_default();
+        let preview = self
+            .preview_excerpt
+            .as_ref()
+            .map(|value| format!(" preview=\"{}\"", value))
+            .unwrap_or_default();
         format!(
-            "- {} [{}|{}] {}{}{}{}",
-            self.locator, self.kind, self.role, self.status, scope, method, structured
+            "- {} [{}|{}] {}{}{}{}{}",
+            self.locator, self.kind, self.role, self.status, scope, method, structured, preview
         )
     }
 }

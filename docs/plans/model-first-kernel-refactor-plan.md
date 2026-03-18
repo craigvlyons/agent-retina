@@ -81,6 +81,22 @@ The burden of proof is now reversed:
 - interpretive harness logic must justify itself
 - otherwise it goes
 
+Live-loop audit conclusion:
+- per-step completion checking is harness interference and should not drive the loop
+- the agent should keep working until it explicitly responds, hard-fails, is cancelled, or burns the hard budget
+- low-value exploration policing should be removed from the normal path until there is clear evidence it helps more than it hurts
+- validation belongs at explicit loop completion, not after every step
+- the worker needs enough room to roam before the harness concludes anything
+
+Immediate operating rules:
+- set the normal task budget to `50`
+- set the interactive chat task budget to `50`
+- do not ask "are we done?" after each step
+- do not stop just because the reasoner marked `task_complete=true` on a non-terminal action
+- treat explicit `respond` as the normal terminal path
+- keep observation, logging, approvals, cancellation, and hard-failure handling
+- postpone final validation if it is still steering behavior instead of merely checking it
+
 ## Cleanup Inventory
 
 This section is the working removal list.

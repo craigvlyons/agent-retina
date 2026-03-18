@@ -1,6 +1,5 @@
 use super::*;
 use crate::support::recover_mutex;
-use crate::task_shape::completion_guard;
 
 use retina_test_utils::{MockMemory, MockReasoner, MockShell};
 use std::sync::{Arc, Mutex};
@@ -158,144 +157,6 @@ fn assembled_context_includes_output_task_shape() {
 }
 
 #[test]
-fn ungrounded_reasoner_completion_basis_is_blocked() {
-    let mut task_state = TaskState::default();
-    task_state.intent_hint = Some(TaskKind::Answer);
-    task_state.reasoner_framing = Some(ReasonerTaskFraming {
-        intent_kind: Some(TaskKind::Answer),
-        deliverable: Some("summary".to_string()),
-        completion_basis: Some("read startup.md and answered the question".to_string()),
-    });
-    task_state.recent_actions.push(RecentActionSummary {
-        step: 1,
-        action: "respond:done".to_string(),
-        outcome: "responded to operator".to_string(),
-        artifact_refs: Vec::new(),
-    });
-
-    let blocker = completion_guard(&task_state);
-    assert!(matches!(
-        blocker.as_deref(),
-        Some("reasoner completion basis is not grounded in observed evidence yet")
-    ));
-}
-
-#[test]
-fn grounded_reasoner_completion_basis_passes_with_observed_evidence() {
-    let mut task_state = TaskState::default();
-    task_state.intent_hint = Some(TaskKind::Answer);
-    task_state.reasoner_framing = Some(ReasonerTaskFraming {
-        intent_kind: Some(TaskKind::Answer),
-        deliverable: Some("summary".to_string()),
-        completion_basis: Some("read startup.md and answered the question".to_string()),
-    });
-    task_state.working_sources.push(WorkingSource {
-        locator: "startup.md".to_string(),
-        kind: "file".to_string(),
-        role: "authoritative".to_string(),
-        status: "read".to_string(),
-        why_it_matters: "source".to_string(),
-        last_used_step: 1,
-        evidence_refs: vec!["startup.md".to_string()],
-        page_reference: None,
-        extraction_method: Some("text_read".to_string()),
-        structured_summary: None,
-    });
-    task_state.recent_actions.push(RecentActionSummary {
-        step: 2,
-        action: "respond:done".to_string(),
-        outcome: "responded to operator".to_string(),
-        artifact_refs: Vec::new(),
-    });
-
-    assert!(completion_guard(&task_state).is_none());
-}
-
-#[test]
-fn reasoner_intent_kind_overrides_heuristic_shape_for_completion() {
-    let mut task_state = TaskState::default();
-    task_state.reasoner_framing = Some(ReasonerTaskFraming {
-        intent_kind: Some(TaskKind::Answer),
-        deliverable: Some("summary".to_string()),
-        completion_basis: Some("read startup.md and answered the question".to_string()),
-    });
-    task_state.working_sources.push(WorkingSource {
-        locator: "startup.md".to_string(),
-        kind: "file".to_string(),
-        role: "authoritative".to_string(),
-        status: "read".to_string(),
-        why_it_matters: "source".to_string(),
-        last_used_step: 1,
-        evidence_refs: vec!["startup.md".to_string()],
-        page_reference: None,
-        extraction_method: Some("text_read".to_string()),
-        structured_summary: None,
-    });
-    task_state.recent_actions.push(RecentActionSummary {
-        step: 2,
-        action: "respond:done".to_string(),
-        outcome: "responded to operator".to_string(),
-        artifact_refs: Vec::new(),
-    });
-
-    assert!(completion_guard(&task_state).is_none());
-}
-
-#[test]
-fn discovery_only_completion_is_blocked_until_terminal_result_exists() {
-    let mut task_state = TaskState::default();
-    task_state.working_sources.push(WorkingSource {
-        locator: "/Users/macc/Desktop".to_string(),
-        kind: "directory".to_string(),
-        role: "supporting".to_string(),
-        status: "listed".to_string(),
-        why_it_matters: "discovered initial location".to_string(),
-        last_used_step: 1,
-        evidence_refs: vec!["/Users/macc/Desktop".to_string()],
-        page_reference: None,
-        extraction_method: None,
-        structured_summary: None,
-    });
-    task_state.recent_actions.push(RecentActionSummary {
-        step: 1,
-        action: "list_directory:/Users/macc/Desktop:recursive=false".to_string(),
-        outcome: "listed desktop".to_string(),
-        artifact_refs: vec![ArtifactReference {
-            kind: "directory".to_string(),
-            locator: "/Users/macc/Desktop".to_string(),
-            status: "listed".to_string(),
-        }],
-    });
-
-    let blocker = completion_guard(&task_state);
-    assert!(matches!(
-        blocker.as_deref(),
-        Some(
-            "task still needs a terminal result; intermediate shell steps must continue into a grounded response or verified output"
-        )
-    ));
-}
-
-#[test]
-fn written_output_counts_as_terminal_result() {
-    let mut task_state = TaskState::default();
-    task_state.progress.output_written = true;
-    task_state.progress.output_verified = true;
-    task_state.recent_actions.push(RecentActionSummary {
-        step: 2,
-        action: "write_file:/tmp/out.txt".to_string(),
-        outcome: "wrote output".to_string(),
-        artifact_refs: vec![ArtifactReference {
-            kind: "file".to_string(),
-            locator: "/tmp/out.txt".to_string(),
-            status: "written".to_string(),
-        }],
-    });
-
-    assert!(completion_guard(&task_state).is_none());
-}
-
-#[test]
 fn task_state_frontier_prefers_authoritative_progress_over_generic_gap() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default()),
@@ -318,6 +179,7 @@ fn task_state_frontier_prefers_authoritative_progress_over_generic_gap() {
         page_reference: None,
         extraction_method: Some("text_read".to_string()),
         structured_summary: None,
+        preview_excerpt: Some("startup preview".to_string()),
     });
     state.recent_action_summaries.push(RecentActionSummary {
         step: 2,
@@ -340,13 +202,11 @@ fn task_state_frontier_prefers_authoritative_progress_over_generic_gap() {
 
     assert_eq!(
         task_state.frontier.open_questions.first().map(String::as_str),
-        Some("Need to use authoritative evidence to finish the requested result")
+        Some("evidence gathered from authoritative sources")
     );
     assert_eq!(
         task_state.frontier.next_action_hint.as_deref(),
-        Some(
-            "Use the authoritative evidence to take the next verifiable synthesis, answer, or action step"
-        )
+        Some("gathered evidence available for an answer")
     );
 }
 
@@ -366,6 +226,7 @@ fn compaction_preserves_authoritative_sources_before_candidates() {
             page_reference: None,
             extraction_method: None,
             structured_summary: None,
+            preview_excerpt: None,
         });
     }
     state.working_sources.push(WorkingSource {
@@ -379,6 +240,7 @@ fn compaction_preserves_authoritative_sources_before_candidates() {
         page_reference: None,
         extraction_method: Some("text_read".to_string()),
         structured_summary: None,
+        preview_excerpt: Some("authoritative preview".to_string()),
     });
     state.last_result_json = Some("{\"type\":\"directory_listing\"}".to_string());
     state.last_result_summary = Some("listed many candidates".to_string());
@@ -396,4 +258,203 @@ fn compaction_preserves_authoritative_sources_before_candidates() {
         .iter()
         .any(|source| source.locator == "authoritative.md" && source.role == "authoritative"));
     assert!(state.working_sources.len() <= 6);
+}
+
+#[test]
+fn reflection_retry_reenters_main_loop_and_can_finish_normally() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default().with_force_unchanged(true)),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "generate".to_string(),
+                    cwd: None,
+                    require_approval: false,
+                    expect_change: true,
+                    state_scope: HashScope::default(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("try the command".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::ReadFile {
+                    id: ActionId::new(),
+                    path: "startup.md".into(),
+                    max_bytes: None,
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("retry with a safer read".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: Some(ReasonerTaskFraming {
+                    intent_kind: Some(TaskKind::Answer),
+                    deliverable: Some("answer".to_string()),
+                    completion_basis: Some("inspected startup.md and answered".to_string()),
+                }),
+                reasoning: Some("finish from gathered evidence".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(MockMemory::default()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        Task::new(AgentId::new(), "check startup.md"),
+        ExecutionConfig {
+            max_steps: 4,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+}
+
+#[test]
+fn non_response_task_complete_does_not_end_loop_early() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::ReadFile {
+                    id: ActionId::new(),
+                    path: "startup.md".into(),
+                    max_bytes: None,
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("inspect first".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("only now finish".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(MockMemory::default()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        Task::new(AgentId::new(), "check startup.md"),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+}
+
+#[test]
+fn explicit_response_is_the_normal_terminal_path() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "finished".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        Task::new(AgentId::new(), "say hi"),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+}
+
+#[test]
+fn unsupported_document_read_is_avoided_after_retry_feedback() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::ExtractDocumentText {
+                    id: ActionId::new(),
+                    path: "Equipment Certificate.pdf".into(),
+                    page_start: None,
+                    page_end: None,
+                    max_chars: None,
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("extract first".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::ReadFile {
+                    id: ActionId::new(),
+                    path: "Equipment Certificate.pdf".into(),
+                    max_bytes: None,
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("try reading directly".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::ReadFile {
+                    id: ActionId::new(),
+                    path: "Equipment Certificate.pdf".into(),
+                    max_bytes: None,
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("repeat the bad action".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("answer once evidence exists".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(MockMemory::default()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        Task::new(AgentId::new(), "inspect equipment certificate"),
+        ExecutionConfig {
+            max_steps: 6,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
 }

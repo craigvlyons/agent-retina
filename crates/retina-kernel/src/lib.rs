@@ -9,8 +9,10 @@ mod task_shape;
 
 pub(crate) use crate::loop_state::{TaskLoopState, action_label};
 use crate::router::Router;
-pub(crate) use crate::support::{CircuitBreaker, EventSpec, ReflexEngine, StepSelectionContext};
-use crate::task_shape::completion_guard;
+pub(crate) use crate::support::{
+    ActionExecution, CircuitBreaker, EventSpec, ReflexEngine, StepDecision,
+    StepSelectionContext,
+};
 use retina_traits::{Memory, Reasoner, Shell};
 use retina_types::*;
 use serde_json::json;
@@ -143,6 +145,7 @@ impl Kernel {
 
         let mut state = TaskLoopState::new(max_steps);
         let mut next_reflex_action = reflex_action;
+        let mut pending_retry_step: Option<StepDecision> = None;
 
         loop {
             if state.step_index >= max_steps {
@@ -153,14 +156,7 @@ impl Kernel {
                     max_steps,
                     state.last_result_summary.clone(),
                 );
-                let reason = if let Some(blocker) = completion_guard(&task_state) {
-                    format!(
-                        "step budget exhausted after {} steps; {}",
-                        max_steps, blocker
-                    )
-                } else {
-                    format!("step budget exhausted after {} steps", max_steps)
-                };
+                let reason = format!("step budget exhausted after {} steps", max_steps);
                 self.emit_event(EventSpec::new(
                     &task,
                     Some(&intent),
@@ -185,17 +181,21 @@ impl Kernel {
                 return Ok(outcome);
             }
 
-            let step = self.select_action(
-                StepSelectionContext {
-                    task: &task,
-                    intent: &intent,
-                    state: &state,
-                    control: config.control.as_ref(),
-                    current_step: state.step_index + 1,
-                    max_steps,
-                },
-                next_reflex_action.take(),
-            )?;
+            let step = if let Some(retry_step) = pending_retry_step.take() {
+                retry_step
+            } else {
+                self.select_action(
+                    StepSelectionContext {
+                        task: &task,
+                        intent: &intent,
+                        state: &state,
+                        control: config.control.as_ref(),
+                        current_step: state.step_index + 1,
+                        max_steps,
+                    },
+                    next_reflex_action.take(),
+                )?
+            };
             if let Some(outcome) = self.check_cancellation(
                 &task,
                 Some(&intent),
@@ -205,8 +205,45 @@ impl Kernel {
             )? {
                 return Ok(outcome);
             }
-            let outcome =
+            if let Some(reason) = state
+                .avoid_reason_for_action(&step.action)
+                .filter(|reason| reason.starts_with("unsupported operation:"))
+            {
+                let execution = self.reflect_or_fail(
+                    &task,
+                    &mut intent,
+                    &step.action,
+                    config.control.as_ref(),
+                    format!("avoid repeating {} because {}", action_label(&step.action), reason),
+                    true,
+                )?;
+                match execution {
+                    ActionExecution::Retry {
+                        step: retry_step,
+                        failed_action_label,
+                        failure_reason,
+                    } => {
+                        state.record_retry_feedback(failed_action_label, failure_reason);
+                        pending_retry_step = Some(retry_step);
+                        continue;
+                    }
+                    ActionExecution::Outcome(outcome) => return Ok(outcome),
+                }
+            }
+            let execution =
                 self.execute_action(&task, &mut intent, &step, config.control.as_ref(), true)?;
+            let outcome = match execution {
+                ActionExecution::Retry {
+                    step: retry_step,
+                    failed_action_label,
+                    failure_reason,
+                } => {
+                    state.record_retry_feedback(failed_action_label, failure_reason);
+                    pending_retry_step = Some(retry_step);
+                    continue;
+                }
+                ActionExecution::Outcome(outcome) => outcome,
+            };
             let progress = state.record_step(&step.action, &outcome)?;
             state.last_reasoner_framing = step.framing.clone();
             let compaction = state.apply_live_compaction();
@@ -217,7 +254,6 @@ impl Kernel {
                 max_steps,
                 state.last_result_summary.clone(),
             );
-            let completion_blocker = completion_guard(&task_state);
 
             if let Some(compaction) = compaction {
                 self.emit_event(EventSpec::new(
@@ -240,35 +276,43 @@ impl Kernel {
                 TimelineEventType::TaskStepCompleted,
                 json!({
                     "result": "step_completed",
-                    "completion_guard_blocked": completion_blocker,
                     "task_state": task_state
                 }),
             ))?;
 
             if progress.repeated_without_progress {
-                return self.reflect_or_fail(
+                let execution = self.reflect_or_fail(
                     &task,
                     &mut intent,
                     &step.action,
                     config.control.as_ref(),
                     "repeated the same step without discovering new information".to_string(),
                     true,
-                );
+                )?;
+                match execution {
+                    ActionExecution::Retry {
+                        step: retry_step,
+                        failed_action_label,
+                        failure_reason,
+                    } => {
+                        state.record_retry_feedback(failed_action_label, failure_reason);
+                        pending_retry_step = Some(retry_step);
+                        continue;
+                    }
+                    ActionExecution::Outcome(outcome) => return Ok(outcome),
+                }
             }
 
-            if state.record_low_value_post_ingest_exploration(&step.action, &task_state) {
-                return self.reflect_or_fail(
-                    &task,
-                    &mut intent,
-                    &step.action,
-                    config.control.as_ref(),
-                    "continued low-value exploration after enough observed evidence existed to make a verifiable next move"
-                        .to_string(),
-                    true,
-                );
-            }
+            let explicit_response = matches!(
+                (&step.action, &outcome),
+                (Action::Respond { .. }, Outcome::Success(ActionResult::Response { .. }))
+            );
 
-            if step.task_complete && completion_blocker.is_none() {
+            if explicit_response {
+                let final_answer_summary = match &step.action {
+                    Action::Respond { message, .. } => Some(compact_answer_summary(message)),
+                    _ => None,
+                };
                 self.emit_event(EventSpec::new(
                     &task,
                     Some(&intent),
@@ -276,18 +320,26 @@ impl Kernel {
                     TimelineEventType::TaskCompleted,
                     json!({
                         "outcome": "success",
+                        "final_answer_summary": final_answer_summary,
                         "task_state": task_state
                     }),
                 ))?;
             }
 
-            if (step.task_complete && completion_blocker.is_none())
-                || matches!(outcome, Outcome::Failure(_) | Outcome::Blocked(_))
-            {
+            if explicit_response || matches!(outcome, Outcome::Failure(_) | Outcome::Blocked(_)) {
                 return Ok(outcome);
             }
         }
     }
+}
+
+fn compact_answer_summary(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = normalized.chars().take(240).collect::<String>();
+    if normalized.chars().count() > 240 {
+        preview.push_str("...");
+    }
+    preview
 }
 
 #[cfg(test)]

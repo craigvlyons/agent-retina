@@ -197,14 +197,69 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let recent_context = if let Some(context) = request.context.recent_context.as_ref() {
+        let answer = context
+            .prior_answer_summary
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
+        let sources = if context.sources.is_empty() {
+            "- none".to_string()
+        } else {
+            context
+                .sources
+                .iter()
+                .take(5)
+                .map(|source| {
+                    let scope = source
+                        .page_reference
+                        .as_ref()
+                        .map(|value| format!("|{value}"))
+                        .unwrap_or_default();
+                    let method = source
+                        .extraction_method
+                        .as_ref()
+                        .map(|value| format!(" via {value}"))
+                        .unwrap_or_default();
+                    format!(
+                        "- {} [{}|{}|{}{}]{}",
+                        source.locator, source.kind, source.role, source.status, scope, method
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let artifacts = if context.artifacts.is_empty() {
+            "- none".to_string()
+        } else {
+            context
+                .artifacts
+                .iter()
+                .take(5)
+                .map(|artifact| {
+                    format!(
+                        "- {} [{}|{}]",
+                        artifact.locator, artifact.kind, artifact.status
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        format!(
+            "- prior_objective: {}\n- prior_answer_summary: {}\n- sources:\n{}\n- artifacts:\n{}",
+            context.prior_objective, answer, sources, artifacts
+        )
+    } else {
+        "none".to_string()
+    };
 
     format!(
-        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n- compact source set:\n{}\n- blockers:\n{}\n\nDynamic task context follows in the next block. Observations and verified tool results are the source of truth for this step.",
+        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n- compact source set:\n{}\n- blockers:\n{}\n\nRecent conversational context:\n{}\n\nDynamic task context follows in the next block. Observations and verified tool results are the source of truth for this step. Recent conversational context is advisory only; use it when it naturally matches the current request.",
         constraints,
         request.context.task_state.progress.output_written,
         request.context.task_state.progress.output_verified,
         source_set,
-        blockers
+        blockers,
+        recent_context
     )
 }
 
@@ -249,4 +304,92 @@ fn build_compaction_instructions(request: &ReasonRequest, reflection: bool) -> S
         "Write a compact continuation artifact for this Retina task. Preserve the task goal, progress, working sources, artifact references, blockers, failed paths, and next frontier. Prefer exact file paths, IDs, and evidence references over vague prose. Keep it concise and continuation-oriented. Reflection mode: {reflection}. Task: {}. Wrap the result in <summary></summary>.",
         request.context.task
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use retina_types::*;
+
+    fn sample_request() -> ReasonRequest {
+        ReasonRequest {
+            context: AssembledContext {
+                identity: "Retina/root".to_string(),
+                task: "what is Watcher.txt about?".to_string(),
+                task_state: TaskState {
+                    goal: TaskGoal {
+                        objective: "what is Watcher.txt about?".to_string(),
+                        success_criteria: vec![],
+                        constraints: vec![],
+                    },
+                    intent_hint: None,
+                    reasoner_framing: None,
+                    progress: TaskProgress {
+                        current_phase: "working".to_string(),
+                        current_step: 1,
+                        max_steps: 50,
+                        completed_checkpoints: vec![],
+                        verified_facts: vec![],
+                        output_written: false,
+                        output_verified: false,
+                    },
+                    frontier: TaskFrontier::default(),
+                    recent_actions: vec![],
+                    working_sources: vec![],
+                    artifact_references: vec![],
+                    avoid: vec![],
+                    compaction: None,
+                },
+                recent_context: Some(RecentContext {
+                    prior_objective: "list files in texts".to_string(),
+                    prior_answer_summary: Some("Watcher.txt is a meeting notes file.".to_string()),
+                    sources: vec![WorkingSource {
+                        kind: "file".to_string(),
+                        locator: "C:/texts/Watcher.txt".to_string(),
+                        role: "authoritative".to_string(),
+                        status: "read".to_string(),
+                        why_it_matters: "recent file".to_string(),
+                        last_used_step: 2,
+                        evidence_refs: vec![],
+                        page_reference: None,
+                        extraction_method: Some("text_read".to_string()),
+                        structured_summary: None,
+                        preview_excerpt: Some("watcher notes".to_string()),
+                    }],
+                    artifacts: vec![ArtifactReference {
+                        kind: "file".to_string(),
+                        locator: "C:/texts/Watcher.txt".to_string(),
+                        status: "read".to_string(),
+                    }],
+                }),
+                tools: vec![],
+                memory_slice: vec![],
+                last_result: None,
+                last_result_summary: None,
+                recent_steps: vec![],
+                operator_guidance: None,
+                current_step: 1,
+                max_steps: 50,
+            },
+            tools: vec![],
+            constraints: vec![],
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn dynamic_context_block_includes_recent_conversational_context() {
+        let block = build_dynamic_context_block(&sample_request());
+        assert!(block.contains("Recent conversational context"));
+        assert!(block.contains("list files in texts"));
+        assert!(block.contains("C:/texts/Watcher.txt"));
+    }
+
+    #[test]
+    fn assembled_context_render_keeps_recent_context_separate_from_live_state() {
+        let rendered = sample_request().context.render();
+        assert!(rendered.contains("Recent conversational context:"));
+        assert!(rendered.contains("prior_objective: list files in texts"));
+        assert!(rendered.contains("Task state:"));
+    }
 }

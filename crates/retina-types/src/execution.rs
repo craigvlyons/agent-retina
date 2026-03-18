@@ -12,7 +12,7 @@ pub struct ExecutionConfig {
 impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
-            max_steps: 4,
+            max_steps: 50,
             control: None,
         }
     }

@@ -8,6 +8,8 @@ Run Retina from the project root:
 cd /path/to/agent-retina
 mac
 cd /Users/macc/projects/personal/agent-retina
+windows
+cd C:\Projects\agent-retina
 ```
 
 ## Environment

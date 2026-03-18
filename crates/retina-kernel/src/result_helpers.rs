@@ -557,6 +557,7 @@ pub(crate) fn working_sources_for_result(
                 page_reference: None,
                 extraction_method: None,
                 structured_summary: None,
+                preview_excerpt: None,
             })
             .collect(),
         ActionResult::DirectoryListing { root, .. } => vec![WorkingSource {
@@ -570,6 +571,7 @@ pub(crate) fn working_sources_for_result(
             page_reference: None,
             extraction_method: None,
             structured_summary: None,
+            preview_excerpt: None,
         }],
         ActionResult::FileMatches { matches, .. } => matches
             .iter()
@@ -585,9 +587,10 @@ pub(crate) fn working_sources_for_result(
                 page_reference: None,
                 extraction_method: None,
                 structured_summary: None,
+                preview_excerpt: None,
             })
             .collect(),
-        ActionResult::FileRead { path, .. } => vec![WorkingSource {
+        ActionResult::FileRead { path, content, .. } => vec![WorkingSource {
             kind: "file".to_string(),
             locator: path.display().to_string(),
             role: "authoritative".to_string(),
@@ -598,6 +601,7 @@ pub(crate) fn working_sources_for_result(
             page_reference: None,
             extraction_method: Some("text_read".to_string()),
             structured_summary: None,
+            preview_excerpt: Some(preview_text(content, 100)),
         }],
         ActionResult::StructuredData {
             path,
@@ -621,9 +625,11 @@ pub(crate) fn working_sources_for_result(
                 sample_rows: rows.len(),
                 total_rows: *total_rows,
             }),
+            preview_excerpt: None,
         }],
         ActionResult::DocumentText {
             path,
+            content,
             extraction_method,
             page_range,
             ..
@@ -638,6 +644,7 @@ pub(crate) fn working_sources_for_result(
             page_reference: page_range.as_ref().map(DocumentPageRange::render),
             extraction_method: Some(extraction_method.clone()),
             structured_summary: None,
+            preview_excerpt: Some(preview_text(content, 100)),
         }],
         ActionResult::TextSearch { matches, .. } => matches
             .iter()
@@ -653,6 +660,7 @@ pub(crate) fn working_sources_for_result(
                 page_reference: None,
                 extraction_method: None,
                 structured_summary: None,
+                preview_excerpt: Some(preview_text(&item.line, 100)),
             })
             .collect(),
         ActionResult::FileWrite {
@@ -680,6 +688,7 @@ pub(crate) fn working_sources_for_result(
             page_reference: None,
             extraction_method: Some("file_write".to_string()),
             structured_summary: None,
+            preview_excerpt: None,
         }],
         ActionResult::Command(command) => {
             let mut sources = vec![WorkingSource {
@@ -699,6 +708,7 @@ pub(crate) fn working_sources_for_result(
                 page_reference: None,
                 extraction_method: Some("run_command".to_string()),
                 structured_summary: None,
+                preview_excerpt: Some(preview_text(&command.stdout, 100)),
             }];
             sources.extend(command.observed_paths.iter().map(|path| WorkingSource {
                 kind: "file".to_string(),
@@ -711,6 +721,7 @@ pub(crate) fn working_sources_for_result(
                 page_reference: None,
                 extraction_method: Some("run_command".to_string()),
                 structured_summary: None,
+                preview_excerpt: None,
             }));
             sources
         }
@@ -725,6 +736,7 @@ pub(crate) fn working_sources_for_result(
             page_reference: None,
             extraction_method: Some("record_note".to_string()),
             structured_summary: None,
+            preview_excerpt: Some(preview_text(note, 80)),
         }],
         ActionResult::Response { .. } => Vec::new(),
     }

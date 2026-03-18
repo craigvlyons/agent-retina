@@ -1,4 +1,4 @@
-use crate::{Action, AgentId, TaskKind, TaskState};
+use crate::{Action, AgentId, ArtifactReference, TaskKind, TaskState, WorkingSource};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -8,6 +8,8 @@ pub struct AssembledContext {
     pub identity: String,
     pub task: String,
     pub task_state: TaskState,
+    #[serde(default)]
+    pub recent_context: Option<RecentContext>,
     pub tools: Vec<ToolDescriptor>,
     pub memory_slice: Vec<String>,
     pub last_result: Option<String>,
@@ -36,15 +38,21 @@ impl AssembledContext {
         } else {
             self.recent_steps.join("\n")
         };
+        let recent_context = self
+            .recent_context
+            .as_ref()
+            .map(RecentContext::render)
+            .unwrap_or_else(|| "none".to_string());
         let operator_guidance = self
             .operator_guidance
             .clone()
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "Identity:\n{}\n\nTask:\n{}\n\nTask state:\n{}\n\nTools:\n{}\n\nMemory:\n{}\n\nRecent steps:\n{}\n\nOperator guidance:\n{}\n\nLast result summary:\n{}\n\nLast result:\n{}",
+            "Identity:\n{}\n\nTask:\n{}\n\nTask state:\n{}\n\nRecent conversational context:\n{}\n\nTools:\n{}\n\nMemory:\n{}\n\nRecent steps:\n{}\n\nOperator guidance:\n{}\n\nLast result summary:\n{}\n\nLast result:\n{}",
             self.identity,
             self.task,
             self.task_state.render(),
+            recent_context,
             tools,
             memory,
             recent_steps,
@@ -55,6 +63,48 @@ impl AssembledContext {
             self.last_result
                 .clone()
                 .unwrap_or_else(|| "none".to_string())
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecentContext {
+    pub prior_objective: String,
+    pub prior_answer_summary: Option<String>,
+    pub sources: Vec<WorkingSource>,
+    pub artifacts: Vec<ArtifactReference>,
+}
+
+impl RecentContext {
+    pub fn render(&self) -> String {
+        let answer = self
+            .prior_answer_summary
+            .clone()
+            .unwrap_or_else(|| "none".to_string());
+        let sources = if self.sources.is_empty() {
+            "  - none".to_string()
+        } else {
+            self.sources
+                .iter()
+                .map(WorkingSource::render)
+                .map(|item| format!("  {}", item))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let artifacts = if self.artifacts.is_empty() {
+            "  - none".to_string()
+        } else {
+            self.artifacts
+                .iter()
+                .map(ArtifactReference::render)
+                .map(|item| format!("  {}", item))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        format!(
+            "- prior_objective: {}\n- prior_answer_summary: {}\n- sources:\n{}\n- artifacts:\n{}",
+            self.prior_objective, answer, sources, artifacts
         )
     }
 }

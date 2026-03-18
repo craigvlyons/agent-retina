@@ -158,7 +158,7 @@ impl ChatSession {
         let task = self.agent.spawn_task(
             line.to_string(),
             ExecutionConfig {
-                max_steps: 6,
+                max_steps: 50,
                 control: None,
             },
         );

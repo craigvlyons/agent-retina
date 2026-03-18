@@ -1,4 +1,4 @@
-use crate::{Action, AgentId, HashScope, IntentId, TaskId};
+use crate::{Action, AgentId, HashScope, IntentId, RecentContext, TaskId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -10,6 +10,8 @@ pub struct Task {
     pub agent_id: AgentId,
     pub description: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub recent_context: Option<RecentContext>,
     pub metadata: BTreeMap<String, String>,
 }
 
@@ -21,6 +23,7 @@ impl Task {
             agent_id,
             description: description.into(),
             created_at: Utc::now(),
+            recent_context: None,
             metadata: BTreeMap::new(),
         }
     }

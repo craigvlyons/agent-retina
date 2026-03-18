@@ -94,7 +94,7 @@ impl AgentController {
         task_description: impl Into<String>,
         config: ExecutionConfig,
     ) -> Result<Outcome> {
-        let task = Task::new(root_agent_id(), task_description.into());
+        let task = build_task_for_description(task_description.into())?;
         self.execute_with_root_state(task, move |kernel, task| {
             kernel.execute_task_with_config(task, config)
         })
@@ -105,7 +105,9 @@ impl AgentController {
         task_description: impl Into<String>,
         mut config: ExecutionConfig,
     ) -> RunningTask {
-        let task = Task::new(root_agent_id(), task_description.into());
+        let task_description = task_description.into();
+        let task = build_task_for_description(task_description.clone())
+            .unwrap_or_else(|_| Task::new(root_agent_id(), task_description));
         let control = ExecutionControl::new();
         let control_handle = control.handle();
         config.control = Some(control_handle.clone());
@@ -132,6 +134,119 @@ impl AgentController {
             receiver,
         }
     }
+}
+
+fn build_task_for_description(task_description: String) -> Result<Task> {
+    let mut task = Task::new(root_agent_id(), task_description);
+    task.recent_context = latest_recent_context_from_memory()?;
+    Ok(task)
+}
+
+fn latest_recent_context_from_memory() -> Result<Option<RecentContext>> {
+    let memory = open_memory(root_db_path()?)?;
+    let events = memory.recent_states(200)?;
+    Ok(latest_recent_context_from_events(&events))
+}
+
+fn latest_recent_context_from_events(events: &[TimelineEvent]) -> Option<RecentContext> {
+    let completed = events
+        .iter()
+        .find(|event| matches!(event.event_type, TimelineEventType::TaskCompleted))?;
+    let task_state = completed
+        .payload_json
+        .get("task_state")
+        .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())?;
+
+    let prior_answer_summary = completed
+        .payload_json
+        .get("final_answer_summary")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            task_state.recent_actions.iter().rev().find_map(|action| {
+                action
+                    .action
+                    .strip_prefix("respond:")
+                    .map(compact_answer_summary)
+            })
+        });
+
+    Some(RecentContext {
+        prior_objective: task_state.goal.objective.clone(),
+        prior_answer_summary,
+        sources: select_recent_sources(&task_state.working_sources),
+        artifacts: select_recent_artifacts(&task_state.artifact_references),
+    })
+}
+
+fn select_recent_sources(sources: &[WorkingSource]) -> Vec<WorkingSource> {
+    let mut ranked = sources
+        .iter()
+        .filter(|source| source.kind != "command")
+        .cloned()
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        source_rank(right)
+            .cmp(&source_rank(left))
+            .then_with(|| right.last_used_step.cmp(&left.last_used_step))
+            .then_with(|| left.locator.cmp(&right.locator))
+    });
+    ranked.truncate(5);
+    ranked
+}
+
+fn select_recent_artifacts(artifacts: &[ArtifactReference]) -> Vec<ArtifactReference> {
+    let mut ranked = artifacts
+        .iter()
+        .filter(|artifact| artifact.kind != "command")
+        .cloned()
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        artifact_rank(right)
+            .cmp(&artifact_rank(left))
+            .then_with(|| left.locator.cmp(&right.locator))
+    });
+    ranked.truncate(5);
+    ranked
+}
+
+fn source_rank(source: &WorkingSource) -> u8 {
+    let role_rank = match source.role.as_str() {
+        "authoritative" => 4,
+        "generated" => 3,
+        "supporting" => 2,
+        "candidate" => 1,
+        _ => 0,
+    };
+    let status_rank = match source.status.as_str() {
+        "read" | "excerpted" | "ingested" => 4,
+        "created" | "written" | "overwritten" | "appended" | "command_changed" => 4,
+        "matched_text" => 3,
+        "matched" => 2,
+        "listed" | "inspected" => 1,
+        _ => 0,
+    };
+    role_rank * 10 + status_rank
+}
+
+fn artifact_rank(artifact: &ArtifactReference) -> u8 {
+    match artifact.status.as_str() {
+        "read" | "structured_read" | "extracted" => 5,
+        "created" | "written" | "overwritten" | "appended" | "command_changed" => 4,
+        "searched" => 3,
+        "matched" => 2,
+        "listed" | "inspected" => 1,
+        _ => 0,
+    }
+}
+
+fn compact_answer_summary(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = normalized.chars().take(240).collect::<String>();
+    if normalized.chars().count() > 240 {
+        preview.push_str("...");
+    }
+    preview
 }
 
 impl RunningTask {
@@ -372,4 +487,148 @@ fn summarize_compaction_stats(events: &[TimelineEvent]) -> CompactionStats {
     }
 
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use serde_json::json;
+
+    fn completed_event(
+        objective: &str,
+        final_answer_summary: Option<&str>,
+        mut task_state: TaskState,
+        timestamp: chrono::DateTime<Utc>,
+    ) -> TimelineEvent {
+        task_state.goal.objective = objective.to_string();
+        TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: root_agent_id(),
+            timestamp,
+            event_type: TimelineEventType::TaskCompleted,
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            delta_summary: None,
+            duration_ms: None,
+            payload_json: json!({
+                "final_answer_summary": final_answer_summary,
+                "task_state": task_state
+            }),
+        }
+    }
+
+    fn sample_task_state() -> TaskState {
+        TaskState {
+            goal: TaskGoal {
+                objective: "placeholder".to_string(),
+                success_criteria: vec![],
+                constraints: vec![],
+            },
+            intent_hint: None,
+            reasoner_framing: None,
+            progress: TaskProgress {
+                current_phase: "working".to_string(),
+                current_step: 2,
+                max_steps: 50,
+                completed_checkpoints: vec![],
+                verified_facts: vec![],
+                output_written: false,
+                output_verified: false,
+            },
+            frontier: TaskFrontier::default(),
+            recent_actions: vec![RecentActionSummary {
+                step: 2,
+                action: "respond:summary".to_string(),
+                outcome: "responded to operator".to_string(),
+                artifact_refs: vec![],
+            }],
+            working_sources: vec![
+                WorkingSource {
+                    kind: "command".to_string(),
+                    locator: "dir".to_string(),
+                    role: "supporting".to_string(),
+                    status: "executed".to_string(),
+                    why_it_matters: "noise".to_string(),
+                    last_used_step: 1,
+                    evidence_refs: vec![],
+                    page_reference: None,
+                    extraction_method: Some("run_command".to_string()),
+                    structured_summary: None,
+                    preview_excerpt: None,
+                },
+                WorkingSource {
+                    kind: "file".to_string(),
+                    locator: "C:/texts/Watcher.txt".to_string(),
+                    role: "authoritative".to_string(),
+                    status: "read".to_string(),
+                    why_it_matters: "real source".to_string(),
+                    last_used_step: 2,
+                    evidence_refs: vec![],
+                    page_reference: None,
+                    extraction_method: Some("text_read".to_string()),
+                    structured_summary: None,
+                    preview_excerpt: Some("watcher notes".to_string()),
+                },
+            ],
+            artifact_references: vec![
+                ArtifactReference {
+                    kind: "command".to_string(),
+                    locator: "dir".to_string(),
+                    status: "executed".to_string(),
+                },
+                ArtifactReference {
+                    kind: "file".to_string(),
+                    locator: "C:/texts/Watcher.txt".to_string(),
+                    status: "read".to_string(),
+                },
+            ],
+            avoid: vec![],
+            compaction: None,
+        }
+    }
+
+    #[test]
+    fn latest_recent_context_uses_only_latest_completed_task() {
+        let older = completed_event(
+            "list files in texts",
+            Some("older"),
+            sample_task_state(),
+            Utc::now() - chrono::Duration::minutes(2),
+        );
+        let newer = completed_event(
+            "what is Watcher.txt about?",
+            Some("newer"),
+            sample_task_state(),
+            Utc::now(),
+        );
+
+        let recent = latest_recent_context_from_events(&[newer.clone(), older]).unwrap();
+        assert_eq!(recent.prior_objective, "what is Watcher.txt about?");
+        assert_eq!(recent.prior_answer_summary.as_deref(), Some("newer"));
+    }
+
+    #[test]
+    fn latest_recent_context_prefers_authoritative_sources_and_non_command_artifacts() {
+        let recent = latest_recent_context_from_events(&[completed_event(
+            "list files in texts",
+            None,
+            sample_task_state(),
+            Utc::now(),
+        )])
+        .unwrap();
+
+        assert_eq!(recent.sources.len(), 1);
+        assert_eq!(recent.sources[0].locator, "C:/texts/Watcher.txt");
+        assert_eq!(recent.artifacts.len(), 1);
+        assert_eq!(recent.artifacts[0].locator, "C:/texts/Watcher.txt");
+        assert_eq!(
+            recent.prior_answer_summary.as_deref(),
+            Some("summary")
+        );
+    }
 }

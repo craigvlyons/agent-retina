@@ -4,7 +4,6 @@ use crate::result_helpers::{
     prioritized_working_sources, repeated_step_signature, summarize_action_result,
     working_sources_for_result,
 };
-use crate::task_shape::task_state_needs_terminal_result;
 use retina_types::*;
 use std::collections::HashMap;
 
@@ -22,7 +21,6 @@ pub(crate) struct TaskLoopState {
     pub(crate) last_compaction_reason: Option<String>,
     pub(crate) last_compaction_snapshot: Option<CompactionSnapshot>,
     seen_signatures: HashMap<String, usize>,
-    low_value_discovery_steps: usize,
 }
 
 impl TaskLoopState {
@@ -41,7 +39,6 @@ impl TaskLoopState {
             last_compaction_reason: None,
             last_compaction_snapshot: None,
             seen_signatures: HashMap::new(),
-            low_value_discovery_steps: 0,
         }
     }
 
@@ -78,7 +75,7 @@ impl TaskLoopState {
                 if let Some(signature) = repeated_step_signature(action, result) {
                     let count = self.seen_signatures.entry(signature).or_insert(0);
                     *count += 1;
-                    repeated_without_progress = *count > 1;
+                    repeated_without_progress = *count > 3;
                 }
                 Some(
                     compact_action_result_for_context(result)
@@ -131,37 +128,30 @@ impl TaskLoopState {
         })
     }
 
-    pub(crate) fn record_low_value_post_ingest_exploration(
-        &mut self,
-        action: &Action,
-        task_state: &TaskState,
-    ) -> bool {
-        let discovery_action = matches!(
-            action,
-            Action::InspectPath { .. }
-                | Action::InspectWorkingDirectory { .. }
-                | Action::ListDirectory { .. }
-                | Action::FindFiles { .. }
-                | Action::SearchText { .. }
-        );
-        let has_any_evidence = !task_state.working_sources.is_empty()
-            || !task_state.artifact_references.is_empty()
-            || !task_state.progress.verified_facts.is_empty();
-        let should_count = discovery_action
-            && has_any_evidence
-            && task_state_needs_terminal_result(task_state)
-            && task_state
-                .recent_actions
-                .iter()
-                .any(|summary| !summary.action.starts_with("respond:"));
-
-        if should_count {
-            self.low_value_discovery_steps += 1;
-        } else {
-            self.low_value_discovery_steps = 0;
+    pub(crate) fn record_retry_feedback(&mut self, failed_action_label: String, reason: String) {
+        if let Some(existing) = self
+            .avoid_rules
+            .iter_mut()
+            .find(|rule| rule.label == failed_action_label)
+        {
+            existing.reason = reason;
+            return;
         }
 
-        self.low_value_discovery_steps > 1
+        self.avoid_rules.push(AvoidRule {
+            label: failed_action_label,
+            reason,
+        });
+        trim_avoid_rules(&mut self.avoid_rules);
+    }
+
+    pub(crate) fn avoid_reason_for_action(&self, action: &Action) -> Option<&str> {
+        let label = action_label(action);
+        self.avoid_rules
+            .iter()
+            .rev()
+            .find(|rule| rule.label == label)
+            .map(|rule| rule.reason.as_str())
     }
 
     pub(crate) fn apply_live_compaction(&mut self) -> Option<CompactionDecision> {

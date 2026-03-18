@@ -401,39 +401,59 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             }),
         TimelineEventType::TaskStepCompleted => event
             .payload_json
-            .get("completion_guard_blocked")
-            .and_then(Value::as_str)
-            .map(|reason| format!("not done: {reason}"))
-            .or_else(|| {
-                event
-                    .payload_json
-                    .get("task_state")
-                    .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
-                    .and_then(|task_state| {
+            .get("task_state")
+            .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
+            .and_then(|task_state| {
+                let responded = task_state
+                    .recent_actions
+                    .last()
+                    .map(|summary| summary.action.starts_with("respond:"))
+                    .unwrap_or(false);
+                if responded {
+                    return None;
+                }
+                task_state
+                    .frontier
+                    .blockers
+                    .first()
+                    .map(|blocker| format!("blocked: {blocker}"))
+                    .or_else(|| {
+                        task_state.working_sources.last().map(|source| {
+                            let preview = source
+                                .preview_excerpt
+                                .as_ref()
+                                .map(|value| format!(" | {}", value))
+                                .unwrap_or_default();
+                            let method = source
+                                .extraction_method
+                                .as_ref()
+                                .map(|value| format!(" via {value}"))
+                                .unwrap_or_default();
+                            format!(
+                                "observed: {} [{}{}]{}",
+                                source.locator, source.status, method, preview
+                            )
+                        })
+                    })
+                    .or_else(|| {
                         task_state
                             .frontier
-                            .blockers
+                            .open_questions
                             .first()
-                            .map(|blocker| format!("blocked: {blocker}"))
-                            .or_else(|| {
-                                task_state
-                                    .frontier
-                                    .open_questions
-                                    .first()
-                                    .map(|question| format!("next gap: {question}"))
-                            })
-                            .or_else(|| {
-                                task_state.working_sources.last().map(|source| {
-                                    format!("source: {} [{}]", source.locator, source.status)
-                                })
-                            })
+                            .map(|question| format!("observed: {question}"))
                     })
             }),
         TimelineEventType::ReflectionRequested => event
             .payload_json
             .get("reason")
             .and_then(Value::as_str)
-            .map(|reason| format!("reflection: {reason}")),
+            .map(|reason| {
+                if reason.starts_with("unsupported operation:") {
+                    "retried after tool mismatch".to_string()
+                } else {
+                    format!("reflection: {reason}")
+                }
+            }),
         TimelineEventType::TaskFailed => event
             .payload_json
             .get("reason")
@@ -714,6 +734,7 @@ mod tests {
                 page_reference: None,
                 extraction_method: None,
                 structured_summary: None,
+                preview_excerpt: None,
             }],
             artifact_references: vec![],
             avoid: vec![],
@@ -742,5 +763,129 @@ mod tests {
             render_chat_event(&event, false),
             "blocked: required input still not ingested: dominican_Med.pdf\n"
         );
+    }
+
+    #[test]
+    fn task_step_completed_uses_observed_status_for_sources() {
+        let task_state = TaskState {
+            goal: TaskGoal {
+                objective: "summarize pdf".to_string(),
+                success_criteria: vec![],
+                constraints: vec![],
+            },
+            progress: TaskProgress {
+                current_phase: "working".to_string(),
+                current_step: 2,
+                max_steps: 50,
+                completed_checkpoints: vec![],
+                verified_facts: vec![],
+                output_written: false,
+                output_verified: false,
+            },
+            intent_hint: None,
+            reasoner_framing: None,
+            frontier: TaskFrontier {
+                open_questions: vec!["evidence gathered from authoritative sources".to_string()],
+                blockers: vec![],
+                next_action_hint: Some("gathered evidence available for an answer".to_string()),
+            },
+            recent_actions: vec![],
+            working_sources: vec![WorkingSource {
+                locator: "plan.pdf".to_string(),
+                kind: "document".to_string(),
+                role: "authoritative".to_string(),
+                status: "excerpted".to_string(),
+                why_it_matters: "source".to_string(),
+                last_used_step: 2,
+                evidence_refs: vec!["plan.pdf".to_string()],
+                page_reference: None,
+                extraction_method: Some("pdf_extract".to_string()),
+                structured_summary: None,
+                preview_excerpt: Some("panel schedule and electrical notes".to_string()),
+            }],
+            artifact_references: vec![],
+            avoid: vec![],
+            compaction: None,
+        };
+
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskStepCompleted,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "task_state": task_state
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "observed: plan.pdf [excerpted via pdf_extract] | panel schedule and electrical notes\n"
+        );
+    }
+
+    #[test]
+    fn task_step_completed_suppresses_next_gap_after_response() {
+        let task_state = TaskState {
+            goal: TaskGoal {
+                objective: "answer question".to_string(),
+                success_criteria: vec![],
+                constraints: vec![],
+            },
+            progress: TaskProgress {
+                current_phase: "working".to_string(),
+                current_step: 2,
+                max_steps: 50,
+                completed_checkpoints: vec![],
+                verified_facts: vec![],
+                output_written: false,
+                output_verified: false,
+            },
+            intent_hint: None,
+            reasoner_framing: None,
+            frontier: TaskFrontier {
+                open_questions: vec!["evidence gathered from authoritative sources".to_string()],
+                blockers: vec![],
+                next_action_hint: Some("gathered evidence available for an answer".to_string()),
+            },
+            recent_actions: vec![RecentActionSummary {
+                step: 2,
+                action: "respond:done".to_string(),
+                outcome: "responded to operator".to_string(),
+                artifact_refs: vec![],
+            }],
+            working_sources: vec![],
+            artifact_references: vec![],
+            avoid: vec![],
+            compaction: None,
+        };
+
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskStepCompleted,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "task_state": task_state
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(render_chat_event(&event, false), "");
     }
 }

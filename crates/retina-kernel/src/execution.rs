@@ -1,7 +1,8 @@
 use crate::result_helpers::{should_retry, summarize_verified_facts};
 use crate::support::{
-    ContextAssemblyInput, EventSpec, StepDecision, StepSelectionContext, action_failure_reason,
-    action_requires_approval, action_utility, approval_reason, default_tool_descriptors,
+    ActionExecution, ContextAssemblyInput, EventSpec, StepDecision, StepSelectionContext,
+    action_failure_reason, action_requires_approval, action_utility, approval_reason,
+    default_tool_descriptors,
 };
 use crate::task_shape::{build_task_frontier, current_intent_hint, describe_task_phase};
 use crate::{Kernel, TaskLoopState, action_label};
@@ -33,7 +34,6 @@ impl Kernel {
             ))?;
             return Ok(StepDecision {
                 action,
-                task_complete: true,
                 framing: None,
             });
         }
@@ -73,7 +73,6 @@ impl Kernel {
         ))?;
         Ok(StepDecision {
             action: response.action,
-            task_complete: response.task_complete,
             framing: response.framing,
         })
     }
@@ -85,7 +84,7 @@ impl Kernel {
         step: &StepDecision,
         control: Option<&ExecutionControlHandle>,
         allow_retry: bool,
-    ) -> Result<Outcome> {
+    ) -> Result<ActionExecution> {
         let mut action = step.action.clone();
         intent.action = Some(action.clone());
         intent.expects_change = action.expects_change();
@@ -98,7 +97,7 @@ impl Kernel {
             control,
             "before pre-state capture",
         )? {
-            return Ok(outcome);
+            return Ok(ActionExecution::Outcome(outcome));
         }
 
         let pre = self.shell.capture_state(&intent.hash_scope)?;
@@ -121,19 +120,21 @@ impl Kernel {
                 control,
                 "before approval prompt",
             )? {
-                return Ok(outcome);
+                return Ok(ActionExecution::Outcome(outcome));
             }
             let response = self.shell.request_approval(&ApprovalRequest {
                 action: action_label(&action),
                 reason: approval_reason(&action),
             })?;
             if matches!(response, ApprovalResponse::Cancelled) {
-                return self.cancel_outcome(
+                return self
+                    .cancel_outcome(
                     task,
                     Some(intent),
                     Some(&action),
                     "task cancelled by operator during approval",
-                );
+                )
+                    .map(ActionExecution::Outcome);
             }
             if matches!(response, ApprovalResponse::Denied) {
                 return Err(KernelError::ApprovalDenied(
@@ -159,7 +160,7 @@ impl Kernel {
             control,
             "before action execution",
         )? {
-            return Ok(outcome);
+            return Ok(ActionExecution::Outcome(outcome));
         }
 
         let mut result = match self.shell.execute_controlled(&action, control) {
@@ -195,7 +196,8 @@ impl Kernel {
                         .termination
                         .clone()
                         .unwrap_or_else(|| "task cancelled by operator".to_string()),
-                );
+                )
+                .map(ActionExecution::Outcome);
             }
         }
 
@@ -206,7 +208,7 @@ impl Kernel {
             control,
             "after action result",
         )? {
-            return Ok(outcome);
+            return Ok(ActionExecution::Outcome(outcome));
         }
 
         let post = self.shell.capture_state(&intent.hash_scope)?;
@@ -276,7 +278,7 @@ impl Kernel {
             self.circuit_breaker.record_failure(intent);
             return self.reflect_or_fail(task, intent, &action, control, reason, allow_retry);
         }
-        Ok(Outcome::Success(result))
+        Ok(ActionExecution::Outcome(Outcome::Success(result)))
     }
 
     pub(crate) fn reflect_or_fail(
@@ -287,7 +289,7 @@ impl Kernel {
         control: Option<&ExecutionControlHandle>,
         reason: String,
         allow_retry: bool,
-    ) -> Result<Outcome> {
+    ) -> Result<ActionExecution> {
         if let Some(outcome) = self.check_cancellation(
             task,
             Some(intent),
@@ -295,7 +297,7 @@ impl Kernel {
             control,
             "before reflection",
         )? {
-            return Ok(outcome);
+            return Ok(ActionExecution::Outcome(outcome));
         }
         self.emit_event(EventSpec::new(
             task,
@@ -358,16 +360,18 @@ impl Kernel {
             control,
             "after reflection",
         )? {
-            return Ok(outcome);
+            return Ok(ActionExecution::Outcome(outcome));
         }
 
         if allow_retry && should_retry(action, &reflection.action) {
-            let retry_step = StepDecision {
-                action: reflection.action,
-                task_complete: reflection.task_complete,
-                framing: reflection.framing,
-            };
-            return self.execute_action(task, intent, &retry_step, control, false);
+            return Ok(ActionExecution::Retry {
+                step: StepDecision {
+                    action: reflection.action,
+                    framing: reflection.framing,
+                },
+                failed_action_label: action_label(action),
+                failure_reason: reason,
+            });
         }
 
         self.emit_event(EventSpec::new(
@@ -377,7 +381,7 @@ impl Kernel {
             TimelineEventType::TaskFailed,
             json!({ "reason": reason }),
         ))?;
-        Ok(Outcome::Failure(reason))
+        Ok(ActionExecution::Outcome(Outcome::Failure(reason)))
     }
 
     pub(crate) fn record_experience(
@@ -457,6 +461,7 @@ impl Kernel {
                     last_result_summary.clone(),
                 )
                 .with_constraints(shell_constraints),
+            recent_context: task.recent_context.clone(),
             tools,
             memory_slice: experiences
                 .into_iter()
@@ -632,11 +637,14 @@ fn derive_success_criteria(
         });
 
     if has_candidate_sources && !has_authoritative_source {
-        criteria.push("at least one discovered candidate is promoted into authoritative evidence".to_string());
+        criteria.push(
+            "discovered paths should lead to a concrete inspection, read, or answer step"
+                .to_string(),
+        );
     }
 
     if has_authoritative_source && !has_generated_output {
-        criteria.push("authoritative evidence is used to complete the next meaningful task obligation".to_string());
+        criteria.push("gathered evidence is used to answer or take the next concrete step".to_string());
     }
 
     if output_written || has_generated_output {
