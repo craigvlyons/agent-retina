@@ -184,13 +184,14 @@ impl Kernel {
             let step = if let Some(retry_step) = pending_retry_step.take() {
                 retry_step
             } else {
+                let current_step = state.step_index + 1;
                 self.select_action(
                     StepSelectionContext {
                         task: &task,
                         intent: &intent,
-                        state: &state,
+                        state: &mut state,
                         control: config.control.as_ref(),
-                        current_step: state.step_index + 1,
+                        current_step,
                         max_steps,
                     },
                     next_reflex_action.take(),

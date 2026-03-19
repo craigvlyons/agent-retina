@@ -3,6 +3,7 @@ use crate::support::recover_mutex;
 
 use retina_test_utils::{MockMemory, MockReasoner, MockShell};
 use std::sync::{Arc, Mutex};
+use tempfile::tempdir;
 
 fn must<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
     result.unwrap_or_else(|error| panic!("test operation failed: {error}"))
@@ -10,7 +11,6 @@ fn must<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
 
 #[derive(Clone)]
 struct GuidanceReasoner {
-    seen_guidance: Arc<Mutex<Vec<Option<String>>>>,
     seen_task_states: Arc<Mutex<Vec<TaskState>>>,
     responses: Arc<Mutex<Vec<ReasonResponse>>>,
 }
@@ -18,7 +18,6 @@ struct GuidanceReasoner {
 impl GuidanceReasoner {
     fn new(responses: Vec<ReasonResponse>) -> Self {
         Self {
-            seen_guidance: Arc::new(Mutex::new(Vec::new())),
             seen_task_states: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(responses)),
         }
@@ -31,7 +30,6 @@ impl GuidanceReasoner {
 
 impl retina_traits::Reasoner for GuidanceReasoner {
     fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
-        recover_mutex(&self.seen_guidance).push(request.context.operator_guidance.clone());
         recover_mutex(&self.seen_task_states).push(request.context.task_state.clone());
         let mut responses = recover_mutex(&self.responses);
         Ok(if responses.len() > 1 {
@@ -202,11 +200,15 @@ fn task_state_frontier_prefers_authoritative_progress_over_generic_gap() {
 
     assert_eq!(
         task_state.frontier.open_questions.first().map(String::as_str),
-        Some("evidence gathered from authoritative sources")
+        Some("use the authoritative evidence to finish the requested answer")
     );
     assert_eq!(
         task_state.frontier.next_action_hint.as_deref(),
         Some("gathered evidence available for an answer")
+    );
+    assert_eq!(
+        task_state.progress.remaining_obligation.as_deref(),
+        Some("use the authoritative evidence to finish the requested answer")
     );
 }
 
@@ -258,6 +260,162 @@ fn compaction_preserves_authoritative_sources_before_candidates() {
         .iter()
         .any(|source| source.locator == "authoritative.md" && source.role == "authoritative"));
     assert!(state.working_sources.len() <= 6);
+}
+
+#[test]
+fn output_task_state_tracks_pending_deliverable_and_existing_target() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let temp = tempdir().unwrap_or_else(|error| panic!("tempdir failed: {error}"));
+    let target = temp.path().join("summary.md");
+    std::fs::write(&target, "existing").unwrap_or_else(|error| panic!("write failed: {error}"));
+
+    let mut state = TaskLoopState::new(6);
+    state.step_index = 3;
+    state.working_sources.push(WorkingSource {
+        locator: "startup.md".to_string(),
+        kind: "file".to_string(),
+        role: "authoritative".to_string(),
+        status: "read".to_string(),
+        why_it_matters: "source".to_string(),
+        last_used_step: 3,
+        evidence_refs: vec!["startup.md".to_string()],
+        page_reference: None,
+        extraction_method: Some("text_read".to_string()),
+        structured_summary: None,
+        preview_excerpt: Some("preview".to_string()),
+    });
+
+    let objective = format!("update {} again from startup.md", target.display());
+    let task = Task::new(AgentId::new(), &objective);
+    let task_state = kernel.build_task_state(&task, &state, 3, 6, Some("read startup.md".to_string()));
+    let target_display = target.display().to_string();
+    let pending_deliverable = format!("write or update {}", target.display());
+    let remaining = format!(
+        "overwrite or confirm {} using the gathered evidence",
+        target.display()
+    );
+
+    assert_eq!(
+        task_state.progress.target_output_path.as_deref(),
+        Some(target_display.as_str())
+    );
+    assert!(task_state.progress.target_output_exists);
+    assert_eq!(
+        task_state.progress.pending_deliverable.as_deref(),
+        Some(pending_deliverable.as_str())
+    );
+    assert_eq!(
+        task_state.progress.remaining_obligation.as_deref(),
+        Some(remaining.as_str())
+    );
+}
+
+#[test]
+fn low_value_discovery_is_reconsidered_when_output_target_is_ready() {
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default().with_files([("startup.md", "hello") ])),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::ReadFile {
+                    id: ActionId::new(),
+                    path: "startup.md".into(),
+                    max_bytes: None,
+                },
+                task_complete: false,
+                framing: Some(ReasonerTaskFraming {
+                    intent_kind: Some(TaskKind::Output),
+                    deliverable: Some("summary.md".to_string()),
+                    completion_basis: None,
+                }),
+                reasoning: Some("read first".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::FindFiles {
+                    id: ActionId::new(),
+                    root: ".".into(),
+                    pattern: "*summary*".to_string(),
+                    max_results: 20,
+                },
+                task_complete: false,
+                framing: Some(ReasonerTaskFraming {
+                    intent_kind: Some(TaskKind::Output),
+                    deliverable: Some("summary.md".to_string()),
+                    completion_basis: None,
+                }),
+                reasoning: Some("search again".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::WriteFile {
+                    id: ActionId::new(),
+                    path: "summary.md".into(),
+                    content: "summary".to_string(),
+                    overwrite: true,
+                },
+                task_complete: false,
+                framing: Some(ReasonerTaskFraming {
+                    intent_kind: Some(TaskKind::Output),
+                    deliverable: Some("summary.md".to_string()),
+                    completion_basis: Some("write the requested output".to_string()),
+                }),
+                reasoning: Some("write now".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: Some(ReasonerTaskFraming {
+                    intent_kind: Some(TaskKind::Output),
+                    deliverable: Some("summary.md".to_string()),
+                    completion_basis: Some("written and verified".to_string()),
+                }),
+                reasoning: Some("finish".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(memory.clone()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        Task::new(AgentId::new(), "create summary.md from startup.md"),
+        ExecutionConfig {
+            max_steps: 4,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+
+    let events = must(memory.recent_states(20));
+    let dispatched = events
+        .iter()
+        .filter(|event| matches!(event.event_type, TimelineEventType::ActionDispatched))
+        .map(|event| {
+            event
+                .payload_json
+                .get("action")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(dispatched.iter().any(|action| action.starts_with("write_file:summary.md")));
+    assert!(!dispatched.iter().any(|action| action.starts_with("find_files:.:*summary*")));
 }
 
 #[test]

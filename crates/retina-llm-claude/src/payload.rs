@@ -131,12 +131,18 @@ Planning rules:\n\
 - When the last result already contains enough evidence to answer the user, respond directly instead of repeating exploration.\n\
 - If multiple files match, prefer the shallowest and most human-readable candidate unless the task explicitly asks for another one.\n\
 - If the user asks a question about content, gather the evidence first and then finish with respond once you can answer directly.\n\
+- If the task asks you to create, save, update, or rewrite a named output file and you already have the needed source evidence, prefer write_file or append_file over more exploration.\n\
+- If the task names an output path on Desktop, Documents, Downloads, or ~/ and prior steps already verified that area, target the named output path directly instead of diagnosing the filesystem again.\n\
 - If the last result already gave enough evidence, do not repeat the same exploratory step.\n\
 - Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
 - Discovery-only steps such as inspect_path, list_directory, find_files, and search_text are intermediate progress when the request still asks you to read, answer, summarize, extract, or create output.\n\
 - For multi-step requests, keep working toward the original objective one concrete action at a time; do not stop after locating the likely source if reading, synthesis, or output creation is still required.\n\
 - In general, intermediate shell steps should not be marked task_complete=true. Use task_complete=true when you are returning a grounded final response or when a verified output/state change satisfies the task.\n\
 - If task_state shows an explicit output artifact that still needs verification, do not mark task_complete=true until that artifact is verified, unless you are surfacing a grounded blocker.\n\
+- If a named target file already exists and the task is to save again, rewrite, refresh, or update it, use write_file with overwrite=true unless the user asked to preserve the old file.\n\
+- If a named target file already exists and the user did not ask you to change it, respond with that grounded observation instead of wandering into more diagnostics.\n\
+- If authoritative evidence already exists and task_state shows a pending deliverable or target output path, prefer the next completion move such as write_file, inspect_path on the target artifact, or respond.\n\
+- In reflection mode, recover toward completion. Do not return to broad search/list/find actions when the evidence and target artifact are already available unless a real blocker makes completion impossible.\n\
 - `intent_kind`, `deliverable`, and `completion_basis` are optional continuity metadata. When useful, keep `intent_kind` to: answer, output, or unknown.\n\
 \n\
 Set require_approval=true only for delete-like or kill-like commands that need explicit operator approval.\n\
@@ -253,10 +259,32 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
     };
 
     format!(
-        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n- compact source set:\n{}\n- blockers:\n{}\n\nRecent conversational context:\n{}\n\nDynamic task context follows in the next block. Observations and verified tool results are the source of truth for this step. Recent conversational context is advisory only; use it when it naturally matches the current request.",
+        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n- remaining_obligation: {}\n- pending_deliverable: {}\n- target_output_path: {}\n- target_output_exists: {}\n- compact source set:\n{}\n- blockers:\n{}\n\nRecent conversational context:\n{}\n\nDynamic task context follows in the next block. Observations and verified tool results are the source of truth for this step. Recent conversational context is advisory only; use it when it naturally matches the current request.",
         constraints,
         request.context.task_state.progress.output_written,
         request.context.task_state.progress.output_verified,
+        request
+            .context
+            .task_state
+            .progress
+            .remaining_obligation
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        request
+            .context
+            .task_state
+            .progress
+            .pending_deliverable
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        request
+            .context
+            .task_state
+            .progress
+            .target_output_path
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        request.context.task_state.progress.target_output_exists,
         source_set,
         blockers,
         recent_context
@@ -332,6 +360,10 @@ mod tests {
                         verified_facts: vec![],
                         output_written: false,
                         output_verified: false,
+                        remaining_obligation: None,
+                        pending_deliverable: None,
+                        target_output_path: None,
+                        target_output_exists: false,
                     },
                     frontier: TaskFrontier::default(),
                     recent_actions: vec![],

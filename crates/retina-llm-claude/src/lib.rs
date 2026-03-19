@@ -195,6 +195,10 @@ mod tests {
                             verified_facts: Vec::new(),
                             output_written: false,
                             output_verified: false,
+                            remaining_obligation: None,
+                            pending_deliverable: None,
+                            target_output_path: None,
+                            target_output_exists: false,
                         },
                         frontier: TaskFrontier {
                             next_action_hint: None,
@@ -362,6 +366,10 @@ mod tests {
         assert!(instructions.contains("best next verifiable step"));
         assert!(instructions.contains("target those artifacts directly"));
         assert!(instructions.contains("the harness can verify the change"));
+        assert!(instructions.contains("prefer write_file or append_file"));
+        assert!(instructions.contains("overwrite=true"));
+        assert!(instructions.contains("pending deliverable or target output path"));
+        assert!(instructions.contains("recover toward completion"));
         assert!(instructions.contains("keep root as a real directory path"));
         assert!(instructions.contains("Desktop plus a PDF name"));
         assert!(!instructions.contains("smallest useful next step"));
@@ -395,6 +403,10 @@ mod tests {
                         verified_facts: Vec::new(),
                         output_written: false,
                         output_verified: false,
+                        remaining_obligation: None,
+                        pending_deliverable: None,
+                        target_output_path: None,
+                        target_output_exists: false,
                     },
                     frontier: TaskFrontier {
                         next_action_hint: Some("Verify the best Desktop path candidate for Patent Center.pdf".to_string()),

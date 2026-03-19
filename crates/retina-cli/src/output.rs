@@ -345,7 +345,11 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .map(|resolution| format!("approval resolved: {resolution}")),
         TimelineEventType::ReasonerCalled => {
             if let Some(action) = event.payload_json.get("action").and_then(Value::as_str) {
-                Some(format!("plan: {}", humanize_action_label(action)))
+                if action.starts_with("respond:") {
+                    Some("plan: respond".to_string())
+                } else {
+                    Some(format!("plan: {}", humanize_action_label(action)))
+                }
             } else {
                 event
                     .payload_json
@@ -363,7 +367,13 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .payload_json
             .get("action")
             .and_then(Value::as_str)
-            .map(|action| format!("action: {}", humanize_action_label(action))),
+            .map(|action| {
+                if action.starts_with("respond:") {
+                    "action: respond".to_string()
+                } else {
+                    format!("action: {}", humanize_action_label(action))
+                }
+            }),
         TimelineEventType::TaskCompacted => event
             .payload_json
             .get("task_state")
@@ -714,6 +724,10 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
+                remaining_obligation: None,
+                pending_deliverable: None,
+                target_output_path: None,
+                target_output_exists: false,
             },
             intent_hint: Some(TaskKind::Output),
             reasoner_framing: None,
@@ -781,6 +795,10 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
+                remaining_obligation: None,
+                pending_deliverable: None,
+                target_output_path: None,
+                target_output_exists: false,
             },
             intent_hint: None,
             reasoner_framing: None,
@@ -848,6 +866,10 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
+                remaining_obligation: None,
+                pending_deliverable: None,
+                target_output_path: None,
+                target_output_exists: false,
             },
             intent_hint: None,
             reasoner_framing: None,

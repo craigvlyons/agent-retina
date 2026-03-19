@@ -105,7 +105,7 @@ impl TaskState {
             .unwrap_or_else(|| "none".to_string());
 
         format!(
-            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nIntent hint:\n- {}\n\nReasoner framing:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
+            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nIntent hint:\n- {}\n\nReasoner framing:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n- remaining_obligation: {}\n- pending_deliverable: {}\n- target_output_path: {}\n- target_output_exists: {}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
             self.goal.objective,
             success_criteria,
             constraints,
@@ -118,6 +118,19 @@ impl TaskState {
             verified,
             self.progress.output_written,
             self.progress.output_verified,
+            self.progress
+                .remaining_obligation
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            self.progress
+                .pending_deliverable
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            self.progress
+                .target_output_path
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            self.progress.target_output_exists,
             next_action,
             open_questions,
             blockers,
@@ -167,6 +180,10 @@ pub struct TaskProgress {
     pub verified_facts: Vec<String>,
     pub output_written: bool,
     pub output_verified: bool,
+    pub remaining_obligation: Option<String>,
+    pub pending_deliverable: Option<String>,
+    pub target_output_path: Option<String>,
+    pub target_output_exists: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

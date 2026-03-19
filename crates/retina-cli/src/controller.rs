@@ -539,6 +539,10 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
+                remaining_obligation: None,
+                pending_deliverable: None,
+                target_output_path: None,
+                target_output_exists: false,
             },
             frontier: TaskFrontier::default(),
             recent_actions: vec![RecentActionSummary {

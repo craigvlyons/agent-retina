@@ -4,7 +4,11 @@ use crate::support::{
     action_failure_reason, action_requires_approval, action_utility, approval_reason,
     default_tool_descriptors,
 };
-use crate::task_shape::{build_task_frontier, current_intent_hint, describe_task_phase};
+use crate::task_shape::{
+    build_task_frontier, current_intent_hint, describe_task_phase, infer_pending_deliverable,
+    infer_remaining_obligation, infer_target_output_path, should_reconsider_low_value_action,
+    target_output_exists,
+};
 use crate::{Kernel, TaskLoopState, action_label};
 use chrono::Utc;
 use retina_types::*;
@@ -71,6 +75,58 @@ impl Kernel {
                 "task_complete": response.task_complete
             }),
         ))?;
+        let target_output_path = infer_target_output_path(task, state);
+        if let Some(reason) = should_reconsider_low_value_action(
+            task,
+            state,
+            &response.action,
+            target_output_path.as_deref(),
+        ) {
+            self.emit_event(EventSpec::new(
+                task,
+                Some(intent),
+                Some(&response.action),
+                TimelineEventType::ReflectionRequested,
+                json!({ "reason": reason }),
+            ))?;
+            let reflection_context = self.assemble_context(ContextAssemblyInput {
+                task,
+                state,
+                last_result: Some(reason.clone()),
+                last_result_summary: Some(reason.clone()),
+                operator_guidance: Some(reason.clone()),
+                current_step,
+                max_steps,
+            })?;
+            let reflection = self.reasoner.reflect(&ReasonRequest {
+                tools: reflection_context.tools.clone(),
+                context: reflection_context,
+                constraints: self
+                    .shell
+                    .constraints()
+                    .iter()
+                    .map(|constraint| format!("{constraint:?}"))
+                    .collect(),
+                max_tokens: Some(384),
+            })?;
+            self.emit_event(EventSpec::new(
+                task,
+                Some(intent),
+                Some(&reflection.action),
+                TimelineEventType::ReflectionCompleted,
+                json!({
+                    "action": action_label(&reflection.action),
+                    "reasoning": reflection.reasoning,
+                    "framing": reflection.framing,
+                    "retry": true,
+                    "task_complete": reflection.task_complete
+                }),
+            ))?;
+            return Ok(StepDecision {
+                action: reflection.action,
+                framing: reflection.framing,
+            });
+        }
         Ok(StepDecision {
             action: response.action,
             framing: response.framing,
@@ -504,8 +560,6 @@ impl Kernel {
         last_result_summary: Option<String>,
     ) -> TaskState {
         let intent_hint = current_intent_hint(state);
-        let (open_questions, blockers, next_action_hint) =
-            build_task_frontier(last_result_summary.clone(), state);
         let output_written = state.artifact_references.iter().any(|artifact| {
             matches!(
                 artifact.status.as_str(),
@@ -518,6 +572,26 @@ impl Kernel {
                 "created" | "written" | "overwritten" | "appended" | "command_changed"
             )
         });
+        let target_output_path = infer_target_output_path(task, state);
+        let target_exists = target_output_exists(target_output_path.as_deref(), state);
+        let remaining_obligation = infer_remaining_obligation(
+            task,
+            state,
+            output_written,
+            output_verified,
+            target_output_path.as_deref(),
+            target_exists,
+        );
+        let pending_deliverable =
+            infer_pending_deliverable(task, state, target_output_path.as_deref());
+        let (open_questions, blockers, next_action_hint) = build_task_frontier(
+            task,
+            last_result_summary.clone(),
+            state,
+            target_output_path.as_deref(),
+            target_exists,
+            remaining_obligation.as_deref(),
+        );
         let success_criteria = derive_success_criteria(state, output_written, output_verified);
         TaskState {
             goal: TaskGoal {
@@ -538,6 +612,10 @@ impl Kernel {
                 ),
                 output_written,
                 output_verified,
+                remaining_obligation,
+                pending_deliverable,
+                target_output_path,
+                target_output_exists: target_exists,
             },
             frontier: TaskFrontier {
                 next_action_hint,

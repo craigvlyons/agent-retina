@@ -5,7 +5,7 @@ Use this guide to stress test the current terminal-based worker.
 Run from the project root:
 
 ```bash
-cd /Users/macc/Projects/gabanode_lab/agent-retina
+cd /Users/macc/projects/personal/agent-retina
 cargo run -p retina-cli -- chat
 ```
 

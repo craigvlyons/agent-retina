@@ -64,7 +64,10 @@ impl Shell for CliShell {
         let files = scope
             .tracked_paths
             .iter()
-            .map(|tracked| Self::inspect_path_state(&tracked.path, tracked.include_content))
+            .map(|tracked| {
+                let resolved = Self::resolve_path(&tracked.path)?;
+                Self::inspect_path_state(&resolved, tracked.include_content)
+            })
             .collect::<Result<Vec<_>>>()?;
         Ok(StateSnapshot {
             scope: scope.clone(),
@@ -170,7 +173,10 @@ impl Shell for CliShell {
                 ..
             } => Ok(ActionResult::Inspection(WorldState {
                 cwd: std::env::current_dir()?,
-                files: vec![Self::inspect_path_state(path, *include_content)?],
+                files: vec![Self::inspect_path_state(
+                    &Self::resolve_path(path)?,
+                    *include_content,
+                )?],
                 last_command: lock_state(&self.last_command)?.clone(),
                 notes: lock_state(&self.notes)?.clone(),
             })),
@@ -462,6 +468,33 @@ mod tests {
     }
 
     #[test]
+    fn inspect_path_resolves_known_folder_aliases() {
+        let Some(desktop) = dirs::desktop_dir() else {
+            return;
+        };
+
+        let file = desktop.join("retina-inspect-alias-test.txt");
+        let _ = fs::remove_file(&file);
+        must(fs::write(&file, "alias inspect content"));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::InspectPath {
+            id: ActionId::new(),
+            path: PathBuf::from("~/Desktop/retina-inspect-alias-test.txt"),
+            include_content: true,
+        }));
+        let ActionResult::Inspection(world) = result else {
+            panic!("expected inspection result");
+        };
+        let inspected = world.files.first().unwrap_or_else(|| panic!("expected inspected file"));
+        assert_eq!(inspected.path, file);
+        assert!(inspected.exists);
+        assert_eq!(inspected.size, Some("alias inspect content".len() as u64));
+        assert!(inspected.content_hash.is_some());
+
+        let _ = fs::remove_file(file);
+    }
+
+    #[test]
     fn read_file_rejects_pdf_and_requests_document_tool() {
         let dir = must_tempdir();
         let file = dir.path().join("resume.pdf");
@@ -548,6 +581,43 @@ mod tests {
         let after = must(shell.capture_state(&scope));
         let delta = must(shell.compare_state(&before, &after, None));
         assert!(matches!(delta.kind, StateDeltaKind::Unchanged));
+    }
+
+    #[test]
+    fn state_capture_resolves_known_folder_aliases_for_write_targets() {
+        let Some(desktop) = dirs::desktop_dir() else {
+            return;
+        };
+
+        let file = desktop.join("retina-state-capture-alias-test.txt");
+        let _ = fs::remove_file(&file);
+        let shell = CliShell::new();
+        let scope = HashScope {
+            tracked_paths: vec![TrackedPath {
+                path: PathBuf::from("~/Desktop/retina-state-capture-alias-test.txt"),
+                include_content: true,
+            }],
+            include_working_directory: false,
+            include_last_command: false,
+        };
+        let before = must(shell.capture_state(&scope));
+        must(fs::write(&file, "written through resolved alias"));
+        let after = must(shell.capture_state(&scope));
+        let delta = must(shell.compare_state(
+            &before,
+            &after,
+            Some(&Action::WriteFile {
+                id: ActionId::new(),
+                path: PathBuf::from("~/Desktop/retina-state-capture-alias-test.txt"),
+                content: "written through resolved alias".to_string(),
+                overwrite: true,
+            }),
+        ));
+
+        assert!(matches!(delta.kind, StateDeltaKind::ChangedAsExpected));
+        assert_eq!(delta.changed_paths, vec![file.clone()]);
+
+        let _ = fs::remove_file(file);
     }
 
     #[test]
