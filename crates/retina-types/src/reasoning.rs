@@ -33,11 +33,6 @@ impl AssembledContext {
         } else {
             self.memory_slice.join("\n")
         };
-        let recent_steps = if self.recent_steps.is_empty() {
-            "none".to_string()
-        } else {
-            self.recent_steps.join("\n")
-        };
         let recent_context = self
             .recent_context
             .as_ref()
@@ -48,21 +43,14 @@ impl AssembledContext {
             .clone()
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "Identity:\n{}\n\nTask:\n{}\n\nTask state:\n{}\n\nRecent conversational context:\n{}\n\nTools:\n{}\n\nMemory:\n{}\n\nRecent steps:\n{}\n\nOperator guidance:\n{}\n\nLast result summary:\n{}\n\nLast result:\n{}",
+            "Identity:\n{}\n\nTask:\n{}\n\nTask state:\n{}\n\nRecent conversational context:\n{}\n\nTools:\n{}\n\nMemory:\n{}\n\nOperator guidance:\n{}",
             self.identity,
             self.task,
             self.task_state.render(),
             recent_context,
             tools,
             memory,
-            recent_steps,
             operator_guidance,
-            self.last_result_summary
-                .clone()
-                .unwrap_or_else(|| "none".to_string()),
-            self.last_result
-                .clone()
-                .unwrap_or_else(|| "none".to_string())
         )
     }
 }

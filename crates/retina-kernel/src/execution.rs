@@ -6,8 +6,8 @@ use crate::support::{
 };
 use crate::task_shape::{
     build_task_frontier, current_intent_hint, describe_task_phase, infer_pending_deliverable,
-    infer_remaining_obligation, infer_target_output_path, should_reconsider_low_value_action,
-    target_output_exists,
+    infer_remaining_obligation, infer_target_output_path, is_operational_command_task,
+    should_reconsider_low_value_action, target_output_exists,
 };
 use crate::{Kernel, TaskLoopState, action_label};
 use chrono::Utc;
@@ -137,6 +137,7 @@ impl Kernel {
         &self,
         task: &Task,
         intent: &mut Intent,
+        state: &TaskLoopState,
         step: &StepDecision,
         control: Option<&ExecutionControlHandle>,
         allow_retry: bool,
@@ -193,9 +194,9 @@ impl Kernel {
                     .map(ActionExecution::Outcome);
             }
             if matches!(response, ApprovalResponse::Denied) {
-                return Err(KernelError::ApprovalDenied(
-                    "command denied by operator".to_string(),
-                ));
+                return Ok(ActionExecution::Outcome(Outcome::Blocked(
+                    synthesize_approval_denied_blocker(task, state, &action),
+                )));
             }
             action.mark_approval_granted();
             intent.action = Some(action.clone());
@@ -592,7 +593,7 @@ impl Kernel {
             target_exists,
             remaining_obligation.as_deref(),
         );
-        let success_criteria = derive_success_criteria(state, output_written, output_verified);
+        let success_criteria = derive_success_criteria(task, state, output_written, output_verified);
         TaskState {
             goal: TaskGoal {
                 objective: task.description.clone(),
@@ -693,19 +694,23 @@ impl Kernel {
 }
 
 fn derive_success_criteria(
+    task: &Task,
     state: &TaskLoopState,
     output_written: bool,
     output_verified: bool,
 ) -> Vec<String> {
     let mut criteria = vec!["completion is grounded in observed evidence".to_string()];
+    let operational = is_operational_command_task(task, state);
     let has_authoritative_source = state
         .working_sources
         .iter()
-        .any(|source| source.role == "authoritative");
+        .any(|source| source.kind != "command" && source.role == "authoritative");
     let has_candidate_sources = state
         .working_sources
         .iter()
-        .any(|source| matches!(source.role.as_str(), "candidate" | "supporting"));
+        .any(|source| {
+            source.kind != "command" && matches!(source.role.as_str(), "candidate" | "supporting")
+        });
     let has_generated_output = state.working_sources.iter().any(|source| source.role == "generated")
         || state.artifact_references.iter().any(|artifact| {
             matches!(
@@ -714,7 +719,12 @@ fn derive_success_criteria(
             )
         });
 
-    if has_candidate_sources && !has_authoritative_source {
+    if operational {
+        criteria.push(
+            "the next step should either change system state materially or report the grounded current status/blocker"
+                .to_string(),
+        );
+    } else if has_candidate_sources && !has_authoritative_source {
         criteria.push(
             "discovered paths should lead to a concrete inspection, read, or answer step"
                 .to_string(),
@@ -736,4 +746,38 @@ fn derive_success_criteria(
     }
 
     criteria
+}
+
+fn synthesize_approval_denied_blocker(
+    task: &Task,
+    state: &TaskLoopState,
+    action: &Action,
+) -> String {
+    let attempted = state
+        .recent_action_summaries
+        .iter()
+        .rev()
+        .take(3)
+        .map(|summary| summary.action.clone())
+        .collect::<Vec<_>>();
+    let recent_attempts = if attempted.is_empty() {
+        "no prior control steps were recorded".to_string()
+    } else {
+        attempted.join(", ")
+    };
+    let latest_status = state
+        .working_sources
+        .iter()
+        .rev()
+        .find(|source| source.kind == "command")
+        .and_then(|source| source.preview_excerpt.clone())
+        .unwrap_or_else(|| "the latest command evidence still indicates the task is unresolved".to_string());
+
+    format!(
+        "Automatic completion is blocked for '{}'. Earlier steps already attempted: {}. Latest command evidence: {}. The stronger step '{}' requires approval and was denied, so Retina cannot continue automatically.",
+        task.description,
+        recent_attempts,
+        latest_status,
+        action_label(action)
+    )
 }

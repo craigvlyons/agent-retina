@@ -213,6 +213,75 @@ fn task_state_frontier_prefers_authoritative_progress_over_generic_gap() {
 }
 
 #[test]
+fn command_state_frontier_stays_operational_instead_of_file_discovery() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let mut state = TaskLoopState::new(4);
+    state.step_index = 2;
+    state.working_sources.push(WorkingSource {
+        locator: "ps aux | grep -i docker | grep -v grep".to_string(),
+        kind: "command".to_string(),
+        role: "supporting".to_string(),
+        status: "executed".to_string(),
+        why_it_matters: "process check".to_string(),
+        last_used_step: 2,
+        evidence_refs: vec!["ps aux | grep -i docker | grep -v grep".to_string()],
+        page_reference: None,
+        extraction_method: Some("run_command".to_string()),
+        structured_summary: None,
+        preview_excerpt: Some("Docker Desktop still running".to_string()),
+    });
+    state.recent_action_summaries.push(RecentActionSummary {
+        step: 2,
+        action: "run_command:ps aux | grep -i docker | grep -v grep".to_string(),
+        outcome: "command succeeded with exit Some(0)".to_string(),
+        artifact_refs: vec![ArtifactReference {
+            kind: "command".to_string(),
+            locator: "ps aux | grep -i docker | grep -v grep".to_string(),
+            status: "executed".to_string(),
+        }],
+    });
+    state.artifact_references.push(ArtifactReference {
+        kind: "command".to_string(),
+        locator: "ps aux | grep -i docker | grep -v grep".to_string(),
+        status: "executed".to_string(),
+    });
+
+    let task = Task::new(AgentId::new(), "shutdown docker desktop");
+    let task_state =
+        kernel.build_task_state(&task, &state, 2, 4, Some("docker still running".to_string()));
+
+    assert_eq!(
+        task_state.progress.remaining_obligation.as_deref(),
+        Some("decide the next control action or report the current status")
+    );
+    assert_eq!(
+        task_state.frontier.open_questions.first().map(String::as_str),
+        Some("decide the next control action or report the current status")
+    );
+    assert_eq!(
+        task_state.frontier.next_action_hint.as_deref(),
+        Some("latest command result available; choose the next control step or report status")
+    );
+    assert!(task_state
+        .goal
+        .success_criteria
+        .iter()
+        .any(|item| item.contains("change system state materially or report the grounded current status/blocker")));
+    assert!(!task_state
+        .goal
+        .success_criteria
+        .iter()
+        .any(|item| item.contains("inspection, read, or answer step")));
+}
+
+#[test]
 fn compaction_preserves_authoritative_sources_before_candidates() {
     let mut state = TaskLoopState::new(8);
     state.step_index = 4;
@@ -416,6 +485,124 @@ fn low_value_discovery_is_reconsidered_when_output_target_is_ready() {
         .collect::<Vec<_>>();
     assert!(dispatched.iter().any(|action| action.starts_with("write_file:summary.md")));
     assert!(!dispatched.iter().any(|action| action.starts_with("find_files:.:*summary*")));
+}
+
+#[test]
+fn repeated_command_signature_groups_near_duplicate_process_checks() {
+    let base_action = Action::RunCommand {
+        id: ActionId::new(),
+        command: "ps aux | grep -i docker | grep -v grep".to_string(),
+        cwd: None,
+        require_approval: false,
+        expect_change: false,
+        state_scope: HashScope::default(),
+    };
+    let variant_action = Action::RunCommand {
+        id: ActionId::new(),
+        command: "ps aux | grep -i docker | grep -v grep || echo 'No Docker processes found'"
+            .to_string(),
+        cwd: None,
+        require_approval: false,
+        expect_change: false,
+        state_scope: HashScope::default(),
+    };
+    let head_variant_action = Action::RunCommand {
+        id: ActionId::new(),
+        command: "ps aux | grep -i docker | head -10".to_string(),
+        cwd: None,
+        require_approval: false,
+        expect_change: false,
+        state_scope: HashScope::default(),
+    };
+    let pgrep_variant_action = Action::RunCommand {
+        id: ActionId::new(),
+        command: "pgrep -f docker".to_string(),
+        cwd: None,
+        require_approval: false,
+        expect_change: false,
+        state_scope: HashScope::default(),
+    };
+    let result = ActionResult::Command(CommandResult {
+        command: "ps aux | grep -i docker | grep -v grep".to_string(),
+        cwd: ".".into(),
+        stdout: "docker still running".to_string(),
+        stderr: String::new(),
+        exit_code: Some(0),
+        success: true,
+        duration_ms: 1,
+        cancelled: false,
+        termination: None,
+        observed_paths: Vec::new(),
+    });
+
+    let base = crate::result_helpers::repeated_step_signature(&base_action, &result);
+    let variant = crate::result_helpers::repeated_step_signature(&variant_action, &result);
+    let head_variant = crate::result_helpers::repeated_step_signature(&head_variant_action, &result);
+    let pgrep_variant =
+        crate::result_helpers::repeated_step_signature(&pgrep_variant_action, &result);
+
+    assert_eq!(base, variant);
+    assert_eq!(base, head_variant);
+    assert_eq!(base, pgrep_variant);
+}
+
+#[test]
+fn denied_approval_closes_operational_task_with_grounded_blocker() {
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(
+            MockShell::default().with_approvals(vec![ApprovalResponse::Denied])
+        ),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "ps aux | grep -i docker | grep -v grep".to_string(),
+                    cwd: None,
+                    require_approval: false,
+                    expect_change: false,
+                    state_scope: HashScope::default(),
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("check docker".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "sudo pkill -f docker".to_string(),
+                    cwd: None,
+                    require_approval: true,
+                    expect_change: false,
+                    state_scope: HashScope::default(),
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("need stronger action".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(memory.clone()),
+    ));
+
+    let task = Task::new(AgentId::new(), "shut down docker desktop");
+    let outcome = must(kernel.execute_task_with_config(
+        task,
+        ExecutionConfig {
+            max_steps: 4,
+            control: None,
+        },
+    ));
+
+    match outcome {
+        Outcome::Blocked(message) => {
+            assert!(message.contains("requires approval and was denied"));
+            assert!(message.contains("Earlier steps already attempted"));
+            assert!(message.contains("Latest command evidence"));
+        }
+        _ => panic!("expected blocked outcome after denied approval"),
+    }
 }
 
 #[test]

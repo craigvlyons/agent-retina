@@ -16,7 +16,7 @@ pub fn plan_task(task: &str, last_result: Option<&str>) -> Option<ReasonResponse
     if let Some(action) = plan_follow_up_action(trimmed, last_result) {
         return Some(with_reasoning(
             action,
-            true,
+            false,
             "deterministic planner: structured follow-up from prior result",
         ));
     }
@@ -361,7 +361,7 @@ mod tests {
         );
         let response = must(response, "expected follow-up read plan");
         assert!(matches!(response.action, Action::ReadFile { .. }));
-        assert!(response.task_complete);
+        assert!(!response.task_complete);
     }
 
     #[test]
@@ -483,7 +483,6 @@ mod tests {
         );
         let response = must(response, "expected read follow-up for content question");
         assert!(matches!(response.action, Action::ReadFile { .. }));
-        assert!(response.task_complete);
+        assert!(!response.task_complete);
     }
 }
-

@@ -231,8 +231,14 @@ impl Kernel {
                     ActionExecution::Outcome(outcome) => return Ok(outcome),
                 }
             }
-            let execution =
-                self.execute_action(&task, &mut intent, &step, config.control.as_ref(), true)?;
+            let execution = self.execute_action(
+                &task,
+                &mut intent,
+                &state,
+                &step,
+                config.control.as_ref(),
+                true,
+            )?;
             let outcome = match execution {
                 ActionExecution::Retry {
                     step: retry_step,
@@ -282,12 +288,16 @@ impl Kernel {
             ))?;
 
             if progress.repeated_without_progress {
+                let repeated_reason = match &step.action {
+                    Action::RunCommand { .. } => "repeated a similar verification or control command without materially changing the picture; choose a stronger next action or report the current status/blocker".to_string(),
+                    _ => "repeated the same step without discovering new information".to_string(),
+                };
                 let execution = self.reflect_or_fail(
                     &task,
                     &mut intent,
                     &step.action,
                     config.control.as_ref(),
-                    "repeated the same step without discovering new information".to_string(),
+                    repeated_reason,
                     true,
                 )?;
                 match execution {

@@ -266,6 +266,16 @@ pub(crate) fn repeated_step_signature(action: &Action, result: &ActionResult) ->
         return None;
     }
 
+    if let (Action::RunCommand { command, .. }, ActionResult::Command(outcome)) = (action, result) {
+        return Some(format!(
+            "command_family:{}::success={}::exit={:?}::observed_paths={}",
+            normalize_command_family(command),
+            outcome.success,
+            outcome.exit_code,
+            outcome.observed_paths.len()
+        ));
+    }
+
     Some(format!(
         "{}::{}",
         action_label(action),
@@ -756,6 +766,108 @@ fn preview_paths(paths: Vec<PathBuf>) -> String {
         return "no examples".to_string();
     }
     preview.join(", ")
+}
+
+fn normalize_command_family(command: &str) -> String {
+    let normalized = normalize_shellish_command(command);
+    let subject = command_subject_key(command);
+
+    if normalized.contains("ps aux") && normalized.contains("grep ") {
+        if let Some(target) = subject.clone().or_else(|| extract_grep_target(&normalized)) {
+            return format!("process_check:{target}");
+        }
+        return "process_check".to_string();
+    }
+
+    if normalized.starts_with("pgrep ") {
+        if let Some(target) = subject.clone().or_else(|| extract_last_non_flag_token(&normalized)) {
+            return format!("process_check:{target}");
+        }
+        return "process_check".to_string();
+    }
+
+    if normalized.contains("pkill ") || normalized.starts_with("killall ") {
+        if let Some(target) = subject.clone().or_else(|| extract_last_non_flag_token(&normalized)) {
+            return format!("process_kill:{target}");
+        }
+        return "process_kill".to_string();
+    }
+
+    if normalized.contains("osascript") && normalized.contains("quit app") {
+        if let Some(target) = subject.or_else(|| extract_quoted_app_name(command).map(|name| name.to_ascii_lowercase())) {
+            return format!("app_quit:{}", target.to_ascii_lowercase());
+        }
+        return "app_quit".to_string();
+    }
+
+    normalized
+}
+
+fn command_subject_key(command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("docker") {
+        return Some("docker".to_string());
+    }
+    if lower.contains("github") {
+        return Some("github".to_string());
+    }
+    None
+}
+
+fn normalize_shellish_command(command: &str) -> String {
+    let mut normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if let Some((base, _)) = normalized.split_once(" || echo ") {
+        normalized = base.trim().to_string();
+    }
+    if let Some((base, _)) = normalized.split_once(" | head ") {
+        normalized = base.trim().to_string();
+    }
+    if let Some((base, _)) = normalized.split_once(" | tail ") {
+        normalized = base.trim().to_string();
+    }
+
+    normalized
+}
+
+fn extract_grep_target(command: &str) -> Option<String> {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        if *token != "grep" {
+            continue;
+        }
+        let mut cursor = index + 1;
+        while cursor < tokens.len() {
+            let candidate = tokens[cursor];
+            if candidate.starts_with('-') {
+                cursor += 1;
+                continue;
+            }
+            if candidate == "grep" || candidate == "|" {
+                break;
+            }
+            return Some(candidate.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn extract_last_non_flag_token(command: &str) -> Option<String> {
+    command
+        .split_whitespace()
+        .rev()
+        .find(|token| !token.starts_with('-') && *token != "|" && *token != "&&")
+        .map(|token| token.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
+}
+
+fn extract_quoted_app_name(command: &str) -> Option<String> {
+    let (_, suffix) = command.split_once("quit app ")?;
+    let quote = suffix.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let closing = suffix[1..].find(quote)?;
+    Some(suffix[1..1 + closing].to_string())
 }
 
 fn preview_search_matches(matches: &[SearchMatch]) -> String {

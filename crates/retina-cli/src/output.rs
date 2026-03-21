@@ -428,7 +428,11 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
                     .first()
                     .map(|blocker| format!("blocked: {blocker}"))
                     .or_else(|| {
-                        task_state.working_sources.last().map(|source| {
+                        task_state
+                            .working_sources
+                            .iter()
+                            .max_by_key(|source| source.last_used_step)
+                            .map(|source| {
                             let preview = source
                                 .preview_excerpt
                                 .as_ref()
@@ -909,5 +913,98 @@ mod tests {
         };
 
         assert_eq!(render_chat_event(&event, false), "");
+    }
+
+    #[test]
+    fn task_step_completed_prefers_latest_command_observation() {
+        let task_state = TaskState {
+            goal: TaskGoal {
+                objective: "shutdown docker".to_string(),
+                success_criteria: vec![],
+                constraints: vec![],
+            },
+            progress: TaskProgress {
+                current_phase: "working".to_string(),
+                current_step: 3,
+                max_steps: 50,
+                completed_checkpoints: vec![],
+                verified_facts: vec![],
+                output_written: false,
+                output_verified: false,
+                remaining_obligation: Some(
+                    "decide the next control action or report the current status".to_string(),
+                ),
+                pending_deliverable: None,
+                target_output_path: None,
+                target_output_exists: false,
+            },
+            intent_hint: None,
+            reasoner_framing: None,
+            frontier: TaskFrontier {
+                open_questions: vec![
+                    "decide the next control action or report the current status".to_string(),
+                ],
+                blockers: vec![],
+                next_action_hint: Some(
+                    "latest command result available; choose the next control step or report status"
+                        .to_string(),
+                ),
+            },
+            recent_actions: vec![],
+            working_sources: vec![
+                WorkingSource {
+                    locator: "osascript -e 'quit app \"Docker\"'".to_string(),
+                    kind: "command".to_string(),
+                    role: "supporting".to_string(),
+                    status: "executed".to_string(),
+                    why_it_matters: "quit".to_string(),
+                    last_used_step: 2,
+                    evidence_refs: vec![],
+                    page_reference: None,
+                    extraction_method: Some("run_command".to_string()),
+                    structured_summary: None,
+                    preview_excerpt: Some(String::new()),
+                },
+                WorkingSource {
+                    locator: "ps aux | grep -i docker | grep -v grep".to_string(),
+                    kind: "command".to_string(),
+                    role: "supporting".to_string(),
+                    status: "executed".to_string(),
+                    why_it_matters: "status".to_string(),
+                    last_used_step: 3,
+                    evidence_refs: vec![],
+                    page_reference: None,
+                    extraction_method: Some("run_command".to_string()),
+                    structured_summary: None,
+                    preview_excerpt: Some("Docker helper still running".to_string()),
+                },
+            ],
+            artifact_references: vec![],
+            avoid: vec![],
+            compaction: None,
+        };
+
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskStepCompleted,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "task_state": task_state
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "observed: ps aux | grep -i docker | grep -v grep [executed via run_command] | Docker helper still running\n"
+        );
     }
 }

@@ -285,6 +285,7 @@ pub struct MockShell {
     force_unchanged: bool,
     inputs: Arc<Mutex<Vec<String>>>,
     files: Arc<Mutex<HashMap<PathBuf, String>>>,
+    approvals: Arc<Mutex<Vec<ApprovalResponse>>>,
 }
 
 impl Default for MockShell {
@@ -293,6 +294,7 @@ impl Default for MockShell {
             force_unchanged: false,
             inputs: Arc::new(Mutex::new(Vec::new())),
             files: Arc::new(Mutex::new(HashMap::new())),
+            approvals: Arc::new(Mutex::new(vec![ApprovalResponse::Approved])),
         }
     }
 }
@@ -320,6 +322,15 @@ impl MockShell {
                 .map(|(path, content)| (path.into(), content.into()))
                 .collect(),
         ));
+        self
+    }
+
+    pub fn with_approvals(mut self, approvals: Vec<ApprovalResponse>) -> Self {
+        self.approvals = Arc::new(Mutex::new(if approvals.is_empty() {
+            vec![ApprovalResponse::Approved]
+        } else {
+            approvals
+        }));
         self
     }
 }
@@ -565,7 +576,15 @@ impl Shell for MockShell {
     }
 
     fn request_approval(&self, _request: &ApprovalRequest) -> Result<ApprovalResponse> {
-        Ok(ApprovalResponse::Approved)
+        let mut approvals = recover_mutex(&self.approvals);
+        if approvals.len() > 1 {
+            Ok(approvals.remove(0))
+        } else {
+            Ok(approvals
+                .first()
+                .cloned()
+                .unwrap_or(ApprovalResponse::Approved))
+        }
     }
 
     fn notify(&self, _message: &str) -> Result<()> {
@@ -593,4 +612,3 @@ pub fn sample_knowledge() -> KnowledgeNode {
         metadata: json!({}),
     }
 }
-

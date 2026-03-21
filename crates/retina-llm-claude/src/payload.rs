@@ -143,6 +143,9 @@ Planning rules:\n\
 - If a named target file already exists and the user did not ask you to change it, respond with that grounded observation instead of wandering into more diagnostics.\n\
 - If authoritative evidence already exists and task_state shows a pending deliverable or target output path, prefer the next completion move such as write_file, inspect_path on the target artifact, or respond.\n\
 - In reflection mode, recover toward completion. Do not return to broad search/list/find actions when the evidence and target artifact are already available unless a real blocker makes completion impossible.\n\
+- For terminal or system-control tasks, use command output as evidence, but do not assume the harness can fully verify world state for you.\n\
+- Prefer hard verification for concrete artifact changes. For process, service, or environment checks, decide whether another control step is worthwhile or whether you should report the grounded current status/blocker.\n\
+- When repeated command checks no longer change the picture, stop varying the same check and either take a materially different action or respond with the current grounded status.\n\
 - `intent_kind`, `deliverable`, and `completion_basis` are optional continuity metadata. When useful, keep `intent_kind` to: answer, output, or unknown.\n\
 \n\
 Set require_approval=true only for delete-like or kill-like commands that need explicit operator approval.\n\
@@ -162,104 +165,8 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let source_set = if request.context.task_state.working_sources.is_empty() {
-        "- none".to_string()
-    } else {
-        request
-            .context
-            .task_state
-            .working_sources
-            .iter()
-            .take(5)
-            .map(|source| {
-                let scope = source
-                    .page_reference
-                    .as_ref()
-                    .map(|value| format!("|{value}"))
-                    .unwrap_or_default();
-                let method = source
-                    .extraction_method
-                    .as_ref()
-                    .map(|value| format!(" via {value}"))
-                    .unwrap_or_default();
-                format!(
-                    "- {} [{}|{}|{}{}]{}",
-                    source.locator, source.kind, source.role, source.status, scope, method
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let blockers = if request.context.task_state.frontier.blockers.is_empty() {
-        "- none".to_string()
-    } else {
-        request
-            .context
-            .task_state
-            .frontier
-            .blockers
-            .iter()
-            .map(|blocker| format!("- {blocker}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let recent_context = if let Some(context) = request.context.recent_context.as_ref() {
-        let answer = context
-            .prior_answer_summary
-            .clone()
-            .unwrap_or_else(|| "none".to_string());
-        let sources = if context.sources.is_empty() {
-            "- none".to_string()
-        } else {
-            context
-                .sources
-                .iter()
-                .take(5)
-                .map(|source| {
-                    let scope = source
-                        .page_reference
-                        .as_ref()
-                        .map(|value| format!("|{value}"))
-                        .unwrap_or_default();
-                    let method = source
-                        .extraction_method
-                        .as_ref()
-                        .map(|value| format!(" via {value}"))
-                        .unwrap_or_default();
-                    format!(
-                        "- {} [{}|{}|{}{}]{}",
-                        source.locator, source.kind, source.role, source.status, scope, method
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let artifacts = if context.artifacts.is_empty() {
-            "- none".to_string()
-        } else {
-            context
-                .artifacts
-                .iter()
-                .take(5)
-                .map(|artifact| {
-                    format!(
-                        "- {} [{}|{}]",
-                        artifact.locator, artifact.kind, artifact.status
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        format!(
-            "- prior_objective: {}\n- prior_answer_summary: {}\n- sources:\n{}\n- artifacts:\n{}",
-            context.prior_objective, answer, sources, artifacts
-        )
-    } else {
-        "none".to_string()
-    };
-
     format!(
-        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n- remaining_obligation: {}\n- pending_deliverable: {}\n- target_output_path: {}\n- target_output_exists: {}\n- compact source set:\n{}\n- blockers:\n{}\n\nRecent conversational context:\n{}\n\nDynamic task context follows in the next block. Observations and verified tool results are the source of truth for this step. Recent conversational context is advisory only; use it when it naturally matches the current request.",
+        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n- remaining_obligation: {}\n- pending_deliverable: {}\n- target_output_path: {}\n- target_output_exists: {}\n\nDynamic task context follows in the next block. Treat task_state as the canonical live thread. Observations and verified tool results are the source of truth for this step.",
         constraints,
         request.context.task_state.progress.output_written,
         request.context.task_state.progress.output_verified,
@@ -284,10 +191,7 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
             .target_output_path
             .clone()
             .unwrap_or_else(|| "none".to_string()),
-        request.context.task_state.progress.target_output_exists,
-        source_set,
-        blockers,
-        recent_context
+        request.context.task_state.progress.target_output_exists
     )
 }
 
@@ -410,18 +314,22 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_context_block_includes_recent_conversational_context() {
+    fn dynamic_context_block_stays_compact_and_task_state_canonical() {
         let block = build_dynamic_context_block(&sample_request());
-        assert!(block.contains("Recent conversational context"));
-        assert!(block.contains("list files in texts"));
-        assert!(block.contains("C:/texts/Watcher.txt"));
+        assert!(block.contains("Observed state snapshot"));
+        assert!(block.contains("Treat task_state as the canonical live thread"));
+        assert!(!block.contains("Recent conversational context"));
+        assert!(!block.contains("compact source set"));
     }
 
     #[test]
-    fn assembled_context_render_keeps_recent_context_separate_from_live_state() {
+    fn assembled_context_render_keeps_recent_context_but_not_replay_sections() {
         let rendered = sample_request().context.render();
         assert!(rendered.contains("Recent conversational context:"));
         assert!(rendered.contains("prior_objective: list files in texts"));
         assert!(rendered.contains("Task state:"));
+        assert!(!rendered.contains("Recent steps:"));
+        assert!(!rendered.contains("Last result summary:"));
+        assert!(!rendered.contains("Last result:"));
     }
 }

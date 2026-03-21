@@ -20,6 +20,31 @@ pub(crate) fn current_intent_hint(state: &TaskLoopState) -> Option<TaskKind> {
     state.last_reasoner_framing.as_ref()?.intent_kind.clone()
 }
 
+pub(crate) fn is_operational_command_task(task: &Task, state: &TaskLoopState) -> bool {
+    if task_requests_output(task, state) {
+        return false;
+    }
+
+    let lower = task.description.to_ascii_lowercase();
+    let mentions_control = [
+        "shutdown",
+        "shut down",
+        "stop",
+        "start",
+        "restart",
+        "quit",
+        "kill",
+        "terminate",
+        "close",
+        "disable",
+        "enable",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle));
+
+    mentions_control || has_command_state_evidence(state)
+}
+
 pub(crate) fn infer_target_output_path(task: &Task, state: &TaskLoopState) -> Option<String> {
     state
         .artifact_references
@@ -86,25 +111,10 @@ pub(crate) fn infer_remaining_obligation(
     target_output_path: Option<&str>,
     target_output_exists: bool,
 ) -> Option<String> {
-    let has_authoritative_source = state
-        .working_sources
-        .iter()
-        .any(|source| source.role == "authoritative");
-    let has_generated_output = state.working_sources.iter().any(|source| source.role == "generated")
-        || state.artifact_references.iter().any(|artifact| {
-            matches!(
-                artifact.status.as_str(),
-                "created" | "written" | "overwritten" | "appended" | "command_changed"
-            )
-        });
-    let has_candidate_sources = state
-        .working_sources
-        .iter()
-        .any(|source| matches!(source.role.as_str(), "candidate" | "supporting"))
-        || state
-            .artifact_references
-            .iter()
-            .any(|artifact| matches!(artifact.status.as_str(), "matched" | "listed" | "inspected"));
+    let has_authoritative_source = has_authoritative_file_source(state);
+    let has_generated_output = has_generated_artifact(state);
+    let has_candidate_sources = has_file_candidate_sources(state);
+    let has_command_state = has_command_state_evidence(state);
 
     match (
         task_requests_output(task, state),
@@ -148,6 +158,9 @@ pub(crate) fn infer_remaining_obligation(
         (false, _, _, true, _, false, _) => {
             Some("verify the produced artifact or state change".to_string())
         }
+        (false, _, false, false, _, _, _) if has_command_state => {
+            Some("decide the next control action or report the current status".to_string())
+        }
         _ => None,
     }
 }
@@ -163,30 +176,17 @@ pub(crate) fn build_task_frontier(
     let has_evidence = !state.working_sources.is_empty()
         || !state.artifact_references.is_empty()
         || !state.recent_action_summaries.is_empty();
-    let has_authoritative_source = state
-        .working_sources
-        .iter()
-        .any(|source| source.role == "authoritative");
-    let has_generated_output = state.working_sources.iter().any(|source| source.role == "generated")
-        || state.artifact_references.iter().any(|artifact| {
-            matches!(
-                artifact.status.as_str(),
-                "created" | "written" | "overwritten" | "appended" | "command_changed"
-            )
-        });
-    let has_candidate_sources = state
-        .working_sources
-        .iter()
-        .any(|source| matches!(source.role.as_str(), "candidate" | "supporting"))
-        || state
-            .artifact_references
-            .iter()
-            .any(|artifact| matches!(artifact.status.as_str(), "matched" | "listed" | "inspected"));
+    let has_authoritative_source = has_authoritative_file_source(state);
+    let has_generated_output = has_generated_artifact(state);
+    let has_candidate_sources = has_file_candidate_sources(state);
+    let has_command_state = has_command_state_evidence(state);
     let mut open_questions = Vec::new();
     let mut blockers = Vec::new();
     if state.step_index > 0 && has_evidence {
         if let Some(obligation) = remaining_obligation {
             open_questions.push(obligation.to_string());
+        } else if has_command_state && !has_authoritative_source && !has_generated_output {
+            open_questions.push("command-state evidence gathered".to_string());
         } else if has_candidate_sources && !has_authoritative_source && !has_generated_output {
             open_questions.push("candidate paths observed".to_string());
         } else if has_authoritative_source && !has_generated_output {
@@ -227,7 +227,16 @@ pub(crate) fn build_task_frontier(
                 (_, _, true, None) => {
                     "produced artifact present; verify it and then report completion".to_string()
                 }
+                _ if has_command_state => {
+                    "latest command result available; choose the next control step or report status".to_string()
+                }
                 _ => "latest observed result available for the next completion step".to_string(),
+            }
+        } else if has_command_state && !has_candidate_sources && !has_authoritative_source && !has_generated_output {
+            if blockers.is_empty() {
+                "latest command result available; choose the next control step or report status".to_string()
+            } else {
+                "latest command result available; choose a materially different control step or report blocker".to_string()
             }
         } else if has_candidate_sources && !has_authoritative_source && !has_generated_output {
             "candidate path available for inspection or reading".to_string()
@@ -258,33 +267,53 @@ pub(crate) fn should_reconsider_low_value_action(
     action: &Action,
     target_output_path: Option<&str>,
 ) -> Option<String> {
-    if !task_requests_output(task, state) {
-        return None;
+    if task_requests_output(task, state) {
+        if !state
+            .working_sources
+            .iter()
+            .any(|source| source.role == "authoritative")
+        {
+            return None;
+        }
+        let target_output_path = target_output_path?;
+        let is_low_value = match action {
+            Action::FindFiles { .. }
+            | Action::SearchText { .. }
+            | Action::ListDirectory { .. }
+            | Action::InspectWorkingDirectory { .. } => true,
+            Action::InspectPath { path, .. } => !path_matches_target(path, target_output_path),
+            _ => false,
+        };
+        if !is_low_value {
+            return None;
+        }
+
+        return Some(format!(
+            "authoritative evidence and the named output target {} are already available; prefer writing, verifying, or responding instead of broad discovery",
+            display_path_hint(target_output_path)
+        ));
     }
-    if !state
-        .working_sources
-        .iter()
-        .any(|source| source.role == "authoritative")
-    {
-        return None;
-    }
-    let target_output_path = target_output_path?;
-    let is_low_value = match action {
-        Action::FindFiles { .. }
-        | Action::SearchText { .. }
-        | Action::ListDirectory { .. }
-        | Action::InspectWorkingDirectory { .. } => true,
-        Action::InspectPath { path, .. } => !path_matches_target(path, target_output_path),
-        _ => false,
-    };
-    if !is_low_value {
+
+    if !is_operational_command_task(task, state) {
         return None;
     }
 
-    Some(format!(
-        "authoritative evidence and the named output target {} are already available; prefer writing, verifying, or responding instead of broad discovery",
-        display_path_hint(target_output_path)
-    ))
+    let action_label = match action {
+        Action::RunCommand { command, .. } => command.as_str(),
+        _ => return None,
+    };
+    let already_tried = state
+        .recent_action_summaries
+        .iter()
+        .rev()
+        .any(|summary| summary.action == format!("run_command:{action_label}"));
+    if !already_tried {
+        return None;
+    }
+
+    Some(
+        "that control step already ran and the remaining blocker is still unresolved; choose a materially different action or report the grounded current status/blocker".to_string(),
+    )
 }
 
 fn task_requests_output(task: &Task, state: &TaskLoopState) -> bool {
@@ -312,6 +341,41 @@ fn task_requests_output(task: &Task, state: &TaskLoopState) -> bool {
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+fn has_authoritative_file_source(state: &TaskLoopState) -> bool {
+    state
+        .working_sources
+        .iter()
+        .any(|source| source.kind != "command" && source.role == "authoritative")
+}
+
+fn has_generated_artifact(state: &TaskLoopState) -> bool {
+    state.working_sources.iter().any(|source| source.role == "generated")
+        || state.artifact_references.iter().any(|artifact| {
+            matches!(
+                artifact.status.as_str(),
+                "created" | "written" | "overwritten" | "appended" | "command_changed"
+            )
+        })
+}
+
+fn has_file_candidate_sources(state: &TaskLoopState) -> bool {
+    state
+        .working_sources
+        .iter()
+        .any(|source| source.kind != "command" && matches!(source.role.as_str(), "candidate" | "supporting"))
+        || state.artifact_references.iter().any(|artifact| {
+            artifact.kind != "command"
+                && matches!(artifact.status.as_str(), "matched" | "listed" | "inspected")
+        })
+}
+
+fn has_command_state_evidence(state: &TaskLoopState) -> bool {
+    state
+        .working_sources
+        .iter()
+        .any(|source| source.kind == "command" && source.status == "executed")
 }
 
 

@@ -24,10 +24,10 @@ impl TaskState {
     }
 
     pub fn render(&self) -> String {
-        let success_criteria = render_list(&self.goal.success_criteria);
+        let success_criteria = render_compact_list(&self.goal.success_criteria, 3);
         let constraints = render_list(&self.goal.constraints);
-        let completed = render_list(&self.progress.completed_checkpoints);
-        let verified = render_list(&self.progress.verified_facts);
+        let completed = render_compact_list(&self.progress.completed_checkpoints, 4);
+        let verified = render_compact_list(&self.progress.verified_facts, 4);
         let open_questions = render_list(&self.frontier.open_questions);
         let blockers = render_list(&self.frontier.blockers);
         let framing_hint = self
@@ -62,42 +62,12 @@ impl TaskState {
             .next_action_hint
             .clone()
             .unwrap_or_else(|| "none".to_string());
-        let recent_actions = if self.recent_actions.is_empty() {
-            "none".to_string()
-        } else {
-            self.recent_actions
-                .iter()
-                .map(RecentActionSummary::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let working_sources = if self.working_sources.is_empty() {
-            "none".to_string()
-        } else {
-            self.working_sources
-                .iter()
-                .map(WorkingSource::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let artifacts = if self.artifact_references.is_empty() {
-            "none".to_string()
-        } else {
-            self.artifact_references
-                .iter()
-                .map(ArtifactReference::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let avoid = if self.avoid.is_empty() {
-            "none".to_string()
-        } else {
-            self.avoid
-                .iter()
-                .map(AvoidRule::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+        let recent_actions =
+            render_tail_items(&self.recent_actions, 4, RecentActionSummary::render);
+        let working_sources = render_tail_items(&self.working_sources, 4, WorkingSource::render);
+        let artifacts =
+            render_tail_items(&self.artifact_references, 4, ArtifactReference::render);
+        let avoid = render_tail_items(&self.avoid, 3, AvoidRule::render);
         let compaction = self
             .compaction
             .as_ref()
@@ -105,7 +75,7 @@ impl TaskState {
             .unwrap_or_else(|| "none".to_string());
 
         format!(
-            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nIntent hint:\n- {}\n\nReasoner framing:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n- remaining_obligation: {}\n- pending_deliverable: {}\n- target_output_path: {}\n- target_output_exists: {}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
+            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nIntent hint:\n- {}\n\nReasoner framing:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- recent_completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n- remaining_obligation: {}\n- pending_deliverable: {}\n- target_output_path: {}\n- target_output_exists: {}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
             self.goal.objective,
             success_criteria,
             constraints,
@@ -361,4 +331,42 @@ fn render_list(items: &[String]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+fn render_compact_list(items: &[String], limit: usize) -> String {
+    if items.is_empty() {
+        return "  - none".to_string();
+    }
+
+    let shown = items
+        .iter()
+        .take(limit)
+        .map(|item| format!("  - {item}"))
+        .collect::<Vec<_>>();
+    let remaining = items.len().saturating_sub(limit);
+    if remaining == 0 {
+        shown.join("\n")
+    } else {
+        let mut lines = shown;
+        lines.push(format!("  - ... {} more", remaining));
+        lines.join("\n")
+    }
+}
+
+fn render_tail_items<T, F>(items: &[T], limit: usize, render: F) -> String
+where
+    F: Fn(&T) -> String,
+{
+    if items.is_empty() {
+        return "none".to_string();
+    }
+
+    let start = items.len().saturating_sub(limit);
+    let mut lines = if start > 0 {
+        vec![format!("... {} earlier items omitted", start)]
+    } else {
+        Vec::new()
+    };
+    lines.extend(items[start..].iter().map(render));
+    lines.join("\n")
 }
