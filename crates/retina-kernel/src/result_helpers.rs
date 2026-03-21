@@ -752,10 +752,6 @@ pub(crate) fn working_sources_for_result(
     }
 }
 
-pub(crate) fn should_retry(previous: &Action, next: &Action) -> bool {
-    action_label(previous) != action_label(next) && !matches!(next, Action::Respond { .. })
-}
-
 fn preview_paths(paths: Vec<PathBuf>) -> String {
     let preview = paths
         .into_iter()

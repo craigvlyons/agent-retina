@@ -137,17 +137,10 @@ impl AgentController {
 }
 
 fn build_task_for_description(task_description: String) -> Result<Task> {
-    let mut task = Task::new(root_agent_id(), task_description);
-    task.recent_context = latest_recent_context_from_memory()?;
-    Ok(task)
+    Ok(Task::new(root_agent_id(), task_description))
 }
 
-fn latest_recent_context_from_memory() -> Result<Option<RecentContext>> {
-    let memory = open_memory(root_db_path()?)?;
-    let events = memory.recent_states(200)?;
-    Ok(latest_recent_context_from_events(&events))
-}
-
+#[cfg(test)]
 fn latest_recent_context_from_events(events: &[TimelineEvent]) -> Option<RecentContext> {
     let completed = events
         .iter()
@@ -179,6 +172,7 @@ fn latest_recent_context_from_events(events: &[TimelineEvent]) -> Option<RecentC
     })
 }
 
+#[cfg(test)]
 fn select_recent_sources(sources: &[WorkingSource]) -> Vec<WorkingSource> {
     let mut ranked = sources
         .iter()
@@ -195,6 +189,7 @@ fn select_recent_sources(sources: &[WorkingSource]) -> Vec<WorkingSource> {
     ranked
 }
 
+#[cfg(test)]
 fn select_recent_artifacts(artifacts: &[ArtifactReference]) -> Vec<ArtifactReference> {
     let mut ranked = artifacts
         .iter()
@@ -210,6 +205,7 @@ fn select_recent_artifacts(artifacts: &[ArtifactReference]) -> Vec<ArtifactRefer
     ranked
 }
 
+#[cfg(test)]
 fn source_rank(source: &WorkingSource) -> u8 {
     let role_rank = match source.role.as_str() {
         "authoritative" => 4,
@@ -229,6 +225,7 @@ fn source_rank(source: &WorkingSource) -> u8 {
     role_rank * 10 + status_rank
 }
 
+#[cfg(test)]
 fn artifact_rank(artifact: &ArtifactReference) -> u8 {
     match artifact.status.as_str() {
         "read" | "structured_read" | "extracted" => 5,
@@ -526,11 +523,8 @@ mod tests {
         TaskState {
             goal: TaskGoal {
                 objective: "placeholder".to_string(),
-                success_criteria: vec![],
                 constraints: vec![],
             },
-            intent_hint: None,
-            reasoner_framing: None,
             progress: TaskProgress {
                 current_phase: "working".to_string(),
                 current_step: 2,
@@ -539,10 +533,6 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
-                remaining_obligation: None,
-                pending_deliverable: None,
-                target_output_path: None,
-                target_output_exists: false,
             },
             frontier: TaskFrontier::default(),
             recent_actions: vec![RecentActionSummary {

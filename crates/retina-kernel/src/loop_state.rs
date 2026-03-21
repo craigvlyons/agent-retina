@@ -16,7 +16,6 @@ pub(crate) struct TaskLoopState {
     pub(crate) working_sources: Vec<WorkingSource>,
     pub(crate) artifact_references: Vec<ArtifactReference>,
     pub(crate) avoid_rules: Vec<AvoidRule>,
-    pub(crate) last_reasoner_framing: Option<ReasonerTaskFraming>,
     pub(crate) compaction_count: usize,
     pub(crate) last_compaction_reason: Option<String>,
     pub(crate) last_compaction_snapshot: Option<CompactionSnapshot>,
@@ -34,7 +33,6 @@ impl TaskLoopState {
             working_sources: Vec::new(),
             artifact_references: Vec::new(),
             avoid_rules: Vec::new(),
-            last_reasoner_framing: None,
             compaction_count: 0,
             last_compaction_reason: None,
             last_compaction_snapshot: None,
@@ -126,32 +124,6 @@ impl TaskLoopState {
         Ok(StepProgress {
             repeated_without_progress,
         })
-    }
-
-    pub(crate) fn record_retry_feedback(&mut self, failed_action_label: String, reason: String) {
-        if let Some(existing) = self
-            .avoid_rules
-            .iter_mut()
-            .find(|rule| rule.label == failed_action_label)
-        {
-            existing.reason = reason;
-            return;
-        }
-
-        self.avoid_rules.push(AvoidRule {
-            label: failed_action_label,
-            reason,
-        });
-        trim_avoid_rules(&mut self.avoid_rules);
-    }
-
-    pub(crate) fn avoid_reason_for_action(&self, action: &Action) -> Option<&str> {
-        let label = action_label(action);
-        self.avoid_rules
-            .iter()
-            .rev()
-            .find(|rule| rule.label == label)
-            .map(|rule| rule.reason.as_str())
     }
 
     pub(crate) fn apply_live_compaction(&mut self) -> Option<CompactionDecision> {

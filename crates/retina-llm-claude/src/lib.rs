@@ -182,11 +182,8 @@ mod tests {
                     task_state: TaskState {
                         goal: TaskGoal {
                             objective: "read startup.md".to_string(),
-                            success_criteria: Vec::new(),
                             constraints: Vec::new(),
                         },
-                        intent_hint: None,
-                        reasoner_framing: None,
                         progress: TaskProgress {
                             current_phase: "starting".to_string(),
                             current_step: 1,
@@ -195,16 +192,8 @@ mod tests {
                             verified_facts: Vec::new(),
                             output_written: false,
                             output_verified: false,
-                            remaining_obligation: None,
-                            pending_deliverable: None,
-                            target_output_path: None,
-                            target_output_exists: false,
                         },
-                        frontier: TaskFrontier {
-                            next_action_hint: None,
-                            open_questions: Vec::new(),
-                            blockers: Vec::new(),
-                        },
+                        frontier: TaskFrontier { blockers: Vec::new() },
                         recent_actions: Vec::new(),
                         working_sources: Vec::new(),
                         artifact_references: Vec::new(),
@@ -363,18 +352,16 @@ mod tests {
     #[test]
     fn stable_instructions_prefer_best_verifiable_step_over_timid_discovery_bias() {
         let instructions = build_stable_instructions(false);
-        assert!(instructions.contains("best next verifiable step"));
-        assert!(instructions.contains("target those artifacts directly"));
+        assert!(instructions.contains("Choose one concrete next step that advances the task or reduces uncertainty."));
         assert!(instructions.contains("the harness can verify the change"));
-        assert!(instructions.contains("prefer write_file or append_file"));
-        assert!(instructions.contains("overwrite=true"));
-        assert!(instructions.contains("pending deliverable or target output path"));
-        assert!(instructions.contains("recover toward completion"));
+        assert!(instructions.contains("In reflection mode, do something materially different or report the grounded blocker/current status."));
         assert!(instructions.contains("keep root as a real directory path"));
-        assert!(instructions.contains("Desktop plus a PDF name"));
-        assert!(!instructions.contains("smallest useful next step"));
-        assert!(!instructions.contains("Prefer structured filesystem actions over shell commands"));
-        assert!(!instructions.contains("Only use run_command for an explicit shell command"));
+        assert!(instructions.contains("For terminal or system-control tasks, use command output as evidence"));
+        assert!(!instructions.contains("best next verifiable step"));
+        assert!(!instructions.contains("Prefer direct interaction with the named path, file, command, or system target"));
+        assert!(!instructions.contains("prefer write_file or append_file"));
+        assert!(!instructions.contains("overwrite=true"));
+        assert!(!instructions.contains("pending deliverable or target output path"));
     }
 
     #[test]
@@ -388,13 +375,8 @@ mod tests {
                     goal: TaskGoal {
                         objective: "read the Patent Center.pdf on Desktop and tell me what it's about"
                             .to_string(),
-                        success_criteria: vec![
-                            "final response is grounded in gathered evidence".to_string()
-                        ],
                         constraints: Vec::new(),
                     },
-                    intent_hint: Some(TaskKind::Answer),
-                    reasoner_framing: None,
                     progress: TaskProgress {
                         current_phase: "planning".to_string(),
                         current_step: 1,
@@ -403,18 +385,8 @@ mod tests {
                         verified_facts: Vec::new(),
                         output_written: false,
                         output_verified: false,
-                        remaining_obligation: None,
-                        pending_deliverable: None,
-                        target_output_path: None,
-                        target_output_exists: false,
                     },
-                    frontier: TaskFrontier {
-                        next_action_hint: Some("Verify the best Desktop path candidate for Patent Center.pdf".to_string()),
-                        open_questions: vec![
-                            "Need evidence from Patent Center.pdf before a grounded answer can be returned".to_string(),
-                        ],
-                        blockers: Vec::new(),
-                    },
+                    frontier: TaskFrontier { blockers: Vec::new() },
                     recent_actions: Vec::new(),
                     working_sources: Vec::new(),
                     artifact_references: Vec::new(),

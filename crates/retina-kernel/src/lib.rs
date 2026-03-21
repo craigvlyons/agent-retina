@@ -10,7 +10,7 @@ mod task_shape;
 pub(crate) use crate::loop_state::{TaskLoopState, action_label};
 use crate::router::Router;
 pub(crate) use crate::support::{
-    ActionExecution, CircuitBreaker, EventSpec, ReflexEngine, StepDecision,
+    ActionExecution, CircuitBreaker, EventSpec, ReflexEngine,
     StepSelectionContext,
 };
 use retina_traits::{Memory, Reasoner, Shell};
@@ -145,7 +145,6 @@ impl Kernel {
 
         let mut state = TaskLoopState::new(max_steps);
         let mut next_reflex_action = reflex_action;
-        let mut pending_retry_step: Option<StepDecision> = None;
 
         loop {
             if state.step_index >= max_steps {
@@ -181,22 +180,18 @@ impl Kernel {
                 return Ok(outcome);
             }
 
-            let step = if let Some(retry_step) = pending_retry_step.take() {
-                retry_step
-            } else {
-                let current_step = state.step_index + 1;
-                self.select_action(
-                    StepSelectionContext {
-                        task: &task,
-                        intent: &intent,
-                        state: &mut state,
-                        control: config.control.as_ref(),
-                        current_step,
-                        max_steps,
-                    },
-                    next_reflex_action.take(),
-                )?
-            };
+            let current_step = state.step_index + 1;
+            let step = self.select_action(
+                StepSelectionContext {
+                    task: &task,
+                    intent: &intent,
+                    state: &mut state,
+                    control: config.control.as_ref(),
+                    current_step,
+                    max_steps,
+                },
+                next_reflex_action.take(),
+            )?;
             if let Some(outcome) = self.check_cancellation(
                 &task,
                 Some(&intent),
@@ -206,53 +201,17 @@ impl Kernel {
             )? {
                 return Ok(outcome);
             }
-            if let Some(reason) = state
-                .avoid_reason_for_action(&step.action)
-                .filter(|reason| reason.starts_with("unsupported operation:"))
-            {
-                let execution = self.reflect_or_fail(
-                    &task,
-                    &mut intent,
-                    &step.action,
-                    config.control.as_ref(),
-                    format!("avoid repeating {} because {}", action_label(&step.action), reason),
-                    true,
-                )?;
-                match execution {
-                    ActionExecution::Retry {
-                        step: retry_step,
-                        failed_action_label,
-                        failure_reason,
-                    } => {
-                        state.record_retry_feedback(failed_action_label, failure_reason);
-                        pending_retry_step = Some(retry_step);
-                        continue;
-                    }
-                    ActionExecution::Outcome(outcome) => return Ok(outcome),
-                }
-            }
             let execution = self.execute_action(
                 &task,
                 &mut intent,
                 &state,
                 &step,
                 config.control.as_ref(),
-                true,
             )?;
             let outcome = match execution {
-                ActionExecution::Retry {
-                    step: retry_step,
-                    failed_action_label,
-                    failure_reason,
-                } => {
-                    state.record_retry_feedback(failed_action_label, failure_reason);
-                    pending_retry_step = Some(retry_step);
-                    continue;
-                }
                 ActionExecution::Outcome(outcome) => outcome,
             };
             let progress = state.record_step(&step.action, &outcome)?;
-            state.last_reasoner_framing = step.framing.clone();
             let compaction = state.apply_live_compaction();
             let task_state = self.build_task_state(
                 &task,
@@ -289,29 +248,17 @@ impl Kernel {
 
             if progress.repeated_without_progress {
                 let repeated_reason = match &step.action {
-                    Action::RunCommand { .. } => "repeated a similar verification or control command without materially changing the picture; choose a stronger next action or report the current status/blocker".to_string(),
-                    _ => "repeated the same step without discovering new information".to_string(),
+                    Action::RunCommand { .. } => "repeated a similar command family without materially changing the observed state".to_string(),
+                    _ => "repeated the same step without new evidence".to_string(),
                 };
-                let execution = self.reflect_or_fail(
+                self.emit_event(EventSpec::new(
                     &task,
-                    &mut intent,
-                    &step.action,
-                    config.control.as_ref(),
-                    repeated_reason,
-                    true,
-                )?;
-                match execution {
-                    ActionExecution::Retry {
-                        step: retry_step,
-                        failed_action_label,
-                        failure_reason,
-                    } => {
-                        state.record_retry_feedback(failed_action_label, failure_reason);
-                        pending_retry_step = Some(retry_step);
-                        continue;
-                    }
-                    ActionExecution::Outcome(outcome) => return Ok(outcome),
-                }
+                    Some(&intent),
+                    Some(&step.action),
+                    TimelineEventType::TaskFailed,
+                    json!({ "reason": repeated_reason }),
+                ))?;
+                return Ok(Outcome::Blocked(repeated_reason));
             }
 
             let explicit_response = matches!(
@@ -337,7 +284,7 @@ impl Kernel {
                 ))?;
             }
 
-            if explicit_response || matches!(outcome, Outcome::Failure(_) | Outcome::Blocked(_)) {
+            if explicit_response || matches!(outcome, Outcome::Blocked(_)) {
                 return Ok(outcome);
             }
         }

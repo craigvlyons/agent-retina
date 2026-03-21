@@ -144,18 +144,11 @@ fn assembled_context_includes_output_task_shape() {
 
     let seen = reasoner.seen_task_states();
     assert!(!seen.is_empty());
-    assert!(seen[0].intent_hint.is_none());
-    assert!(
-        seen[0]
-            .goal
-            .success_criteria
-            .iter()
-            .any(|item| item.contains("reduce the main unresolved obligation"))
-    );
+    assert_eq!(seen[0].goal.objective, "use dominican_Med.pdf and dominican.txt to create Emily_wittenberge.txt");
 }
 
 #[test]
-fn task_state_frontier_prefers_authoritative_progress_over_generic_gap() {
+fn task_state_keeps_authoritative_progress_without_advisory_frontier() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default()),
         Box::new(MockReasoner::for_action(Action::Respond {
@@ -198,22 +191,13 @@ fn task_state_frontier_prefers_authoritative_progress_over_generic_gap() {
     let task = Task::new(AgentId::new(), "read startup.md and answer what it says");
     let task_state = kernel.build_task_state(&task, &state, 2, 4, Some("read startup.md".to_string()));
 
-    assert_eq!(
-        task_state.frontier.open_questions.first().map(String::as_str),
-        Some("use the authoritative evidence to finish the requested answer")
-    );
-    assert_eq!(
-        task_state.frontier.next_action_hint.as_deref(),
-        Some("gathered evidence available for an answer")
-    );
-    assert_eq!(
-        task_state.progress.remaining_obligation.as_deref(),
-        Some("use the authoritative evidence to finish the requested answer")
-    );
+    assert!(task_state.frontier.blockers.is_empty());
+    assert_eq!(task_state.working_sources.len(), 1);
+    assert_eq!(task_state.working_sources[0].locator, "startup.md");
 }
 
 #[test]
-fn command_state_frontier_stays_operational_instead_of_file_discovery() {
+fn command_state_keeps_command_evidence_without_file_discovery_guidance() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default()),
         Box::new(MockReasoner::for_action(Action::Respond {
@@ -257,28 +241,12 @@ fn command_state_frontier_stays_operational_instead_of_file_discovery() {
     let task_state =
         kernel.build_task_state(&task, &state, 2, 4, Some("docker still running".to_string()));
 
+    assert!(task_state.frontier.blockers.is_empty());
+    assert_eq!(task_state.working_sources.len(), 1);
     assert_eq!(
-        task_state.progress.remaining_obligation.as_deref(),
-        Some("decide the next control action or report the current status")
+        task_state.working_sources[0].locator,
+        "ps aux | grep -i docker | grep -v grep"
     );
-    assert_eq!(
-        task_state.frontier.open_questions.first().map(String::as_str),
-        Some("decide the next control action or report the current status")
-    );
-    assert_eq!(
-        task_state.frontier.next_action_hint.as_deref(),
-        Some("latest command result available; choose the next control step or report status")
-    );
-    assert!(task_state
-        .goal
-        .success_criteria
-        .iter()
-        .any(|item| item.contains("change system state materially or report the grounded current status/blocker")));
-    assert!(!task_state
-        .goal
-        .success_criteria
-        .iter()
-        .any(|item| item.contains("inspection, read, or answer step")));
 }
 
 #[test]
@@ -332,7 +300,7 @@ fn compaction_preserves_authoritative_sources_before_candidates() {
 }
 
 #[test]
-fn output_task_state_tracks_pending_deliverable_and_existing_target() {
+fn output_task_state_stays_observational_without_inferred_deliverables() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default()),
         Box::new(MockReasoner::for_action(Action::Respond {
@@ -364,26 +332,9 @@ fn output_task_state_tracks_pending_deliverable_and_existing_target() {
     let objective = format!("update {} again from startup.md", target.display());
     let task = Task::new(AgentId::new(), &objective);
     let task_state = kernel.build_task_state(&task, &state, 3, 6, Some("read startup.md".to_string()));
-    let target_display = target.display().to_string();
-    let pending_deliverable = format!("write or update {}", target.display());
-    let remaining = format!(
-        "overwrite or confirm {} using the gathered evidence",
-        target.display()
-    );
-
-    assert_eq!(
-        task_state.progress.target_output_path.as_deref(),
-        Some(target_display.as_str())
-    );
-    assert!(task_state.progress.target_output_exists);
-    assert_eq!(
-        task_state.progress.pending_deliverable.as_deref(),
-        Some(pending_deliverable.as_str())
-    );
-    assert_eq!(
-        task_state.progress.remaining_obligation.as_deref(),
-        Some(remaining.as_str())
-    );
+    assert_eq!(task_state.goal.objective, objective);
+    assert_eq!(task_state.working_sources.len(), 1);
+    assert!(task_state.frontier.blockers.is_empty());
 }
 
 #[test]

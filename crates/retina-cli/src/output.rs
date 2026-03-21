@@ -192,11 +192,6 @@ pub fn render_timeline_event(event: &TimelineEvent) -> String {
 }
 
 pub fn render_task_state(task_state: &TaskState) -> String {
-    let open_questions = if task_state.frontier.open_questions.is_empty() {
-        "(none)".to_string()
-    } else {
-        task_state.frontier.open_questions.join("\n- ")
-    };
     let blockers = if task_state.frontier.blockers.is_empty() {
         "(none)".to_string()
     } else {
@@ -279,28 +274,13 @@ pub fn render_task_state(task_state: &TaskState) -> String {
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "goal: {}\nintent_hint: {}\nphase: {}\nstep: {} / {}\noutput_written: {}\noutput_verified: {}\nnext: {}\nopen_questions:\n{}\nblockers:\n{}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
+        "goal: {}\nphase: {}\nstep: {} / {}\noutput_written: {}\noutput_verified: {}\nblockers:\n{}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
         task_state.goal.objective,
-        task_state
-            .intent_hint
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "none".to_string()),
         task_state.progress.current_phase,
         task_state.progress.current_step,
         task_state.progress.max_steps,
         task_state.progress.output_written,
         task_state.progress.output_verified,
-        task_state
-            .frontier
-            .next_action_hint
-            .clone()
-            .unwrap_or_else(|| "none".to_string()),
-        if open_questions == "(none)" {
-            open_questions
-        } else {
-            format!("- {open_questions}")
-        },
         if blockers == "(none)" {
             blockers
         } else {
@@ -399,16 +379,7 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .payload_json
             .get("task_state")
             .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
-            .map(|task_state| {
-                format!(
-                    "intent: {}",
-                    task_state
-                        .intent_hint
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| "none".to_string())
-                )
-            }),
+            .map(|_| "context ready".to_string()),
         TimelineEventType::TaskStepCompleted => event
             .payload_json
             .get("task_state")
@@ -448,13 +419,6 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
                                 source.locator, source.status, method, preview
                             )
                         })
-                    })
-                    .or_else(|| {
-                        task_state
-                            .frontier
-                            .open_questions
-                            .first()
-                            .map(|question| format!("observed: {question}"))
                     })
             }),
         TimelineEventType::ReflectionRequested => event
@@ -717,7 +681,6 @@ mod tests {
         let task_state = TaskState {
             goal: TaskGoal {
                 objective: "create output".to_string(),
-                success_criteria: vec![],
                 constraints: vec![],
             },
             progress: TaskProgress {
@@ -728,17 +691,9 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
-                remaining_obligation: None,
-                pending_deliverable: None,
-                target_output_path: None,
-                target_output_exists: false,
             },
-            intent_hint: Some(TaskKind::Output),
-            reasoner_framing: None,
             frontier: TaskFrontier {
-                open_questions: vec!["Need to gather the PDF text".to_string()],
                 blockers: vec!["required input still not ingested: dominican_Med.pdf".to_string()],
-                next_action_hint: None,
             },
             recent_actions: vec![],
             working_sources: vec![WorkingSource {
@@ -788,7 +743,6 @@ mod tests {
         let task_state = TaskState {
             goal: TaskGoal {
                 objective: "summarize pdf".to_string(),
-                success_criteria: vec![],
                 constraints: vec![],
             },
             progress: TaskProgress {
@@ -799,18 +753,8 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
-                remaining_obligation: None,
-                pending_deliverable: None,
-                target_output_path: None,
-                target_output_exists: false,
             },
-            intent_hint: None,
-            reasoner_framing: None,
-            frontier: TaskFrontier {
-                open_questions: vec!["evidence gathered from authoritative sources".to_string()],
-                blockers: vec![],
-                next_action_hint: Some("gathered evidence available for an answer".to_string()),
-            },
+            frontier: TaskFrontier { blockers: vec![] },
             recent_actions: vec![],
             working_sources: vec![WorkingSource {
                 locator: "plan.pdf".to_string(),
@@ -859,7 +803,6 @@ mod tests {
         let task_state = TaskState {
             goal: TaskGoal {
                 objective: "answer question".to_string(),
-                success_criteria: vec![],
                 constraints: vec![],
             },
             progress: TaskProgress {
@@ -870,18 +813,8 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
-                remaining_obligation: None,
-                pending_deliverable: None,
-                target_output_path: None,
-                target_output_exists: false,
             },
-            intent_hint: None,
-            reasoner_framing: None,
-            frontier: TaskFrontier {
-                open_questions: vec!["evidence gathered from authoritative sources".to_string()],
-                blockers: vec![],
-                next_action_hint: Some("gathered evidence available for an answer".to_string()),
-            },
+            frontier: TaskFrontier { blockers: vec![] },
             recent_actions: vec![RecentActionSummary {
                 step: 2,
                 action: "respond:done".to_string(),
@@ -920,7 +853,6 @@ mod tests {
         let task_state = TaskState {
             goal: TaskGoal {
                 objective: "shutdown docker".to_string(),
-                success_criteria: vec![],
                 constraints: vec![],
             },
             progress: TaskProgress {
@@ -931,25 +863,8 @@ mod tests {
                 verified_facts: vec![],
                 output_written: false,
                 output_verified: false,
-                remaining_obligation: Some(
-                    "decide the next control action or report the current status".to_string(),
-                ),
-                pending_deliverable: None,
-                target_output_path: None,
-                target_output_exists: false,
             },
-            intent_hint: None,
-            reasoner_framing: None,
-            frontier: TaskFrontier {
-                open_questions: vec![
-                    "decide the next control action or report the current status".to_string(),
-                ],
-                blockers: vec![],
-                next_action_hint: Some(
-                    "latest command result available; choose the next control step or report status"
-                        .to_string(),
-                ),
-            },
+            frontier: TaskFrontier { blockers: vec![] },
             recent_actions: vec![],
             working_sources: vec![
                 WorkingSource {
