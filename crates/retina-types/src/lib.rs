@@ -68,8 +68,9 @@ mod tests {
     }
 
     #[test]
-    fn task_state_defaults_to_no_intent_hint() {
+    fn task_state_defaults_cleanly() {
         let state = crate::TaskState::default();
-        assert!(state.intent_hint.is_none());
+        assert!(state.goal.objective.is_empty());
+        assert_eq!(state.progress.current_step, 0);
     }
 }

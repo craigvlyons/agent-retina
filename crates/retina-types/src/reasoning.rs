@@ -28,28 +28,16 @@ impl AssembledContext {
             .map(|tool| format!("- {}: {}", tool.name, tool.description))
             .collect::<Vec<_>>()
             .join("\n");
-        let memory = if self.memory_slice.is_empty() {
-            "none".to_string()
-        } else {
-            self.memory_slice.join("\n")
-        };
-        let recent_context = self
-            .recent_context
-            .as_ref()
-            .map(RecentContext::render)
-            .unwrap_or_else(|| "none".to_string());
         let operator_guidance = self
             .operator_guidance
             .clone()
             .unwrap_or_else(|| "none".to_string());
         format!(
-            "Identity:\n{}\n\nTask:\n{}\n\nTask state:\n{}\n\nRecent conversational context:\n{}\n\nTools:\n{}\n\nMemory:\n{}\n\nOperator guidance:\n{}",
+            "Identity:\n{}\n\nTask:\n{}\n\nTask state:\n{}\n\nTools:\n{}\n\nOperator guidance:\n{}",
             self.identity,
             self.task,
             self.task_state.render(),
-            recent_context,
             tools,
-            memory,
             operator_guidance,
         )
     }

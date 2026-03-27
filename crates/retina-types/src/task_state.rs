@@ -1,4 +1,3 @@
-use crate::ReasonerTaskFraming;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -6,8 +5,6 @@ use std::fmt::{Display, Formatter};
 #[serde(default)]
 pub struct TaskState {
     pub goal: TaskGoal,
-    pub intent_hint: Option<TaskKind>,
-    pub reasoner_framing: Option<ReasonerTaskFraming>,
     pub progress: TaskProgress,
     pub frontier: TaskFrontier,
     pub recent_actions: Vec<RecentActionSummary>,
@@ -24,44 +21,10 @@ impl TaskState {
     }
 
     pub fn render(&self) -> String {
-        let success_criteria = render_compact_list(&self.goal.success_criteria, 3);
         let constraints = render_list(&self.goal.constraints);
         let completed = render_compact_list(&self.progress.completed_checkpoints, 4);
         let verified = render_compact_list(&self.progress.verified_facts, 4);
-        let open_questions = render_list(&self.frontier.open_questions);
         let blockers = render_list(&self.frontier.blockers);
-        let framing_hint = self
-            .intent_hint
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "none".to_string());
-        let reasoner_framing = self
-            .reasoner_framing
-            .as_ref()
-            .map(|framing| {
-                format!(
-                    "- intent_kind: {}\n- deliverable: {}\n- completion_basis: {}",
-                    framing
-                        .intent_kind
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_else(|| "none".to_string()),
-                    framing
-                        .deliverable
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string()),
-                    framing
-                        .completion_basis
-                        .clone()
-                        .unwrap_or_else(|| "none".to_string())
-                )
-            })
-            .unwrap_or_else(|| "none".to_string());
-        let next_action = self
-            .frontier
-            .next_action_hint
-            .clone()
-            .unwrap_or_else(|| "none".to_string());
         let recent_actions =
             render_tail_items(&self.recent_actions, 4, RecentActionSummary::render);
         let working_sources = render_tail_items(&self.working_sources, 4, WorkingSource::render);
@@ -75,12 +38,9 @@ impl TaskState {
             .unwrap_or_else(|| "none".to_string());
 
         format!(
-            "Goal:\n- objective: {}\n- success_criteria:\n{}\n- constraints:\n{}\n\nIntent hint:\n- {}\n\nReasoner framing:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- recent_completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n- remaining_obligation: {}\n- pending_deliverable: {}\n- target_output_path: {}\n- target_output_exists: {}\n\nFrontier:\n- next_action_hint: {}\n- open_questions:\n{}\n- blockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
+            "Goal:\n- objective: {}\n- constraints:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- recent_completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n\nBlockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
             self.goal.objective,
-            success_criteria,
             constraints,
-            framing_hint,
-            reasoner_framing,
             self.progress.current_phase,
             self.progress.current_step,
             self.progress.max_steps,
@@ -88,21 +48,6 @@ impl TaskState {
             verified,
             self.progress.output_written,
             self.progress.output_verified,
-            self.progress
-                .remaining_obligation
-                .clone()
-                .unwrap_or_else(|| "none".to_string()),
-            self.progress
-                .pending_deliverable
-                .clone()
-                .unwrap_or_else(|| "none".to_string()),
-            self.progress
-                .target_output_path
-                .clone()
-                .unwrap_or_else(|| "none".to_string()),
-            self.progress.target_output_exists,
-            next_action,
-            open_questions,
             blockers,
             recent_actions,
             working_sources,
@@ -117,7 +62,6 @@ impl TaskState {
 #[serde(default)]
 pub struct TaskGoal {
     pub objective: String,
-    pub success_criteria: Vec<String>,
     pub constraints: Vec<String>,
 }
 
@@ -150,17 +94,11 @@ pub struct TaskProgress {
     pub verified_facts: Vec<String>,
     pub output_written: bool,
     pub output_verified: bool,
-    pub remaining_obligation: Option<String>,
-    pub pending_deliverable: Option<String>,
-    pub target_output_path: Option<String>,
-    pub target_output_exists: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TaskFrontier {
-    pub next_action_hint: Option<String>,
-    pub open_questions: Vec<String>,
     pub blockers: Vec<String>,
 }
 

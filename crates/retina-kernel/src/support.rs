@@ -6,16 +6,10 @@ use std::sync::{Mutex, MutexGuard};
 #[derive(Clone)]
 pub(crate) struct StepDecision {
     pub(crate) action: Action,
-    pub(crate) framing: Option<ReasonerTaskFraming>,
 }
 
 pub(crate) enum ActionExecution {
     Outcome(Outcome),
-    Retry {
-        step: StepDecision,
-        failed_action_label: String,
-        failure_reason: String,
-    },
 }
 
 pub(crate) struct StepSelectionContext<'a> {

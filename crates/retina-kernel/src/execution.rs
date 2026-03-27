@@ -1,14 +1,10 @@
-use crate::result_helpers::{should_retry, summarize_verified_facts};
+use crate::result_helpers::summarize_verified_facts;
 use crate::support::{
     ActionExecution, ContextAssemblyInput, EventSpec, StepDecision, StepSelectionContext,
     action_failure_reason, action_requires_approval, action_utility, approval_reason,
     default_tool_descriptors,
 };
-use crate::task_shape::{
-    build_task_frontier, current_intent_hint, describe_task_phase, infer_pending_deliverable,
-    infer_remaining_obligation, infer_target_output_path, is_operational_command_task,
-    should_reconsider_low_value_action, target_output_exists,
-};
+use crate::task_shape::{build_task_frontier, describe_task_phase};
 use crate::{Kernel, TaskLoopState, action_label};
 use chrono::Utc;
 use retina_types::*;
@@ -38,7 +34,6 @@ impl Kernel {
             ))?;
             return Ok(StepDecision {
                 action,
-                framing: None,
             });
         }
 
@@ -75,61 +70,8 @@ impl Kernel {
                 "task_complete": response.task_complete
             }),
         ))?;
-        let target_output_path = infer_target_output_path(task, state);
-        if let Some(reason) = should_reconsider_low_value_action(
-            task,
-            state,
-            &response.action,
-            target_output_path.as_deref(),
-        ) {
-            self.emit_event(EventSpec::new(
-                task,
-                Some(intent),
-                Some(&response.action),
-                TimelineEventType::ReflectionRequested,
-                json!({ "reason": reason }),
-            ))?;
-            let reflection_context = self.assemble_context(ContextAssemblyInput {
-                task,
-                state,
-                last_result: Some(reason.clone()),
-                last_result_summary: Some(reason.clone()),
-                operator_guidance: Some(reason.clone()),
-                current_step,
-                max_steps,
-            })?;
-            let reflection = self.reasoner.reflect(&ReasonRequest {
-                tools: reflection_context.tools.clone(),
-                context: reflection_context,
-                constraints: self
-                    .shell
-                    .constraints()
-                    .iter()
-                    .map(|constraint| format!("{constraint:?}"))
-                    .collect(),
-                max_tokens: Some(384),
-            })?;
-            self.emit_event(EventSpec::new(
-                task,
-                Some(intent),
-                Some(&reflection.action),
-                TimelineEventType::ReflectionCompleted,
-                json!({
-                    "action": action_label(&reflection.action),
-                    "reasoning": reflection.reasoning,
-                    "framing": reflection.framing,
-                    "retry": true,
-                    "task_complete": reflection.task_complete
-                }),
-            ))?;
-            return Ok(StepDecision {
-                action: reflection.action,
-                framing: reflection.framing,
-            });
-        }
         Ok(StepDecision {
             action: response.action,
-            framing: response.framing,
         })
     }
 
@@ -140,7 +82,6 @@ impl Kernel {
         state: &TaskLoopState,
         step: &StepDecision,
         control: Option<&ExecutionControlHandle>,
-        allow_retry: bool,
     ) -> Result<ActionExecution> {
         let mut action = step.action.clone();
         intent.action = Some(action.clone());
@@ -224,14 +165,7 @@ impl Kernel {
             Ok(result) => result,
             Err(error) => {
                 self.circuit_breaker.record_failure(intent);
-                return self.reflect_or_fail(
-                    task,
-                    intent,
-                    &action,
-                    control,
-                    error.to_string(),
-                    allow_retry,
-                );
+                return Ok(ActionExecution::Outcome(Outcome::Failure(error.to_string())));
             }
         };
 
@@ -333,112 +267,9 @@ impl Kernel {
 
         if let Some(reason) = action_failure_reason(&result, &delta, &action) {
             self.circuit_breaker.record_failure(intent);
-            return self.reflect_or_fail(task, intent, &action, control, reason, allow_retry);
+            return Ok(ActionExecution::Outcome(Outcome::Failure(reason)));
         }
         Ok(ActionExecution::Outcome(Outcome::Success(result)))
-    }
-
-    pub(crate) fn reflect_or_fail(
-        &self,
-        task: &Task,
-        intent: &mut Intent,
-        action: &Action,
-        control: Option<&ExecutionControlHandle>,
-        reason: String,
-        allow_retry: bool,
-    ) -> Result<ActionExecution> {
-        if let Some(outcome) = self.check_cancellation(
-            task,
-            Some(intent),
-            Some(action),
-            control,
-            "before reflection",
-        )? {
-            return Ok(ActionExecution::Outcome(outcome));
-        }
-        self.emit_event(EventSpec::new(
-            task,
-            Some(intent),
-            Some(action),
-            TimelineEventType::ReflectionRequested,
-            json!({ "reason": reason }),
-        ))?;
-
-        let mut reflection_state = TaskLoopState::new(1);
-        reflection_state.recent_steps = vec![format!("failed action: {}", action_label(action))];
-        reflection_state.recent_action_summaries = vec![RecentActionSummary {
-            step: 1,
-            action: action_label(action),
-            outcome: reason.clone(),
-            artifact_refs: Vec::new(),
-        }];
-        reflection_state.avoid_rules = vec![AvoidRule {
-            label: action_label(action),
-            reason: reason.clone(),
-        }];
-        let reflection_context = self.assemble_context(ContextAssemblyInput {
-            task,
-            state: &reflection_state,
-            last_result: Some(reason.clone()),
-            last_result_summary: Some(reason.clone()),
-            operator_guidance: control.and_then(ExecutionControlHandle::take_guidance),
-            current_step: 1,
-            max_steps: 1,
-        })?;
-        let reflection = self.reasoner.reflect(&ReasonRequest {
-            tools: reflection_context.tools.clone(),
-            context: reflection_context,
-            constraints: self
-                .shell
-                .constraints()
-                .iter()
-                .map(|constraint| format!("{constraint:?}"))
-                .collect(),
-            max_tokens: Some(384),
-        })?;
-        self.emit_event(EventSpec::new(
-            task,
-            Some(intent),
-            Some(&reflection.action),
-            TimelineEventType::ReflectionCompleted,
-            json!({
-                "action": action_label(&reflection.action),
-                "reasoning": reflection.reasoning,
-                "framing": reflection.framing,
-                "retry": allow_retry,
-                "task_complete": reflection.task_complete
-            }),
-        ))?;
-
-        if let Some(outcome) = self.check_cancellation(
-            task,
-            Some(intent),
-            Some(action),
-            control,
-            "after reflection",
-        )? {
-            return Ok(ActionExecution::Outcome(outcome));
-        }
-
-        if allow_retry && should_retry(action, &reflection.action) {
-            return Ok(ActionExecution::Retry {
-                step: StepDecision {
-                    action: reflection.action,
-                    framing: reflection.framing,
-                },
-                failed_action_label: action_label(action),
-                failure_reason: reason,
-            });
-        }
-
-        self.emit_event(EventSpec::new(
-            task,
-            Some(intent),
-            Some(action),
-            TimelineEventType::TaskFailed,
-            json!({ "reason": reason }),
-        ))?;
-        Ok(ActionExecution::Outcome(Outcome::Failure(reason)))
     }
 
     pub(crate) fn record_experience(
@@ -490,8 +321,6 @@ impl Kernel {
             .iter()
             .map(|constraint| format!("{constraint:?}"))
             .collect::<Vec<_>>();
-        let experiences = self.memory.recall_experiences(&task.description, 3)?;
-        let knowledge = self.memory.recall_knowledge(&task.description, 3)?;
         let mut tools = default_tool_descriptors(self.shell.capabilities());
         tools.extend(
             self.memory
@@ -520,29 +349,7 @@ impl Kernel {
                 .with_constraints(shell_constraints),
             recent_context: task.recent_context.clone(),
             tools,
-            memory_slice: experiences
-                .into_iter()
-                .map(|experience| {
-                    let prior_task = experience
-                        .metadata
-                        .get("task")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("");
-                    format!(
-                        "experience: task={} action={} outcome={} utility={:.2}",
-                        prior_task,
-                        experience.action_summary,
-                        experience.outcome,
-                        experience.utility
-                    )
-                })
-                .chain(knowledge.into_iter().map(|item| {
-                    format!(
-                        "knowledge: {} (confidence {:.2})",
-                        item.content, item.confidence
-                    )
-                }))
-                .collect(),
+            memory_slice: Vec::new(),
             last_result,
             last_result_summary,
             recent_steps: state.recent_steps.clone(),
@@ -560,7 +367,6 @@ impl Kernel {
         max_steps: usize,
         last_result_summary: Option<String>,
     ) -> TaskState {
-        let intent_hint = current_intent_hint(state);
         let output_written = state.artifact_references.iter().any(|artifact| {
             matches!(
                 artifact.status.as_str(),
@@ -573,35 +379,14 @@ impl Kernel {
                 "created" | "written" | "overwritten" | "appended" | "command_changed"
             )
         });
-        let target_output_path = infer_target_output_path(task, state);
-        let target_exists = target_output_exists(target_output_path.as_deref(), state);
-        let remaining_obligation = infer_remaining_obligation(
-            task,
-            state,
-            output_written,
-            output_verified,
-            target_output_path.as_deref(),
-            target_exists,
-        );
-        let pending_deliverable =
-            infer_pending_deliverable(task, state, target_output_path.as_deref());
-        let (open_questions, blockers, next_action_hint) = build_task_frontier(
-            task,
-            last_result_summary.clone(),
-            state,
-            target_output_path.as_deref(),
-            target_exists,
-            remaining_obligation.as_deref(),
-        );
-        let success_criteria = derive_success_criteria(task, state, output_written, output_verified);
+        let _ = task;
+        let _ = last_result_summary;
+        let blockers = build_task_frontier(state);
         TaskState {
             goal: TaskGoal {
                 objective: task.description.clone(),
-                success_criteria,
                 constraints: Vec::new(),
             },
-            intent_hint,
-            reasoner_framing: state.last_reasoner_framing.clone(),
             progress: TaskProgress {
                 current_phase: describe_task_phase(state, current_step, max_steps),
                 current_step,
@@ -613,16 +398,8 @@ impl Kernel {
                 ),
                 output_written,
                 output_verified,
-                remaining_obligation,
-                pending_deliverable,
-                target_output_path,
-                target_output_exists: target_exists,
             },
-            frontier: TaskFrontier {
-                next_action_hint,
-                open_questions,
-                blockers,
-            },
+            frontier: TaskFrontier { blockers },
             recent_actions: state.recent_action_summaries.clone(),
             working_sources: state.working_sources.clone(),
             artifact_references: state.artifact_references.clone(),
@@ -691,61 +468,6 @@ impl Kernel {
         };
         self.memory.append_timeline_event(&event)
     }
-}
-
-fn derive_success_criteria(
-    task: &Task,
-    state: &TaskLoopState,
-    output_written: bool,
-    output_verified: bool,
-) -> Vec<String> {
-    let mut criteria = vec!["completion is grounded in observed evidence".to_string()];
-    let operational = is_operational_command_task(task, state);
-    let has_authoritative_source = state
-        .working_sources
-        .iter()
-        .any(|source| source.kind != "command" && source.role == "authoritative");
-    let has_candidate_sources = state
-        .working_sources
-        .iter()
-        .any(|source| {
-            source.kind != "command" && matches!(source.role.as_str(), "candidate" | "supporting")
-        });
-    let has_generated_output = state.working_sources.iter().any(|source| source.role == "generated")
-        || state.artifact_references.iter().any(|artifact| {
-            matches!(
-                artifact.status.as_str(),
-                "created" | "written" | "overwritten" | "appended" | "command_changed"
-            )
-        });
-
-    if operational {
-        criteria.push(
-            "the next step should either change system state materially or report the grounded current status/blocker"
-                .to_string(),
-        );
-    } else if has_candidate_sources && !has_authoritative_source {
-        criteria.push(
-            "discovered paths should lead to a concrete inspection, read, or answer step"
-                .to_string(),
-        );
-    }
-
-    if has_authoritative_source && !has_generated_output {
-        criteria.push("gathered evidence is used to answer or take the next concrete step".to_string());
-    }
-
-    if output_written || has_generated_output {
-        criteria.push("any produced artifact or state change is explicitly verified".to_string());
-    } else {
-        criteria.push("the next step should reduce the main unresolved obligation rather than repeat shallow discovery".to_string());
-    }
-
-    if output_verified {
-        criteria.push("verified outputs remain consistent with the task goal".to_string());
-    }
-
-    criteria
 }
 
 fn synthesize_approval_denied_blocker(

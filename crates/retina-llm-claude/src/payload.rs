@@ -116,35 +116,20 @@ Supported action types:\n\
 \n\
 Planning rules:\n\
 - The harness is your body. Explore through shell actions instead of guessing.\n\
-- Choose the best next verifiable step that most reduces uncertainty or advances the requested result.\n\
-- If the task already names likely source files, directories, or output paths, target those artifacts directly instead of broad parent-directory listing unless location is genuinely uncertain.\n\
+- Choose one concrete next step that advances the task or reduces uncertainty.\n\
 - If you use run_command to create or modify a specific artifact, set path to the target file so the harness can verify the change.\n\
-- Use whichever action gives the clearest verifiable progress: structured file actions, document extraction, or run_command for local shell pipelines, text processing, or small local scripts.\n\
 - Use ingest_structured_data for CSV/TSV-style local data when headers, rows, or sample records matter more than plain prose.\n\
-- Prefer readable text sources such as .md, .txt, code, and config files when multiple candidates could answer the task.\n\
 - Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
 - If the task asks for specific PDF pages, set page_start and page_end so the shell extracts only that page range.\n\
 - For find_files, keep root as a real directory path and keep pattern limited to a filename or glob; do not pack path fragments into pattern.\n\
 - For search_text, keep root as the directory scope and keep query limited to search terms; do not combine them into one field.\n\
-- When a prior result already includes likely candidate paths, choose the best next ingest, transform, or write step instead of searching again.\n\
-- When a task names a likely alias-plus-filename target such as Desktop plus a PDF name, prefer verifying that exact candidate path before broad recursive search.\n\
-- When the last result already contains enough evidence to answer the user, respond directly instead of repeating exploration.\n\
-- If multiple files match, prefer the shallowest and most human-readable candidate unless the task explicitly asks for another one.\n\
-- If the user asks a question about content, gather the evidence first and then finish with respond once you can answer directly.\n\
-- If the task asks you to create, save, update, or rewrite a named output file and you already have the needed source evidence, prefer write_file or append_file over more exploration.\n\
-- If the task names an output path on Desktop, Documents, Downloads, or ~/ and prior steps already verified that area, target the named output path directly instead of diagnosing the filesystem again.\n\
-- If the last result already gave enough evidence, do not repeat the same exploratory step.\n\
 - Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
 - Discovery-only steps such as inspect_path, list_directory, find_files, and search_text are intermediate progress when the request still asks you to read, answer, summarize, extract, or create output.\n\
-- For multi-step requests, keep working toward the original objective one concrete action at a time; do not stop after locating the likely source if reading, synthesis, or output creation is still required.\n\
 - In general, intermediate shell steps should not be marked task_complete=true. Use task_complete=true when you are returning a grounded final response or when a verified output/state change satisfies the task.\n\
 - If task_state shows an explicit output artifact that still needs verification, do not mark task_complete=true until that artifact is verified, unless you are surfacing a grounded blocker.\n\
-- If a named target file already exists and the task is to save again, rewrite, refresh, or update it, use write_file with overwrite=true unless the user asked to preserve the old file.\n\
-- If a named target file already exists and the user did not ask you to change it, respond with that grounded observation instead of wandering into more diagnostics.\n\
-- If authoritative evidence already exists and task_state shows a pending deliverable or target output path, prefer the next completion move such as write_file, inspect_path on the target artifact, or respond.\n\
-- In reflection mode, recover toward completion. Do not return to broad search/list/find actions when the evidence and target artifact are already available unless a real blocker makes completion impossible.\n\
+- In reflection mode, do something materially different or report the grounded blocker/current status.\n\
 - For terminal or system-control tasks, use command output as evidence, but do not assume the harness can fully verify world state for you.\n\
-- Prefer hard verification for concrete artifact changes. For process, service, or environment checks, decide whether another control step is worthwhile or whether you should report the grounded current status/blocker.\n\
+- Prefer hard verification for concrete artifact changes. For process, service, or environment checks, reason from the observed command evidence.\n\
 - When repeated command checks no longer change the picture, stop varying the same check and either take a materially different action or respond with the current grounded status.\n\
 - `intent_kind`, `deliverable`, and `completion_basis` are optional continuity metadata. When useful, keep `intent_kind` to: answer, output, or unknown.\n\
 \n\
@@ -166,32 +151,10 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
             .join("\n")
     };
     format!(
-        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n- remaining_obligation: {}\n- pending_deliverable: {}\n- target_output_path: {}\n- target_output_exists: {}\n\nDynamic task context follows in the next block. Treat task_state as the canonical live thread. Observations and verified tool results are the source of truth for this step.",
+        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n\nDynamic task context follows in the next block. Treat task_state as the canonical live thread. Observations and verified tool results are the source of truth for this step.",
         constraints,
         request.context.task_state.progress.output_written,
-        request.context.task_state.progress.output_verified,
-        request
-            .context
-            .task_state
-            .progress
-            .remaining_obligation
-            .clone()
-            .unwrap_or_else(|| "none".to_string()),
-        request
-            .context
-            .task_state
-            .progress
-            .pending_deliverable
-            .clone()
-            .unwrap_or_else(|| "none".to_string()),
-        request
-            .context
-            .task_state
-            .progress
-            .target_output_path
-            .clone()
-            .unwrap_or_else(|| "none".to_string()),
-        request.context.task_state.progress.target_output_exists
+        request.context.task_state.progress.output_verified
     )
 }
 
@@ -251,11 +214,8 @@ mod tests {
                 task_state: TaskState {
                     goal: TaskGoal {
                         objective: "what is Watcher.txt about?".to_string(),
-                        success_criteria: vec![],
                         constraints: vec![],
                     },
-                    intent_hint: None,
-                    reasoner_framing: None,
                     progress: TaskProgress {
                         current_phase: "working".to_string(),
                         current_step: 1,
@@ -264,10 +224,6 @@ mod tests {
                         verified_facts: vec![],
                         output_written: false,
                         output_verified: false,
-                        remaining_obligation: None,
-                        pending_deliverable: None,
-                        target_output_path: None,
-                        target_output_exists: false,
                     },
                     frontier: TaskFrontier::default(),
                     recent_actions: vec![],
@@ -323,11 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn assembled_context_render_keeps_recent_context_but_not_replay_sections() {
+    fn assembled_context_render_stays_minimal_and_does_not_replay_sections() {
         let rendered = sample_request().context.render();
-        assert!(rendered.contains("Recent conversational context:"));
-        assert!(rendered.contains("prior_objective: list files in texts"));
         assert!(rendered.contains("Task state:"));
+        assert!(rendered.contains("Tools:"));
+        assert!(!rendered.contains("Recent conversational context:"));
+        assert!(!rendered.contains("Memory:"));
         assert!(!rendered.contains("Recent steps:"));
         assert!(!rendered.contains("Last result summary:"));
         assert!(!rendered.contains("Last result:"));
