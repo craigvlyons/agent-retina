@@ -43,6 +43,34 @@ Retina already has the right skeleton:
 That means Retina does not need a new foundation.
 It needs a stronger runtime layer around the existing foundation.
 
+## Base Agent Position
+
+To stay aligned with the `code_source` architecture, Retina should keep one shared base worker shape:
+- one shared kernel loop
+- one shared reasoner/runtime path
+- one shared shell/body
+- one shared default tool pool
+
+This is important because `code_source` does not turn file work, shell work, or search work into separate base-agent subsystems.
+It keeps them as capabilities in the default tool pool and lets the agent choose them through the common loop.
+
+Retina should follow the same rule:
+- file management belongs in the base tool surface, not in special kernel logic
+- the CLI shell belongs in the base execution body, not as a one-off implementation detail
+- subagents and specialists should mostly differ by prompt, authority, tool scope, and budget
+- subagents and specialists should not get bespoke control loops unless there is a hard runtime reason
+
+In practice this means:
+- `retina-shell-cli` is part of the base worker body
+- structured file tools are part of the base worker tool pool
+- shell command execution is part of the base worker tool pool/body
+- later specialists reuse the same loop/body/tool architecture with narrower scope
+
+Non-goals:
+- do not build a dedicated "file agent" as the main editing path
+- do not move normal file workflows into specialist-only code
+- do not create separate mini-runtimes for files, shell, docs, or search unless the source pattern truly requires it
+
 ## What To Keep From The Code_Source Harness
 
 ### 1. Task model
@@ -117,6 +145,11 @@ Recommendation:
   - budget
   - working root
   - MCP requirements
+
+Important constraint:
+- start from one shared base tool pool
+- subtract or scope tools per agent
+- do not invent separate per-agent runtime implementations where tool scoping is enough
 
 ### 4. Tool orchestration and concurrency
 
@@ -239,6 +272,23 @@ fs  shell mcp  agent-delegation
          transport later
 ```
 
+Architectural interpretation:
+- the base worker owns the shell/body and the shared default tool pool
+- file read/edit/write/notebook tools are base capabilities
+- MCP tools are additive capabilities, not a replacement for the base shell/body
+- subagents are runtime children of the same architecture
+- specialists are manifest-backed, reusable scoped workers built on the same architecture
+
+So the layering should be:
+- shared loop
+- shared body
+- shared tool registry
+- scoped agent definitions on top
+
+Not:
+- separate base agents for files, shell, browser, docs, or search
+- special kernel branches for each specialist domain
+
 ## Recommended Crate Layout
 
 ### Keep as-is or evolve in place
@@ -339,6 +389,11 @@ Properties:
 - usually local
 - may share memory or use a temporary child memory view
 
+Direction from source:
+- a subagent is a scoped worker built on the same core runtime shape as the parent
+- it should inherit the same fundamental file/shell capabilities unless policy narrows them
+- it should not introduce domain-specific harness logic just to behave differently
+
 ### Specialist
 
 A named worker chamber with its own manifest and lifecycle.
@@ -356,6 +411,11 @@ Properties:
 - authority scope
 - memory scope
 - reusable over many tasks
+
+Direction from source:
+- a specialist is still the same worker architecture underneath
+- the main differences are manifest identity, stable scoped permissions, lifecycle, and role prompt
+- file management and shell access remain base capabilities that may be narrowed, not reimplemented
 
 This aligns directly with Retina's existing agent lifecycle types in [crates/retina-types/src/agents.rs](/Users/macc/projects/personal/agent-retina/crates/retina-types/src/agents.rs).
 
@@ -461,6 +521,9 @@ So the order should be:
 - code_source tool pool assembly -> Retina manifest-scoped `ToolRegistry`
 - code_source task framework -> Retina `retina-runtime`
 - code_source MCP client -> Retina `retina-mcp-client`
+- code_source default tool pool -> Retina shared base tool registry
+- code_source file tools in the default pool -> Retina file management in the base worker tool surface
+- code_source subagent prompt/tool scoping -> Retina child agents as scoped variants of the same worker architecture
 
 ### Do not map directly
 
@@ -505,6 +568,11 @@ Build:
 Goal:
 - let the current worker delegate bounded work without full transport
 
+Interpretation:
+- local subagents are prompt-scoped workers built on the same kernel/body/tool architecture as the main worker
+- they inherit the same base capabilities unless policy narrows them
+- they should not introduce domain-specific harness logic just to behave differently
+
 ### Phase D: specialist manifests and local transport
 
 Build:
@@ -515,6 +583,11 @@ Build:
 
 Goal:
 - make `RoutingDecision::RouteToExisting`, `Reactivate`, and `SpawnSpecialist` real
+
+Interpretation:
+- specialists are reusable scoped workers, not a different class of agent architecture
+- the main difference from local subagents should be lifecycle, manifest identity, and stable scoped permissions
+- file management and shell access remain base capabilities that may be narrowed, not reimplemented
 
 ### Phase E: MCP client integration
 

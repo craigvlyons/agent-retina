@@ -112,6 +112,17 @@ pub(crate) struct ClaudeAction {
     pub(crate) pattern: Option<String>,
     pub(crate) query: Option<String>,
     pub(crate) content: Option<String>,
+    pub(crate) old_string: Option<String>,
+    pub(crate) new_string: Option<String>,
+    pub(crate) replace_all: Option<bool>,
+    pub(crate) server: Option<String>,
+    pub(crate) tool: Option<String>,
+    pub(crate) uri: Option<String>,
+    pub(crate) input_json: Option<serde_json::Value>,
+    pub(crate) cell_id: Option<String>,
+    pub(crate) new_source: Option<String>,
+    pub(crate) cell_type: Option<String>,
+    pub(crate) edit_mode: Option<String>,
     pub(crate) include_content: Option<bool>,
     pub(crate) recursive: Option<bool>,
     pub(crate) max_entries: Option<usize>,
@@ -122,6 +133,9 @@ pub(crate) struct ClaudeAction {
     pub(crate) page_start: Option<usize>,
     pub(crate) page_end: Option<usize>,
     pub(crate) overwrite: Option<bool>,
+    pub(crate) prompt: Option<String>,
+    pub(crate) allowed_tools: Option<Vec<String>>,
+    pub(crate) denied_tools: Option<Vec<String>>,
     pub(crate) require_approval: Option<bool>,
     pub(crate) expect_change: Option<bool>,
     pub(crate) note: Option<String>,
@@ -134,7 +148,21 @@ pub(crate) struct ClaudeAction {
 }
 
 impl ClaudeAction {
-    pub(crate) fn into_reason_response(self) -> ReasonResponse {
+    pub(crate) fn into_reason_response(self) -> Result<ReasonResponse> {
+        let task_complete = self.task_complete.unwrap_or(true);
+        let framing = if self.intent_kind.is_some()
+            || self.deliverable.is_some()
+            || self.completion_basis.is_some()
+        {
+            Some(ReasonerTaskFraming {
+                intent_kind: self.intent_kind.as_deref().and_then(parse_task_kind_hint),
+                deliverable: self.deliverable,
+                completion_basis: self.completion_basis,
+            })
+        } else {
+            None
+        };
+
         let action = match self.action_type.as_str() {
             "run_command" => Action::RunCommand {
                 id: ActionId::new(),
@@ -197,22 +225,78 @@ impl ClaudeAction {
                 page_start: self.page_start,
                 page_end: self.page_end,
             },
+            "list_mcp_resources" => Action::ListMcpResources {
+                id: ActionId::new(),
+                server: self.server,
+            },
+            "read_mcp_resource" => Action::ReadMcpResource {
+                id: ActionId::new(),
+                server: required_string(self.server, "read_mcp_resource", "server")?,
+                uri: required_string(self.uri, "read_mcp_resource", "uri")?,
+            },
+            "mcp_call" => Action::CallMcpTool {
+                id: ActionId::new(),
+                server: required_string(self.server, "mcp_call", "server")?,
+                tool: required_string(self.tool, "mcp_call", "tool")?,
+                input_json: self.input_json.ok_or_else(|| {
+                    KernelError::Reasoning(
+                        "invalid Claude action 'mcp_call': missing required field 'input_json'"
+                            .to_string(),
+                    )
+                })?,
+            },
             "write_file" => Action::WriteFile {
                 id: ActionId::new(),
-                path: self
-                    .path
-                    .unwrap_or_else(|| "retina-output.txt".to_string())
-                    .into(),
+                path: required_string(self.path, "write_file", "path")?.into(),
                 content: self.content.unwrap_or_default(),
                 overwrite: self.overwrite.unwrap_or(false),
             },
+            "edit_file" => Action::EditFile {
+                id: ActionId::new(),
+                path: required_string(self.path, "edit_file", "path")?.into(),
+                old_string: required_string(self.old_string, "edit_file", "old_string")?,
+                new_string: required_string(self.new_string, "edit_file", "new_string")?,
+                replace_all: self.replace_all.unwrap_or(false),
+            },
             "append_file" => Action::AppendFile {
                 id: ActionId::new(),
-                path: self
-                    .path
-                    .unwrap_or_else(|| "retina-output.txt".to_string())
-                    .into(),
+                path: required_string(self.path, "append_file", "path")?.into(),
                 content: self.content.unwrap_or_default(),
+            },
+            "edit_notebook" => Action::EditNotebook {
+                id: ActionId::new(),
+                path: required_string(self.path, "edit_notebook", "path")?.into(),
+                cell_id: self.cell_id,
+                new_source: notebook_source_for_mode(
+                    &self.action_type,
+                    self.edit_mode.as_deref(),
+                    self.new_source,
+                )?,
+                cell_type: match self.cell_type.as_deref() {
+                    Some("code") => Some(NotebookCellType::Code),
+                    Some("markdown") => Some(NotebookCellType::Markdown),
+                    Some(other) => {
+                        return Err(KernelError::Reasoning(format!(
+                            "invalid Claude action 'edit_notebook': unsupported cell_type '{}'; expected 'code' or 'markdown'",
+                            other
+                        )));
+                    }
+                    None => None,
+                },
+                edit_mode: match self.edit_mode.as_deref() {
+                    Some("insert") => NotebookEditMode::Insert,
+                    Some("delete") => NotebookEditMode::Delete,
+                    _ => NotebookEditMode::Replace,
+                },
+            },
+            "spawn_agent" => Action::SpawnAgent {
+                id: ActionId::new(),
+                prompt: self
+                    .prompt
+                    .or(self.message.clone())
+                    .unwrap_or_else(|| "Investigate the delegated subtask.".to_string()),
+                allowed_tools: self.allowed_tools.unwrap_or_default(),
+                denied_tools: self.denied_tools.unwrap_or_default(),
             },
             "record_note" => Action::RecordNote {
                 id: ActionId::new(),
@@ -226,27 +310,33 @@ impl ClaudeAction {
             },
         };
 
-        ReasonResponse {
+        Ok(ReasonResponse {
             action,
-            task_complete: self.task_complete.unwrap_or(true),
-            framing: if self.intent_kind.is_some()
-                || self.deliverable.is_some()
-                || self.completion_basis.is_some()
-            {
-                Some(ReasonerTaskFraming {
-                    intent_kind: self
-                        .intent_kind
-                        .as_deref()
-                        .and_then(parse_task_kind_hint),
-                    deliverable: self.deliverable,
-                    completion_basis: self.completion_basis,
-                })
-            } else {
-                None
-            },
+            task_complete,
+            framing,
             reasoning: self.reasoning,
             tokens_used: TokenUsage::default(),
-        }
+        })
+    }
+}
+
+fn required_string(value: Option<String>, action_type: &str, field: &str) -> Result<String> {
+    value.filter(|text| !text.trim().is_empty()).ok_or_else(|| {
+        KernelError::Reasoning(format!(
+            "invalid Claude action '{}': missing required field '{}'",
+            action_type, field
+        ))
+    })
+}
+
+fn notebook_source_for_mode(
+    action_type: &str,
+    edit_mode: Option<&str>,
+    new_source: Option<String>,
+) -> Result<String> {
+    match edit_mode {
+        Some("delete") => Ok(new_source.unwrap_or_default()),
+        _ => required_string(new_source, action_type, "new_source"),
     }
 }
 

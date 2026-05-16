@@ -22,6 +22,7 @@ pub fn init_runtime() -> Result<()> {
     let agents = home.join("agents");
     let shared = home.join("shared").join("promoted_tools");
     std::fs::create_dir_all(root.join("tools"))?;
+    std::fs::create_dir_all(root_task_output_dir()?)?;
     std::fs::create_dir_all(agents)?;
     std::fs::create_dir_all(shared)?;
 
@@ -65,6 +66,10 @@ pub fn root_db_path() -> Result<PathBuf> {
     Ok(retina_home()?.join("root").join("agent.db"))
 }
 
+pub fn root_task_output_dir() -> Result<PathBuf> {
+    Ok(retina_home()?.join("root").join("runtime").join("tasks"))
+}
+
 pub fn root_agent_id() -> AgentId {
     AgentId("root".to_string())
 }
@@ -76,6 +81,9 @@ pub fn root_manifest() -> Result<AgentManifest> {
         domain: "orchestrator".to_string(),
         status: AgentStatus::Idle,
         description: "Retina root agent running in independent v1 mode.".to_string(),
+        role_prompt: None,
+        initial_prompt: None,
+        model_id: None,
         created_at: now,
         updated_at: now,
         parent_agent_id: None,
@@ -84,8 +92,12 @@ pub fn root_manifest() -> Result<AgentManifest> {
             "filesystem".to_string(),
             "search".to_string(),
             "command".to_string(),
+            "delegation".to_string(),
             "memory".to_string(),
         ],
+        allowed_tools: Vec::new(),
+        denied_tools: Vec::new(),
+        required_mcp_servers: Vec::new(),
         authority: AgentAuthority::default(),
         lifecycle: AgentLifecycle::ready(),
         budget: AgentBudget::default(),
@@ -94,6 +106,7 @@ pub fn root_manifest() -> Result<AgentManifest> {
 
 pub fn normalize_root_manifest(mut manifest: AgentManifest) -> AgentManifest {
     manifest.authority.accessible_roots.clear();
+    manifest.authority.allow_agent_delegation = true;
     manifest
 }
 

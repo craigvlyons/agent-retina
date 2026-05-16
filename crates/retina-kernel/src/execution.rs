@@ -2,11 +2,10 @@ use crate::result_helpers::summarize_verified_facts;
 use crate::support::{
     ActionExecution, ContextAssemblyInput, EventSpec, StepDecision, StepSelectionContext,
     action_failure_reason, action_requires_approval, action_utility, approval_reason,
-    default_tool_descriptors,
 };
-use crate::task_shape::{build_task_frontier, describe_task_phase};
 use crate::{Kernel, TaskLoopState, action_label};
 use chrono::Utc;
+use retina_tools::{ToolExecutor, ToolRegistry};
 use retina_types::*;
 use serde_json::json;
 
@@ -34,6 +33,8 @@ impl Kernel {
             ))?;
             return Ok(StepDecision {
                 action,
+                task_complete: false,
+                framing: None,
             });
         }
 
@@ -41,7 +42,6 @@ impl Kernel {
             task,
             state,
             last_result: state.last_result_json.clone(),
-            last_result_summary: state.last_result_summary.clone(),
             operator_guidance: control.and_then(ExecutionControlHandle::take_guidance),
             current_step,
             max_steps,
@@ -72,6 +72,8 @@ impl Kernel {
         ))?;
         Ok(StepDecision {
             action: response.action,
+            task_complete: response.task_complete,
+            framing: response.framing,
         })
     }
 
@@ -127,11 +129,11 @@ impl Kernel {
             if matches!(response, ApprovalResponse::Cancelled) {
                 return self
                     .cancel_outcome(
-                    task,
-                    Some(intent),
-                    Some(&action),
-                    "task cancelled by operator during approval",
-                )
+                        task,
+                        Some(intent),
+                        Some(&action),
+                        "task cancelled by operator during approval",
+                    )
                     .map(ActionExecution::Outcome);
             }
             if matches!(response, ApprovalResponse::Denied) {
@@ -161,12 +163,69 @@ impl Kernel {
             return Ok(ActionExecution::Outcome(outcome));
         }
 
-        let mut result = match self.shell.execute_controlled(&action, control) {
-            Ok(result) => result,
-            Err(error) => {
-                self.circuit_breaker.record_failure(intent);
-                return Ok(ActionExecution::Outcome(Outcome::Failure(error.to_string())));
+        let mut result = match &action {
+            Action::SpawnAgent {
+                prompt,
+                allowed_tools,
+                denied_tools,
+                ..
+            } => {
+                let Some(runtime) = &self.agent_runtime else {
+                    return Ok(ActionExecution::Outcome(Outcome::Blocked(
+                        "local agent delegation is not available in this runtime".to_string(),
+                    )));
+                };
+                ActionResult::DelegatedTask(runtime.spawn_local_agent(
+                    &SpawnAgentRequest {
+                        parent_task: task.clone(),
+                        prompt: prompt.clone(),
+                        allowed_tools: allowed_tools.clone(),
+                        denied_tools: denied_tools.clone(),
+                    },
+                    control,
+                )?)
             }
+            Action::ListMcpResources { server, .. } => {
+                let Some(runtime) = &self.mcp_runtime else {
+                    return Ok(ActionExecution::Outcome(Outcome::Blocked(
+                        "MCP runtime is not available in this runtime".to_string(),
+                    )));
+                };
+                ActionResult::McpResources {
+                    server: server.clone(),
+                    resources: runtime.list_resources(server.as_deref())?,
+                }
+            }
+            Action::ReadMcpResource { server, uri, .. } => {
+                let Some(runtime) = &self.mcp_runtime else {
+                    return Ok(ActionExecution::Outcome(Outcome::Blocked(
+                        "MCP runtime is not available in this runtime".to_string(),
+                    )));
+                };
+                ActionResult::McpResourceRead(runtime.read_resource(server, uri)?)
+            }
+            Action::CallMcpTool {
+                server,
+                tool,
+                input_json,
+                ..
+            } => {
+                let Some(runtime) = &self.mcp_runtime else {
+                    return Ok(ActionExecution::Outcome(Outcome::Blocked(
+                        "MCP runtime is not available in this runtime".to_string(),
+                    )));
+                };
+                ActionResult::McpToolCall(runtime.call_tool(server, tool, input_json)?)
+            }
+            _ => match self.shell.execute_controlled(&action, control) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.circuit_breaker.record_failure(intent);
+                    return Ok(ActionExecution::Outcome(Outcome::Failure(
+                        error.to_string(),
+                    )));
+                }
+            },
         };
 
         self.emit_event(EventSpec::new(
@@ -179,16 +238,17 @@ impl Kernel {
 
         if let ActionResult::Command(command) = &result {
             if command.cancelled {
-                return self.cancel_outcome(
-                    task,
-                    Some(intent),
-                    Some(&action),
-                    command
-                        .termination
-                        .clone()
-                        .unwrap_or_else(|| "task cancelled by operator".to_string()),
-                )
-                .map(ActionExecution::Outcome);
+                return self
+                    .cancel_outcome(
+                        task,
+                        Some(intent),
+                        Some(&action),
+                        command
+                            .termination
+                            .clone()
+                            .unwrap_or_else(|| "task cancelled by operator".to_string()),
+                    )
+                    .map(ActionExecution::Outcome);
             }
         }
 
@@ -310,7 +370,6 @@ impl Kernel {
             task,
             state,
             last_result,
-            last_result_summary,
             operator_guidance,
             current_step,
             max_steps,
@@ -321,38 +380,50 @@ impl Kernel {
             .iter()
             .map(|constraint| format!("{constraint:?}"))
             .collect::<Vec<_>>();
-        let mut tools = default_tool_descriptors(self.shell.capabilities());
-        tools.extend(
-            self.memory
-                .find_tools(&task.description)?
-                .into_iter()
-                .map(|tool| ToolDescriptor {
-                    name: tool.name,
-                    description: tool.description,
-                }),
+        let tool_policy = self.tool_policy.clone().with_task_metadata(&task.metadata);
+        let mut registry = ToolRegistry::for_shell_capabilities(
+            self.shell.capabilities(),
+            self.agent_runtime.is_some(),
         );
+        if let Some(runtime) = &self.mcp_runtime {
+            registry = registry.with_mcp_snapshot(&runtime.snapshot()?);
+        }
+        let tools = ToolExecutor::new(registry)
+            .with_policy(tool_policy)
+            .available_tools();
+        let identity = task
+            .metadata
+            .get("agent_role_prompt")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                format!(
+                    "You are Retina/{}. {}\nExecute tasks through the CLI shell.",
+                    task.agent_id, value
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "You are Retina/{}. Execute tasks through the CLI shell.",
+                    task.agent_id
+                )
+            });
+        let task_text = task
+            .metadata
+            .get("agent_initial_prompt")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("{value}\n\nCurrent task:\n{}", task.description))
+            .unwrap_or_else(|| task.description.clone());
 
         Ok(AssembledContext {
-            identity: format!(
-                "You are Retina/{}. Execute tasks through the CLI shell.",
-                task.agent_id
-            ),
-            task: task.description.clone(),
+            identity,
+            task: task_text,
             task_state: self
-                .build_task_state(
-                    task,
-                    state,
-                    current_step,
-                    max_steps,
-                    last_result_summary.clone(),
-                )
+                .build_task_state(task, state, current_step, max_steps)
                 .with_constraints(shell_constraints),
             recent_context: task.recent_context.clone(),
             tools,
             memory_slice: Vec::new(),
             last_result,
-            last_result_summary,
-            recent_steps: state.recent_steps.clone(),
             operator_guidance,
             current_step,
             max_steps,
@@ -365,7 +436,6 @@ impl Kernel {
         state: &TaskLoopState,
         current_step: usize,
         max_steps: usize,
-        last_result_summary: Option<String>,
     ) -> TaskState {
         let output_written = state.artifact_references.iter().any(|artifact| {
             matches!(
@@ -373,15 +443,19 @@ impl Kernel {
                 "created" | "written" | "overwritten" | "appended" | "command_changed"
             )
         });
-        let output_verified = state.artifact_references.iter().any(|artifact| {
+        let output_verified = state.working_sources.iter().any(|source| {
+            source.role == "generated"
+                && matches!(
+                    source.status.as_str(),
+                    "created" | "written" | "overwritten" | "appended" | "command_changed"
+                )
+                && source.preview_excerpt.is_some()
+        }) || state.artifact_references.iter().any(|artifact| {
             matches!(
                 artifact.status.as_str(),
-                "created" | "written" | "overwritten" | "appended" | "command_changed"
+                "read" | "structured_read" | "extracted"
             )
         });
-        let _ = task;
-        let _ = last_result_summary;
-        let blockers = build_task_frontier(state);
         TaskState {
             goal: TaskGoal {
                 objective: task.description.clone(),
@@ -399,11 +473,9 @@ impl Kernel {
                 output_written,
                 output_verified,
             },
-            frontier: TaskFrontier { blockers },
             recent_actions: state.recent_action_summaries.clone(),
             working_sources: state.working_sources.clone(),
             artifact_references: state.artifact_references.clone(),
-            avoid: state.avoid_rules.clone(),
             compaction: state.last_compaction_snapshot.clone(),
         }
     }
@@ -470,6 +542,16 @@ impl Kernel {
     }
 }
 
+fn describe_task_phase(state: &TaskLoopState, current_step: usize, max_steps: usize) -> String {
+    if state.step_index == 0 {
+        "starting".to_string()
+    } else if current_step >= max_steps {
+        "final step".to_string()
+    } else {
+        format!("working through step {} of {}", current_step, max_steps)
+    }
+}
+
 fn synthesize_approval_denied_blocker(
     task: &Task,
     state: &TaskLoopState,
@@ -493,7 +575,9 @@ fn synthesize_approval_denied_blocker(
         .rev()
         .find(|source| source.kind == "command")
         .and_then(|source| source.preview_excerpt.clone())
-        .unwrap_or_else(|| "the latest command evidence still indicates the task is unresolved".to_string());
+        .unwrap_or_else(|| {
+            "the latest command evidence still indicates the task is unresolved".to_string()
+        });
 
     format!(
         "Automatic completion is blocked for '{}'. Earlier steps already attempted: {}. Latest command evidence: {}. The stronger step '{}' requires approval and was denied, so Retina cannot continue automatically.",

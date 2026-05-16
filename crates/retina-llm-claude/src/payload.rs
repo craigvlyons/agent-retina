@@ -11,7 +11,7 @@ pub(crate) fn build_payload(
     prompt_caching: &ClaudePromptCaching,
     context_management: &ClaudeContextManagement,
 ) -> serde_json::Value {
-    let system_blocks = build_system_blocks(reflection, prompt_caching);
+    let system_blocks = build_system_blocks(request, reflection, prompt_caching);
     let user_content = build_user_content_blocks(request);
     let mut payload = json!({
         "model": model_id,
@@ -35,10 +35,11 @@ pub(crate) fn build_payload(
 }
 
 fn build_system_blocks(
+    request: &ReasonRequest,
     reflection: bool,
     prompt_caching: &ClaudePromptCaching,
 ) -> Vec<serde_json::Value> {
-    let stable_instructions = build_stable_instructions(reflection);
+    let stable_instructions = build_stable_instructions(reflection, &request.context.tools);
     let mut blocks = vec![json!({
         "type": "text",
         "text": "Return JSON only. Do not wrap the response in markdown fences."
@@ -68,7 +69,11 @@ fn build_user_content_blocks(request: &ReasonRequest) -> Vec<serde_json::Value> 
     ]
 }
 
-pub(crate) fn build_stable_instructions(reflection: bool) -> String {
+pub(crate) fn build_stable_instructions(
+    reflection: bool,
+    tools: &[retina_types::ToolDescriptor],
+) -> String {
+    let supported_action_types = supported_action_types_block(tools);
     format!(
         "You are the Retina agent reasoner.\n\
 Reflection mode: {reflection}.\n\
@@ -80,6 +85,17 @@ Choose exactly one action and return strict JSON with these fields:\n\
 - pattern\n\
 - query\n\
 - content\n\
+- old_string\n\
+- new_string\n\
+- replace_all\n\
+- server\n\
+- tool\n\
+- uri\n\
+- input_json\n\
+- cell_id\n\
+- new_source\n\
+- cell_type\n\
+- edit_mode\n\
 - include_content\n\
 - recursive\n\
 - max_entries\n\
@@ -90,6 +106,9 @@ Choose exactly one action and return strict JSON with these fields:\n\
 - page_start\n\
 - page_end\n\
 - overwrite\n\
+- prompt\n\
+- allowed_tools\n\
+- denied_tools\n\
 - require_approval\n\
 - expect_change\n\
 - note\n\
@@ -101,32 +120,37 @@ Choose exactly one action and return strict JSON with these fields:\n\
 - reasoning\n\
 \n\
 Supported action types:\n\
-- run_command\n\
-- inspect_path\n\
-- list_directory\n\
-- find_files\n\
-- search_text\n\
-- read_file\n\
-- ingest_structured_data\n\
-- extract_document_text\n\
-- write_file\n\
-- append_file\n\
-- record_note\n\
-- respond\n\
+{supported_action_types}\n\
 \n\
 Planning rules:\n\
 - The harness is your body. Explore through shell actions instead of guessing.\n\
 - Choose one concrete next step that advances the task or reduces uncertainty.\n\
+- You may choose only from the supported action types listed above. Do not request unavailable actions.\n\
 - If you use run_command to create or modify a specific artifact, set path to the target file so the harness can verify the change.\n\
 - Use ingest_structured_data for CSV/TSV-style local data when headers, rows, or sample records matter more than plain prose.\n\
 - Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
+- Use list_mcp_resources to see current MCP resources when configured servers may contain the needed context.\n\
+- Use read_mcp_resource with `server` and `uri` to read a specific MCP resource.\n\
+- Use mcp_call with `server`, `tool`, and `input_json` to call a configured MCP tool.\n\
+- Prefer edit_file for modifying existing text files when you know the exact old_string to replace.\n\
+- Use write_file mainly for new files or complete rewrites. If the file already exists, read it first.\n\
+- Use append_file only when adding content to the end is truly the intended edit.\n\
+- Use edit_notebook for `.ipynb` files; do not use text mutation tools for notebooks.\n\
+- When a file mutation succeeds, treat the saved artifact path and artifact result in task_state as the grounded source of truth for what was actually written.\n\
 - If the task asks for specific PDF pages, set page_start and page_end so the shell extracts only that page range.\n\
 - For find_files, keep root as a real directory path and keep pattern limited to a filename or glob; do not pack path fragments into pattern.\n\
 - For search_text, keep root as the directory scope and keep query limited to search terms; do not combine them into one field.\n\
+- Use spawn_agent only for a bounded delegated subtask whose result you will integrate back into the current task.\n\
+- For spawn_agent, set prompt to the delegated objective. Use allowed_tools or denied_tools only when narrowing the child worker's tool pool is clearly helpful.\n\
 - Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
 - Discovery-only steps such as inspect_path, list_directory, find_files, and search_text are intermediate progress when the request still asks you to read, answer, summarize, extract, or create output.\n\
 - In general, intermediate shell steps should not be marked task_complete=true. Use task_complete=true when you are returning a grounded final response or when a verified output/state change satisfies the task.\n\
+- If a directory listing already gives the evidence needed to answer an inventory or summary question, respond from that grounded listing instead of repeating the same listing.\n\
 - If task_state shows an explicit output artifact that still needs verification, do not mark task_complete=true until that artifact is verified, unless you are surfacing a grounded blocker.\n\
+- For output-file tasks, keep the final response narrow and artifact-driven: report the saved path and summarize only what is supported by the saved artifact result or exact evidence.\n\
+- For summaries or reports derived from local evidence, prefer extractive facts over interpretation. Do not invent action items, causes, themes, or explanations unless the user asked for analysis or the source states them directly.\n\
+- If the source contains placeholders, tokens, or unknown markers such as `NO_SPEECH`, preserve them literally or mention them as observed text; do not explain what they mean unless the source explains them.\n\
+- Do not add generated dates, labels, or metadata to an output artifact unless they were requested or are grounded in the observed evidence.\n\
 - In reflection mode, do something materially different or report the grounded blocker/current status.\n\
 - For terminal or system-control tasks, use command output as evidence, but do not assume the harness can fully verify world state for you.\n\
 - Prefer hard verification for concrete artifact changes. For process, service, or environment checks, reason from the observed command evidence.\n\
@@ -137,6 +161,28 @@ Set require_approval=true only for delete-like or kill-like commands that need e
 You are allowed to explore the workspace in bounded steps.\n\
 Path hints like Desktop, Documents, Downloads, and ~/ are user-facing aliases; rely on shell verification rather than assuming a fixed underlying path."
     )
+}
+
+fn supported_action_types_block(tools: &[retina_types::ToolDescriptor]) -> String {
+    let mut action_types = Vec::new();
+    for tool in tools {
+        let action_type = match tool.name.as_str() {
+            "agent_spawn" => "spawn_agent",
+            other => other,
+        };
+        if !action_types.iter().any(|existing| existing == &action_type) {
+            action_types.push(action_type.to_string());
+        }
+    }
+    if action_types.is_empty() {
+        "- respond".to_string()
+    } else {
+        action_types
+            .into_iter()
+            .map(|name| format!("- {name}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 fn build_dynamic_context_block(request: &ReasonRequest) -> String {
@@ -196,7 +242,7 @@ fn build_context_management_edits(
 
 fn build_compaction_instructions(request: &ReasonRequest, reflection: bool) -> String {
     format!(
-        "Write a compact continuation artifact for this Retina task. Preserve the task goal, progress, working sources, artifact references, blockers, failed paths, and next frontier. Prefer exact file paths, IDs, and evidence references over vague prose. Keep it concise and continuation-oriented. Reflection mode: {reflection}. Task: {}. Wrap the result in <summary></summary>.",
+        "Write a compact continuation artifact for this Retina task. Preserve the task goal, progress, working sources, artifact references, failed attempts, and the clearest next unfinished obligation. Prefer exact file paths, IDs, and evidence references over vague prose. Keep it concise and continuation-oriented. Reflection mode: {reflection}. Task: {}. Wrap the result in <summary></summary>.",
         request.context.task
     )
 }
@@ -225,11 +271,9 @@ mod tests {
                         output_written: false,
                         output_verified: false,
                     },
-                    frontier: TaskFrontier::default(),
                     recent_actions: vec![],
                     working_sources: vec![],
                     artifact_references: vec![],
-                    avoid: vec![],
                     compaction: None,
                 },
                 recent_context: Some(RecentContext {
@@ -257,8 +301,6 @@ mod tests {
                 tools: vec![],
                 memory_slice: vec![],
                 last_result: None,
-                last_result_summary: None,
-                recent_steps: vec![],
                 operator_guidance: None,
                 current_step: 1,
                 max_steps: 50,
@@ -288,5 +330,35 @@ mod tests {
         assert!(!rendered.contains("Recent steps:"));
         assert!(!rendered.contains("Last result summary:"));
         assert!(!rendered.contains("Last result:"));
+    }
+
+    #[test]
+    fn supported_action_types_follow_actual_tool_scope() {
+        let instructions = build_stable_instructions(
+            false,
+            &[
+                ToolDescriptor {
+                    name: "respond".to_string(),
+                    description: "Return a grounded answer.".to_string(),
+                    source: ToolSourceKind::BuiltinShell,
+                    concurrency: ToolConcurrencyClass::ReadOnly,
+                    approval: ToolApprovalPolicy::None,
+                    required_authority: Vec::new(),
+                    streaming: false,
+                },
+                ToolDescriptor {
+                    name: "list_directory".to_string(),
+                    description: "List a directory.".to_string(),
+                    source: ToolSourceKind::BuiltinShell,
+                    concurrency: ToolConcurrencyClass::ReadOnly,
+                    approval: ToolApprovalPolicy::None,
+                    required_authority: Vec::new(),
+                    streaming: false,
+                },
+            ],
+        );
+        assert!(instructions.contains("Supported action types:\n- respond\n- list_directory"));
+        assert!(!instructions.contains("- run_command"));
+        assert!(instructions.contains("Do not request unavailable actions."));
     }
 }

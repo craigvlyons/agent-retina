@@ -6,6 +6,12 @@ use crate::result_helpers::{
 };
 use retina_types::*;
 use std::collections::HashMap;
+use std::path::Path;
+
+#[derive(Clone, Debug)]
+struct AvoidRule {
+    label: String,
+}
 
 pub(crate) struct TaskLoopState {
     pub(crate) step_index: usize,
@@ -15,7 +21,7 @@ pub(crate) struct TaskLoopState {
     pub(crate) recent_action_summaries: Vec<RecentActionSummary>,
     pub(crate) working_sources: Vec<WorkingSource>,
     pub(crate) artifact_references: Vec<ArtifactReference>,
-    pub(crate) avoid_rules: Vec<AvoidRule>,
+    avoid_rules: Vec<AvoidRule>,
     pub(crate) compaction_count: usize,
     pub(crate) last_compaction_reason: Option<String>,
     pub(crate) last_compaction_snapshot: Option<CompactionSnapshot>,
@@ -64,12 +70,18 @@ impl TaskLoopState {
                 self.recent_action_summaries.push(RecentActionSummary {
                     step: self.step_index,
                     action: action_label(action),
+                    status: RecentActionStatus::Succeeded,
                     outcome: summary.clone(),
                     artifact_refs: artifact_refs.clone(),
                 });
                 trim_recent_action_summaries(&mut self.recent_action_summaries);
                 merge_working_sources(&mut self.working_sources, working_sources);
                 merge_artifact_references(&mut self.artifact_references, artifact_refs);
+                prune_resolved_avoid_rules(
+                    &mut self.avoid_rules,
+                    &self.artifact_references,
+                    &self.working_sources,
+                );
                 if let Some(signature) = repeated_step_signature(action, result) {
                     let count = self.seen_signatures.entry(signature).or_insert(0);
                     *count += 1;
@@ -91,6 +103,7 @@ impl TaskLoopState {
                 self.recent_action_summaries.push(RecentActionSummary {
                     step: self.step_index,
                     action: action_label(action),
+                    status: RecentActionStatus::Responded,
                     outcome: "responded to operator".to_string(),
                     artifact_refs: Vec::new(),
                 });
@@ -109,13 +122,17 @@ impl TaskLoopState {
                 self.recent_action_summaries.push(RecentActionSummary {
                     step: self.step_index,
                     action: action_label(action),
+                    status: match outcome {
+                        Outcome::Failure(_) => RecentActionStatus::Failed,
+                        Outcome::Blocked(_) => RecentActionStatus::Blocked,
+                        Outcome::Success(_) => RecentActionStatus::Succeeded,
+                    },
                     outcome: reason.clone(),
                     artifact_refs: Vec::new(),
                 });
                 trim_recent_action_summaries(&mut self.recent_action_summaries);
                 self.avoid_rules.push(AvoidRule {
                     label: action_label(action),
-                    reason: reason.clone(),
                 });
                 trim_avoid_rules(&mut self.avoid_rules);
                 None
@@ -171,7 +188,6 @@ impl TaskLoopState {
             score_explanations,
         })
     }
-
 }
 
 #[derive(Default)]
@@ -206,6 +222,76 @@ fn trim_avoid_rules(avoid_rules: &mut Vec<AvoidRule>) {
         let excess = avoid_rules.len() - MAX_AVOID_RULES;
         avoid_rules.drain(0..excess);
     }
+}
+
+fn prune_resolved_avoid_rules(
+    avoid_rules: &mut Vec<AvoidRule>,
+    artifacts: &[ArtifactReference],
+    sources: &[WorkingSource],
+) {
+    let resolved_locators = artifacts
+        .iter()
+        .filter(|artifact| {
+            matches!(
+                artifact.status.as_str(),
+                "created" | "written" | "overwritten" | "appended" | "command_changed"
+            )
+        })
+        .map(|artifact| artifact.locator.clone())
+        .chain(
+            sources
+                .iter()
+                .filter(|source| {
+                    matches!(
+                        source.status.as_str(),
+                        "created" | "written" | "overwritten" | "appended" | "command_changed"
+                    )
+                })
+                .map(|source| source.locator.clone()),
+        )
+        .collect::<Vec<_>>();
+
+    if resolved_locators.is_empty() {
+        return;
+    }
+
+    avoid_rules.retain(|avoid| {
+        let Some(blocked_locator) = avoid_rule_locator(&avoid.label) else {
+            return true;
+        };
+        !resolved_locators
+            .iter()
+            .any(|resolved| locator_resolves_blocker(resolved, &blocked_locator))
+    });
+}
+
+fn avoid_rule_locator(label: &str) -> Option<String> {
+    let raw = if let Some(value) = label.strip_prefix("list_directory:") {
+        value.split(":recursive=").next().unwrap_or(value)
+    } else if let Some(value) = label.strip_prefix("inspect_path:") {
+        value
+    } else if let Some(value) = label.strip_prefix("read_file:") {
+        value
+    } else if let Some(value) = label.strip_prefix("write_file:") {
+        value
+    } else if let Some(value) = label.strip_prefix("edit_file:") {
+        value
+    } else if let Some(value) = label.strip_prefix("append_file:") {
+        value
+    } else if let Some(value) = label.strip_prefix("edit_notebook:") {
+        value
+    } else {
+        return None;
+    };
+    Some(raw.to_string())
+}
+
+fn locator_resolves_blocker(resolved: &str, blocked: &str) -> bool {
+    let resolved_path = Path::new(resolved);
+    let blocked_path = Path::new(blocked);
+    resolved_path == blocked_path
+        || resolved_path.starts_with(blocked_path)
+        || blocked_path.starts_with(resolved_path)
 }
 
 fn merge_artifact_references(
@@ -365,8 +451,19 @@ pub(crate) fn action_label(action: &Action) -> String {
             };
             format!("extract_document_text:{}{}", path.display(), page_suffix)
         }
+        Action::ListMcpResources { server, .. } => format!(
+            "list_mcp_resources:{}",
+            server.clone().unwrap_or_else(|| "*".to_string())
+        ),
+        Action::ReadMcpResource { server, uri, .. } => {
+            format!("read_mcp_resource:{server}:{uri}")
+        }
+        Action::CallMcpTool { server, tool, .. } => format!("mcp_call:{server}:{tool}"),
         Action::WriteFile { path, .. } => format!("write_file:{}", path.display()),
+        Action::EditFile { path, .. } => format!("edit_file:{}", path.display()),
         Action::AppendFile { path, .. } => format!("append_file:{}", path.display()),
+        Action::EditNotebook { path, .. } => format!("edit_notebook:{}", path.display()),
+        Action::SpawnAgent { prompt, .. } => format!("agent_spawn:{prompt}"),
         Action::RecordNote { note, .. } => format!("record_note:{note}"),
         Action::Respond { message, .. } => format!("respond:{message}"),
     }

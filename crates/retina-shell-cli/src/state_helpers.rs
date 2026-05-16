@@ -186,7 +186,10 @@ mod tests {
     #[test]
     fn tilde_known_folder_aliases_follow_os_directory_lookup() {
         if let Some(desktop) = dirs::desktop_dir() {
-            assert_eq!(expand_homeish_path(Path::new("~/Desktop")), Some(desktop.clone()));
+            assert_eq!(
+                expand_homeish_path(Path::new("~/Desktop")),
+                Some(desktop.clone())
+            );
             assert_eq!(
                 expand_homeish_path(Path::new("~/Desktop/report.txt")),
                 Some(desktop.join("report.txt"))
@@ -219,7 +222,10 @@ mod tests {
     #[test]
     fn known_folder_aliases_follow_os_directory_lookup() {
         if let Some(desktop) = dirs::desktop_dir() {
-            assert_eq!(expand_homeish_path(Path::new("Desktop")), Some(desktop.clone()));
+            assert_eq!(
+                expand_homeish_path(Path::new("Desktop")),
+                Some(desktop.clone())
+            );
             assert_eq!(
                 expand_homeish_path(Path::new("Desktop/report.txt")),
                 Some(desktop.join("report.txt"))

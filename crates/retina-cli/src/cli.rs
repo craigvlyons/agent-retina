@@ -34,6 +34,7 @@ pub enum Commands {
 pub enum InspectCommands {
     Timeline,
     TaskState,
+    Tasks,
     Overview,
     Agents,
     Memory {

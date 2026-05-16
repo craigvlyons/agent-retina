@@ -5,17 +5,18 @@ mod loop_state;
 mod result_helpers;
 mod router;
 mod support;
-mod task_shape;
 
 pub(crate) use crate::loop_state::{TaskLoopState, action_label};
 use crate::router::Router;
 pub(crate) use crate::support::{
-    ActionExecution, CircuitBreaker, EventSpec, ReflexEngine,
-    StepSelectionContext,
+    ActionExecution, CircuitBreaker, EventSpec, ReflexEngine, StepSelectionContext,
+    tool_authored_completion_message,
 };
-use retina_traits::{Memory, Reasoner, Shell};
+use retina_tools::ToolPolicy;
+use retina_traits::{AgentRuntime, McpRuntime, Memory, Reasoner, Shell};
 use retina_types::*;
 use serde_json::json;
+use std::sync::Arc;
 
 pub struct Kernel {
     shell: Box<dyn Shell>,
@@ -24,6 +25,9 @@ pub struct Kernel {
     reflex_engine: ReflexEngine,
     circuit_breaker: CircuitBreaker,
     router: Router,
+    tool_policy: ToolPolicy,
+    agent_runtime: Option<Arc<dyn AgentRuntime>>,
+    mcp_runtime: Option<Arc<dyn McpRuntime>>,
 }
 
 impl Kernel {
@@ -32,7 +36,15 @@ impl Kernel {
         reasoner: Box<dyn Reasoner>,
         memory: Box<dyn Memory>,
     ) -> Result<Self> {
-        Self::new_with_registry(shell, reasoner, memory, AgentRegistrySnapshot::default())
+        Self::new_with_runtime(
+            shell,
+            reasoner,
+            memory,
+            AgentRegistrySnapshot::default(),
+            ToolPolicy::allow_all(),
+            None,
+            None,
+        )
     }
 
     pub fn new_with_registry(
@@ -41,7 +53,39 @@ impl Kernel {
         memory: Box<dyn Memory>,
         registry: AgentRegistrySnapshot,
     ) -> Result<Self> {
-        let active_rules = memory.active_rules().unwrap_or_default();
+        Self::new_with_runtime(
+            shell,
+            reasoner,
+            memory,
+            registry,
+            ToolPolicy::allow_all(),
+            None,
+            None,
+        )
+    }
+
+    pub fn new_with_registry_and_tool_policy(
+        shell: Box<dyn Shell>,
+        reasoner: Box<dyn Reasoner>,
+        memory: Box<dyn Memory>,
+        registry: AgentRegistrySnapshot,
+        tool_policy: ToolPolicy,
+    ) -> Result<Self> {
+        Self::new_with_runtime(shell, reasoner, memory, registry, tool_policy, None, None)
+    }
+
+    pub fn new_with_runtime(
+        shell: Box<dyn Shell>,
+        reasoner: Box<dyn Reasoner>,
+        memory: Box<dyn Memory>,
+        registry: AgentRegistrySnapshot,
+        tool_policy: ToolPolicy,
+        agent_runtime: Option<Arc<dyn AgentRuntime>>,
+        mcp_runtime: Option<Arc<dyn McpRuntime>>,
+    ) -> Result<Self> {
+        let active_rules = memory.active_rules().map_err(|error| {
+            KernelError::Storage(format!("failed to load active rules: {error}"))
+        })?;
         Ok(Self {
             shell,
             reasoner,
@@ -49,11 +93,14 @@ impl Kernel {
             reflex_engine: ReflexEngine::new(active_rules),
             circuit_breaker: CircuitBreaker::default(),
             router: Router::v1(registry),
+            tool_policy,
+            agent_runtime,
+            mcp_runtime,
         })
     }
 
     pub fn route_task(&self, _task: &Task) -> RoutingDecision {
-        self.router.route_task(_task).effective_decision
+        self.active_routing_decision(&self.route_assessment(_task))
     }
 
     pub fn execute_task(&self, task: Task) -> Result<Outcome> {
@@ -70,26 +117,51 @@ impl Kernel {
             json!({ "task": task.description }),
         ))?;
 
-        let routing = self.router.route_task(&task);
+        let routing = self.route_assessment(&task);
+        let routing_decision = self.active_routing_decision(&routing);
 
-        match routing.effective_decision.clone() {
+        match routing_decision.clone() {
             RoutingDecision::HandleDirectly => {}
-            RoutingDecision::RouteToExisting(agent_id) => {
-                return Ok(Outcome::Blocked(format!(
-                    "routing to {} not available in v1",
-                    agent_id
-                )));
-            }
-            RoutingDecision::Reactivate(agent_id) => {
-                return Ok(Outcome::Blocked(format!(
-                    "reactivating {} not available in v1",
-                    agent_id
-                )));
-            }
-            RoutingDecision::SpawnSpecialist { domain, .. } => {
-                return Ok(Outcome::Blocked(format!(
-                    "spawning specialist for {domain} not available in v1"
-                )));
+            RoutingDecision::RouteToExisting(agent_id) if agent_id == task.agent_id => {}
+            RoutingDecision::Reactivate(agent_id) if agent_id == task.agent_id => {}
+            decision => {
+                let Some(runtime) = &self.agent_runtime else {
+                    return Ok(Outcome::Blocked(
+                        "agent routing is not available in this runtime".to_string(),
+                    ));
+                };
+                let delegated = runtime.execute_routing_decision(
+                    &RouteAgentRequest {
+                        parent_task: task.clone(),
+                        decision,
+                    },
+                    config.control.as_ref(),
+                )?;
+                self.emit_event(EventSpec::new(
+                    &task,
+                    None,
+                    None,
+                    TimelineEventType::TaskContextAssembled,
+                    json!({
+                        "route": format!("{:?}", routing_decision),
+                        "recommended_route": format!("{:?}", routing.recommended_decision),
+                        "routing_rationale": routing.rationale,
+                        "routing_candidates": routing.candidates,
+                        "network_enabled": routing.network_enabled,
+                        "delegated": delegated
+                    }),
+                ))?;
+                self.emit_event(EventSpec::new(
+                    &task,
+                    None,
+                    None,
+                    TimelineEventType::TaskCompleted,
+                    json!({
+                        "route": format!("{:?}", routing_decision),
+                        "delegated": delegated
+                    }),
+                ))?;
+                return Ok(Outcome::Success(ActionResult::DelegatedTask(delegated)));
             }
         }
 
@@ -101,6 +173,7 @@ impl Kernel {
             TimelineEventType::TaskContextAssembled,
             json!({
                 "route": format!("{:?}", routing.effective_decision),
+                "effective_route": format!("{:?}", routing_decision),
                 "recommended_route": format!("{:?}", routing.recommended_decision),
                 "routing_rationale": routing.rationale,
                 "routing_candidates": routing.candidates,
@@ -110,7 +183,6 @@ impl Kernel {
                     &TaskLoopState::new(max_steps),
                     1,
                     max_steps,
-                    None,
                 )
             }),
         ))?;
@@ -148,13 +220,8 @@ impl Kernel {
 
         loop {
             if state.step_index >= max_steps {
-                let task_state = self.build_task_state(
-                    &task,
-                    &state,
-                    state.step_index.max(1),
-                    max_steps,
-                    state.last_result_summary.clone(),
-                );
+                let task_state =
+                    self.build_task_state(&task, &state, state.step_index.max(1), max_steps);
                 let reason = format!("step budget exhausted after {} steps", max_steps);
                 self.emit_event(EventSpec::new(
                     &task,
@@ -201,25 +268,15 @@ impl Kernel {
             )? {
                 return Ok(outcome);
             }
-            let execution = self.execute_action(
-                &task,
-                &mut intent,
-                &state,
-                &step,
-                config.control.as_ref(),
-            )?;
+            let execution =
+                self.execute_action(&task, &mut intent, &state, &step, config.control.as_ref())?;
             let outcome = match execution {
                 ActionExecution::Outcome(outcome) => outcome,
             };
             let progress = state.record_step(&step.action, &outcome)?;
             let compaction = state.apply_live_compaction();
-            let task_state = self.build_task_state(
-                &task,
-                &state,
-                state.step_index.max(1),
-                max_steps,
-                state.last_result_summary.clone(),
-            );
+            let task_state =
+                self.build_task_state(&task, &state, state.step_index.max(1), max_steps);
 
             if let Some(compaction) = compaction {
                 self.emit_event(EventSpec::new(
@@ -263,7 +320,10 @@ impl Kernel {
 
             let explicit_response = matches!(
                 (&step.action, &outcome),
-                (Action::Respond { .. }, Outcome::Success(ActionResult::Response { .. }))
+                (
+                    Action::Respond { .. },
+                    Outcome::Success(ActionResult::Response { .. })
+                )
             );
 
             if explicit_response {
@@ -284,9 +344,62 @@ impl Kernel {
                 ))?;
             }
 
+            let tool_authored_response = if step.task_complete {
+                match &outcome {
+                    Outcome::Success(result) if !explicit_response => {
+                        tool_authored_completion_message(result, step.framing.as_ref())
+                            .map(|message| Outcome::Success(ActionResult::Response { message }))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(outcome) = tool_authored_response {
+                let final_answer_summary = match &outcome {
+                    Outcome::Success(ActionResult::Response { message }) => {
+                        Some(compact_answer_summary(message))
+                    }
+                    _ => None,
+                };
+                self.emit_event(EventSpec::new(
+                    &task,
+                    Some(&intent),
+                    Some(&step.action),
+                    TimelineEventType::TaskCompleted,
+                    json!({
+                        "outcome": "success",
+                        "completion_mode": "tool_authored",
+                        "final_answer_summary": final_answer_summary,
+                        "task_state": task_state
+                    }),
+                ))?;
+                return Ok(outcome);
+            }
+
             if explicit_response || matches!(outcome, Outcome::Blocked(_)) {
                 return Ok(outcome);
             }
+        }
+    }
+}
+
+impl Kernel {
+    fn route_assessment(&self, task: &Task) -> RoutingAssessment {
+        let latest = self.memory.agent_registry_snapshot().unwrap_or_default();
+        if latest.active_agents.is_empty() && latest.archived_agents.is_empty() {
+            self.router.route_task(task)
+        } else {
+            Router::v1(latest).route_task(task)
+        }
+    }
+
+    fn active_routing_decision(&self, assessment: &RoutingAssessment) -> RoutingDecision {
+        if self.agent_runtime.is_some() {
+            assessment.recommended_decision.clone()
+        } else {
+            assessment.effective_decision.clone()
         }
     }
 }

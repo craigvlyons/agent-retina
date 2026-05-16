@@ -6,6 +6,8 @@ use std::sync::{Mutex, MutexGuard};
 #[derive(Clone)]
 pub(crate) struct StepDecision {
     pub(crate) action: Action,
+    pub(crate) task_complete: bool,
+    pub(crate) framing: Option<ReasonerTaskFraming>,
 }
 
 pub(crate) enum ActionExecution {
@@ -25,7 +27,6 @@ pub(crate) struct ContextAssemblyInput<'a> {
     pub(crate) task: &'a Task,
     pub(crate) state: &'a crate::TaskLoopState,
     pub(crate) last_result: Option<String>,
-    pub(crate) last_result_summary: Option<String>,
     pub(crate) operator_guidance: Option<String>,
     pub(crate) current_step: usize,
     pub(crate) max_steps: usize,
@@ -186,6 +187,24 @@ pub(crate) fn action_failure_reason(
         }
     }
 
+    if let ActionResult::DelegatedTask(result) = result {
+        if result.status != DelegatedTaskStatus::Completed {
+            return Some(format!(
+                "delegated child agent {} ended with {:?}: {}",
+                result.agent_id, result.status, result.summary
+            ));
+        }
+    }
+
+    if let ActionResult::McpToolCall(result) = result {
+        if result.is_error {
+            return Some(format!(
+                "MCP tool {} on {} returned an error: {}",
+                result.tool, result.server, result.content_preview
+            ));
+        }
+    }
+
     if action.expects_change()
         && matches!(
             delta.kind,
@@ -264,7 +283,38 @@ pub(crate) fn action_utility(action: &Action, result: &ActionResult, delta: &Sta
                 0.65
             }
         }
+        ActionResult::McpResources { resources, .. } => {
+            if resources.is_empty() {
+                0.2
+            } else {
+                0.55
+            }
+        }
+        ActionResult::McpResourceRead(result) => {
+            if result.contents.is_empty() {
+                0.1
+            } else {
+                0.75
+            }
+        }
+        ActionResult::McpToolCall(result) => {
+            if result.is_error {
+                -0.75
+            } else if result.content_preview.trim().is_empty()
+                && result.structured_content.is_none()
+            {
+                0.15
+            } else {
+                0.7
+            }
+        }
         ActionResult::FileWrite { .. } => 1.0,
+        ActionResult::DelegatedTask(result) => match result.status {
+            DelegatedTaskStatus::Completed => 0.85,
+            DelegatedTaskStatus::Failed => -1.0,
+            DelegatedTaskStatus::Blocked => -0.4,
+            DelegatedTaskStatus::Killed => -0.7,
+        },
         ActionResult::NoteRecorded { .. } => 0.3,
         ActionResult::Response { message } => {
             if message.trim().is_empty() {
@@ -276,65 +326,44 @@ pub(crate) fn action_utility(action: &Action, result: &ActionResult, delta: &Sta
     }
 }
 
-pub(crate) fn default_tool_descriptors(capabilities: ShellCapabilities) -> Vec<ToolDescriptor> {
-    let mut tools = vec![
-        ToolDescriptor {
-            name: "respond".to_string(),
-            description: "Answer operator questions directly when no shell action is needed."
-                .to_string(),
-        },
-        ToolDescriptor {
-            name: "inspect_path".to_string(),
-            description: "Inspect one path for existence, metadata, and optional content hash."
-                .to_string(),
-        },
-        ToolDescriptor {
-            name: "list_directory".to_string(),
-            description: "List files and directories in a target directory.".to_string(),
-        },
-        ToolDescriptor {
-            name: "find_files".to_string(),
-            description: "Find files by filename or path fragment.".to_string(),
-        },
-        ToolDescriptor {
-            name: "search_text".to_string(),
-            description: "Search text content across files in the current workspace.".to_string(),
-        },
-    ];
+pub(crate) fn tool_authored_completion_message(
+    result: &ActionResult,
+    framing: Option<&ReasonerTaskFraming>,
+) -> Option<String> {
+    let ActionResult::FileWrite {
+        path,
+        mutation_kind,
+        preview_excerpt,
+        ..
+    } = result
+    else {
+        return None;
+    };
 
-    if capabilities.can_read_files {
-        tools.push(ToolDescriptor {
-            name: "read_file".to_string(),
-            description: "Read text-like files such as markdown, code, config, and plaintext with truncation protection.".to_string(),
-        });
-        tools.push(ToolDescriptor {
-            name: "ingest_structured_data".to_string(),
-            description:
-                "Inspect structured local data such as CSV or TSV files by headers and sample rows."
-                    .to_string(),
-        });
-    }
-    if capabilities.can_extract_documents {
-        tools.push(ToolDescriptor {
-            name: "extract_document_text".to_string(),
-            description: "Extract readable text from documents such as PDFs when raw file reads would be binary or unhelpful.".to_string(),
-        });
-    }
-    if capabilities.can_write_files {
-        tools.push(ToolDescriptor {
-            name: "write_file".to_string(),
-            description: "Create, overwrite, or append local files and verify the result."
-                .to_string(),
-        });
-    }
-    if capabilities.can_execute_commands {
-        tools.push(ToolDescriptor {
-            name: "run_command".to_string(),
-            description:
-                "Run shell commands, pipelines, or local scripts when they best advance the task."
-                    .to_string(),
-        });
-    }
+    let _ = framing;
 
-    tools
+    let base = match mutation_kind {
+        FileMutationKind::Create => {
+            format!("File created successfully at: {}", path.display())
+        }
+        FileMutationKind::Overwrite | FileMutationKind::Append | FileMutationKind::ExactEdit => {
+            format!("The file {} has been updated successfully.", path.display())
+        }
+        FileMutationKind::NotebookReplace
+        | FileMutationKind::NotebookInsert
+        | FileMutationKind::NotebookDelete => {
+            format!(
+                "The notebook {} has been updated successfully.",
+                path.display()
+            )
+        }
+    };
+
+    let preview = preview_excerpt
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!("\nPreview: {value}"))
+        .unwrap_or_default();
+
+    Some(format!("{base}{preview}"))
 }

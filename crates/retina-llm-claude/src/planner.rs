@@ -109,6 +109,12 @@ mod tests {
             pattern: "Cargo.toml".to_string(),
             matches: vec!["Cargo.toml".into()],
         });
-        assert!(plan_task("find files named Cargo.toml and read the root one", Some(&previous)).is_none());
+        assert!(
+            plan_task(
+                "find files named Cargo.toml and read the root one",
+                Some(&previous)
+            )
+            .is_none()
+        );
     }
 }

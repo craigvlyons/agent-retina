@@ -36,10 +36,15 @@ pub struct ClaudeReasoner {
 
 impl ClaudeReasoner {
     pub fn new() -> Self {
+        let model_id = env::var("RETINA_CLAUDE_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        Self::with_model(model_id)
+    }
+
+    pub fn with_model(model_id: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
-            model_id: env::var("RETINA_CLAUDE_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
+            model_id: model_id.into(),
             api_key: env::var("ANTHROPIC_API_KEY").ok(),
             prompt_caching: ClaudePromptCaching::from_env(),
             context_management: ClaudeContextManagement::from_env(),
@@ -47,8 +52,8 @@ impl ClaudeReasoner {
     }
 
     pub fn runtime_config_snapshot() -> ClaudeRuntimeConfigSnapshot {
-        let model_id =
-            env::var("RETINA_CLAUDE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        let model_id = env::var("RETINA_CLAUDE_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
         let prompt_caching = ClaudePromptCaching::from_env();
         let context_management = ClaudeContextManagement::from_env();
         let server_side_compaction_supported = config::model_supports_server_compaction(&model_id);
@@ -118,7 +123,7 @@ impl ClaudeReasoner {
         let action: ClaudeAction = serde_json::from_str(&parsed).map_err(|error| {
             KernelError::Reasoning(format!("invalid Claude JSON response: {error}"))
         })?;
-        let mut response = action.into_reason_response();
+        let mut response = action.into_reason_response()?;
         response.tokens_used = body.usage.into();
         Ok(response)
     }
@@ -163,6 +168,10 @@ mod tests {
     use crate::payload::build_stable_instructions;
     use crate::response::ClaudeUsage;
 
+    fn must<T, E: std::fmt::Display>(value: std::result::Result<T, E>) -> T {
+        value.unwrap_or_else(|error| panic!("test operation failed: {error}"))
+    }
+
     fn must_some<T>(value: Option<T>, message: &str) -> T {
         value.unwrap_or_else(|| panic!("{message}"))
     }
@@ -193,19 +202,15 @@ mod tests {
                             output_written: false,
                             output_verified: false,
                         },
-                        frontier: TaskFrontier { blockers: Vec::new() },
                         recent_actions: Vec::new(),
                         working_sources: Vec::new(),
                         artifact_references: Vec::new(),
-                        avoid: Vec::new(),
                         compaction: None,
                     },
                     recent_context: None,
                     tools: Vec::new(),
                     memory_slice: Vec::new(),
                     last_result: None,
-                    last_result_summary: None,
-                    recent_steps: Vec::new(),
                     operator_guidance: None,
                     current_step: 1,
                     max_steps: 4,
@@ -294,8 +299,6 @@ mod tests {
                     tools: Vec::new(),
                     memory_slice: Vec::new(),
                     last_result: None,
-                    last_result_summary: None,
-                    recent_steps: Vec::new(),
                     operator_guidance: None,
                     current_step: 1,
                     max_steps: 4,
@@ -351,14 +354,25 @@ mod tests {
 
     #[test]
     fn stable_instructions_prefer_best_verifiable_step_over_timid_discovery_bias() {
-        let instructions = build_stable_instructions(false);
-        assert!(instructions.contains("Choose one concrete next step that advances the task or reduces uncertainty."));
+        let instructions = build_stable_instructions(false, &[]);
+        assert!(instructions.contains(
+            "Choose one concrete next step that advances the task or reduces uncertainty."
+        ));
         assert!(instructions.contains("the harness can verify the change"));
         assert!(instructions.contains("In reflection mode, do something materially different or report the grounded blocker/current status."));
         assert!(instructions.contains("keep root as a real directory path"));
-        assert!(instructions.contains("For terminal or system-control tasks, use command output as evidence"));
+        assert!(
+            instructions
+                .contains("For terminal or system-control tasks, use command output as evidence")
+        );
+        assert!(instructions.contains("prefer extractive facts over interpretation"));
+        assert!(instructions.contains("Do not invent action items"));
+        assert!(instructions.contains("NO_SPEECH"));
+        assert!(instructions.contains("Do not add generated dates"));
         assert!(!instructions.contains("best next verifiable step"));
-        assert!(!instructions.contains("Prefer direct interaction with the named path, file, command, or system target"));
+        assert!(!instructions.contains(
+            "Prefer direct interaction with the named path, file, command, or system target"
+        ));
         assert!(!instructions.contains("prefer write_file or append_file"));
         assert!(!instructions.contains("overwrite=true"));
         assert!(!instructions.contains("pending deliverable or target output path"));
@@ -373,8 +387,9 @@ mod tests {
                     .to_string(),
                 task_state: TaskState {
                     goal: TaskGoal {
-                        objective: "read the Patent Center.pdf on Desktop and tell me what it's about"
-                            .to_string(),
+                        objective:
+                            "read the Patent Center.pdf on Desktop and tell me what it's about"
+                                .to_string(),
                         constraints: Vec::new(),
                     },
                     progress: TaskProgress {
@@ -386,19 +401,15 @@ mod tests {
                         output_written: false,
                         output_verified: false,
                     },
-                    frontier: TaskFrontier { blockers: Vec::new() },
                     recent_actions: Vec::new(),
                     working_sources: Vec::new(),
                     artifact_references: Vec::new(),
-                    avoid: Vec::new(),
                     compaction: None,
                 },
                 recent_context: None,
                 tools: Vec::new(),
                 memory_slice: Vec::new(),
                 last_result: None,
-                last_result_summary: None,
-                recent_steps: Vec::new(),
                 operator_guidance: None,
                 current_step: 1,
                 max_steps: 6,
@@ -441,64 +452,96 @@ mod tests {
 
     #[test]
     fn write_and_append_actions_have_no_approval_field() {
-        let write = ClaudeAction {
-            action_type: "write_file".to_string(),
-            command: None,
-            path: Some("note.txt".to_string()),
-            root: None,
-            pattern: None,
-            query: None,
-            content: Some("hello".to_string()),
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: Some(true),
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(false),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
-        .into_reason_response();
-        let append = ClaudeAction {
-            action_type: "append_file".to_string(),
-            command: None,
-            path: Some("note.txt".to_string()),
-            root: None,
-            pattern: None,
-            query: None,
-            content: Some("more".to_string()),
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(false),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
-        .into_reason_response();
+        let write = must(
+            ClaudeAction {
+                action_type: "write_file".to_string(),
+                command: None,
+                path: Some("note.txt".to_string()),
+                root: None,
+                pattern: None,
+                query: None,
+                content: Some("hello".to_string()),
+                old_string: None,
+                new_string: None,
+                replace_all: None,
+                include_content: None,
+                cell_id: None,
+                new_source: None,
+                cell_type: None,
+                edit_mode: None,
+                recursive: None,
+                max_entries: None,
+                max_results: None,
+                max_bytes: None,
+                max_rows: None,
+                max_chars: None,
+                page_start: None,
+                page_end: None,
+                overwrite: Some(true),
+                prompt: None,
+                allowed_tools: None,
+                denied_tools: None,
+                require_approval: None,
+                expect_change: None,
+                note: None,
+                message: None,
+                task_complete: Some(false),
+                intent_kind: None,
+                deliverable: None,
+                completion_basis: None,
+                reasoning: None,
+                server: None,
+                tool: None,
+                uri: None,
+                input_json: None,
+            }
+            .into_reason_response(),
+        );
+        let append = must(
+            ClaudeAction {
+                action_type: "append_file".to_string(),
+                command: None,
+                path: Some("note.txt".to_string()),
+                root: None,
+                pattern: None,
+                query: None,
+                content: Some("more".to_string()),
+                old_string: None,
+                new_string: None,
+                replace_all: None,
+                include_content: None,
+                cell_id: None,
+                new_source: None,
+                cell_type: None,
+                edit_mode: None,
+                recursive: None,
+                max_entries: None,
+                max_results: None,
+                max_bytes: None,
+                max_rows: None,
+                max_chars: None,
+                page_start: None,
+                page_end: None,
+                overwrite: None,
+                prompt: None,
+                allowed_tools: None,
+                denied_tools: None,
+                require_approval: None,
+                expect_change: None,
+                note: None,
+                message: None,
+                task_complete: Some(false),
+                intent_kind: None,
+                deliverable: None,
+                completion_basis: None,
+                reasoning: None,
+                server: None,
+                tool: None,
+                uri: None,
+                input_json: None,
+            }
+            .into_reason_response(),
+        );
 
         match write.action {
             Action::WriteFile { .. } => {}
@@ -512,14 +555,151 @@ mod tests {
 
     #[test]
     fn run_command_with_target_path_tracks_that_artifact_for_verification() {
-        let response = ClaudeAction {
-            action_type: "run_command".to_string(),
-            command: Some("python script.py > out.txt".to_string()),
-            path: Some("out.txt".to_string()),
+        let response = must(
+            ClaudeAction {
+                action_type: "run_command".to_string(),
+                command: Some("python script.py > out.txt".to_string()),
+                path: Some("out.txt".to_string()),
+                root: None,
+                pattern: None,
+                query: None,
+                content: None,
+                old_string: None,
+                new_string: None,
+                replace_all: None,
+                include_content: None,
+                cell_id: None,
+                new_source: None,
+                cell_type: None,
+                edit_mode: None,
+                recursive: None,
+                max_entries: None,
+                max_results: None,
+                max_bytes: None,
+                max_rows: None,
+                max_chars: None,
+                page_start: None,
+                page_end: None,
+                overwrite: None,
+                prompt: None,
+                allowed_tools: None,
+                denied_tools: None,
+                require_approval: None,
+                expect_change: None,
+                note: None,
+                message: None,
+                task_complete: Some(false),
+                intent_kind: None,
+                deliverable: None,
+                completion_basis: None,
+                reasoning: None,
+                server: None,
+                tool: None,
+                uri: None,
+                input_json: None,
+            }
+            .into_reason_response(),
+        );
+
+        match response.action {
+            Action::RunCommand {
+                expect_change,
+                state_scope,
+                ..
+            } => {
+                assert!(expect_change);
+                assert_eq!(state_scope.tracked_paths.len(), 1);
+                assert_eq!(
+                    state_scope.tracked_paths[0].path,
+                    std::path::PathBuf::from("out.txt")
+                );
+                assert!(state_scope.tracked_paths[0].include_content);
+            }
+            other => panic!("expected run_command action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_action_can_map_reasoner_framing_fields() {
+        let response = must(
+            ClaudeAction {
+                action_type: "respond".to_string(),
+                command: None,
+                path: None,
+                root: None,
+                pattern: None,
+                query: None,
+                content: None,
+                old_string: None,
+                new_string: None,
+                replace_all: None,
+                include_content: None,
+                cell_id: None,
+                new_source: None,
+                cell_type: None,
+                edit_mode: None,
+                recursive: None,
+                max_entries: None,
+                max_results: None,
+                max_bytes: None,
+                max_rows: None,
+                max_chars: None,
+                page_start: None,
+                page_end: None,
+                overwrite: None,
+                prompt: None,
+                allowed_tools: None,
+                denied_tools: None,
+                require_approval: None,
+                expect_change: None,
+                note: None,
+                message: Some("done".to_string()),
+                task_complete: Some(true),
+                intent_kind: Some("answer".to_string()),
+                deliverable: Some("summary of startup.md".to_string()),
+                completion_basis: Some("read startup.md and extracted relevant lines".to_string()),
+                reasoning: Some("responding from gathered evidence".to_string()),
+                server: None,
+                tool: None,
+                uri: None,
+                input_json: None,
+            }
+            .into_reason_response(),
+        );
+
+        let framing = response.framing.expect("expected framing");
+        assert_eq!(framing.intent_kind, Some(TaskKind::Answer));
+        assert_eq!(
+            framing.deliverable.as_deref(),
+            Some("summary of startup.md")
+        );
+        assert_eq!(
+            framing.completion_basis.as_deref(),
+            Some("read startup.md and extracted relevant lines")
+        );
+    }
+
+    #[test]
+    fn malformed_edit_file_action_returns_reasoning_error() {
+        let error = ClaudeAction {
+            action_type: "edit_file".to_string(),
+            command: None,
+            path: None,
             root: None,
             pattern: None,
             query: None,
             content: None,
+            old_string: Some("before".to_string()),
+            new_string: Some("after".to_string()),
+            replace_all: Some(false),
+            server: None,
+            tool: None,
+            uri: None,
+            input_json: None,
+            cell_id: None,
+            new_source: None,
+            cell_type: None,
+            edit_mode: None,
             include_content: None,
             recursive: None,
             max_entries: None,
@@ -530,6 +710,9 @@ mod tests {
             page_start: None,
             page_end: None,
             overwrite: None,
+            prompt: None,
+            allowed_tools: None,
+            denied_tools: None,
             require_approval: None,
             expect_change: None,
             note: None,
@@ -540,61 +723,13 @@ mod tests {
             completion_basis: None,
             reasoning: None,
         }
-        .into_reason_response();
+        .into_reason_response()
+        .unwrap_err();
 
-        match response.action {
-            Action::RunCommand {
-                expect_change,
-                state_scope,
-                ..
-            } => {
-                assert!(expect_change);
-                assert_eq!(state_scope.tracked_paths.len(), 1);
-                assert_eq!(state_scope.tracked_paths[0].path, std::path::PathBuf::from("out.txt"));
-                assert!(state_scope.tracked_paths[0].include_content);
-            }
-            other => panic!("expected run_command action, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn claude_action_can_map_reasoner_framing_fields() {
-        let response = ClaudeAction {
-            action_type: "respond".to_string(),
-            command: None,
-            path: None,
-            root: None,
-            pattern: None,
-            query: None,
-            content: None,
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: Some("done".to_string()),
-            task_complete: Some(true),
-            intent_kind: Some("answer".to_string()),
-            deliverable: Some("summary of startup.md".to_string()),
-            completion_basis: Some("read startup.md and extracted relevant lines".to_string()),
-            reasoning: Some("responding from gathered evidence".to_string()),
-        }
-        .into_reason_response();
-
-        let framing = response.framing.expect("expected framing");
-        assert_eq!(framing.intent_kind, Some(TaskKind::Answer));
-        assert_eq!(framing.deliverable.as_deref(), Some("summary of startup.md"));
-        assert_eq!(
-            framing.completion_basis.as_deref(),
-            Some("read startup.md and extracted relevant lines")
-        );
+        let KernelError::Reasoning(message) = error else {
+            panic!("expected reasoning error");
+        };
+        assert!(message.contains("edit_file"));
+        assert!(message.contains("path"));
     }
 }

@@ -39,6 +39,27 @@ pub trait Reasoner: Send + Sync {
     fn capabilities(&self) -> ReasonerCapabilities;
 }
 
+pub trait AgentRuntime: Send + Sync {
+    fn spawn_local_agent(
+        &self,
+        request: &SpawnAgentRequest,
+        control: Option<&ExecutionControlHandle>,
+    ) -> Result<DelegatedTaskResult>;
+
+    fn execute_routing_decision(
+        &self,
+        request: &RouteAgentRequest,
+        control: Option<&ExecutionControlHandle>,
+    ) -> Result<DelegatedTaskResult>;
+}
+
+pub trait McpRuntime: Send + Sync {
+    fn snapshot(&self) -> Result<McpRegistrySnapshot>;
+    fn list_resources(&self, server: Option<&str>) -> Result<Vec<McpResourceSummary>>;
+    fn read_resource(&self, server: &str, uri: &str) -> Result<McpResourceReadResult>;
+    fn call_tool(&self, server: &str, tool: &str, input_json: &Value) -> Result<McpToolCallResult>;
+}
+
 pub trait Memory: Send + Sync {
     fn append_timeline_event(&self, event: &TimelineEvent) -> Result<()>;
     fn record_experience(&self, exp: &Experience) -> Result<ExperienceId>;
@@ -51,6 +72,9 @@ pub trait Memory: Send + Sync {
     fn recall_knowledge(&self, query: &str, limit: usize) -> Result<Vec<KnowledgeNode>>;
     fn active_rules(&self) -> Result<Vec<ReflexiveRule>>;
     fn find_tools(&self, capability: &str) -> Result<Vec<ToolRecord>>;
+    fn agent_registry_snapshot(&self) -> Result<AgentRegistrySnapshot> {
+        Ok(AgentRegistrySnapshot::default())
+    }
     fn recent_states(&self, limit: usize) -> Result<Vec<TimelineEvent>>;
     fn update_utility(&self, id: ExperienceId, utility: f64) -> Result<()>;
     fn update_knowledge(&self, id: KnowledgeId, update: &KnowledgeUpdate) -> Result<()>;

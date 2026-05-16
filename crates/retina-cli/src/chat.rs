@@ -1,8 +1,9 @@
-use crate::controller::{AgentController, InspectController, RunningTask};
+use crate::controller::{AgentController, InspectController};
 use crate::output::{
     render_action_result, render_chat_event, render_memory_inspection, render_timeline_event,
 };
 use crate::runtime::root_manifest;
+use retina_runtime::RuntimeTaskHandle;
 use retina_shell_cli::{CliShell, ScopedShell};
 use retina_traits::{Memory, Shell};
 use retina_types::*;
@@ -29,12 +30,17 @@ impl ChatSession {
         let (input_tx, input_rx) = mpsc::channel();
         let (prompt_tx, prompt_rx) = mpsc::channel();
         spawn_input_reader(input_tx);
+        let authority = root_manifest()?.authority;
         let shell = Box::new(InteractiveShell::new(
-            ScopedShell::new(CliShell::new(), root_manifest()?.authority),
+            ScopedShell::new(CliShell::new(), authority.clone()),
             PromptBridge::new(prompt_tx),
         ));
         Ok(Self {
-            agent: AgentController::new_with_streaming_and_shell(shell, debug_events.clone())?,
+            agent: AgentController::new_with_streaming_and_shell(
+                shell,
+                authority,
+                debug_events.clone(),
+            )?,
             inspector: InspectController::new()?,
             debug_events,
             input_rx,
@@ -47,7 +53,7 @@ impl ChatSession {
             "Retina chat is live. Enter a task, or type /help, /exit, /timeline, /memory <query>, /debug. Type /s while a task is running to stop it. Use /guide <text> to steer the next step."
         );
 
-        let mut active_task: Option<RunningTask> = None;
+        let mut active_task: Option<RuntimeTaskHandle> = None;
         let mut pending_prompt: Option<PendingPrompt> = None;
         let mut needs_prompt = true;
 
@@ -90,7 +96,7 @@ impl ChatSession {
     fn handle_input(
         &mut self,
         input: String,
-        active_task: &mut Option<RunningTask>,
+        active_task: &mut Option<RuntimeTaskHandle>,
         pending_prompt: &mut Option<PendingPrompt>,
     ) -> Result<bool> {
         let line = input.trim();
@@ -169,7 +175,7 @@ impl ChatSession {
     fn handle_prompt_input(
         &mut self,
         line: &str,
-        active_task: &mut Option<RunningTask>,
+        active_task: &mut Option<RuntimeTaskHandle>,
         pending_prompt: &mut Option<PendingPrompt>,
     ) -> Result<()> {
         let Some(prompt) = pending_prompt.take() else {
@@ -238,7 +244,11 @@ impl ChatSession {
         Ok(())
     }
 
-    fn handle_guidance(&mut self, line: &str, active_task: Option<&RunningTask>) -> Result<()> {
+    fn handle_guidance(
+        &mut self,
+        line: &str,
+        active_task: Option<&RuntimeTaskHandle>,
+    ) -> Result<()> {
         let Some(task) = active_task else {
             println!("No task is currently running.");
             return Ok(());
@@ -260,7 +270,7 @@ impl ChatSession {
 
     fn drain_prompt_requests(
         &mut self,
-        active_task: &Option<RunningTask>,
+        active_task: &Option<RuntimeTaskHandle>,
     ) -> Result<Option<PendingPrompt>> {
         match self.prompt_rx.try_recv() {
             Ok(request) => {
@@ -288,7 +298,10 @@ impl ChatSession {
         }
     }
 
-    fn poll_task_completion(&mut self, active_task: &mut Option<RunningTask>) -> Result<bool> {
+    fn poll_task_completion(
+        &mut self,
+        active_task: &mut Option<RuntimeTaskHandle>,
+    ) -> Result<bool> {
         let Some(task) = active_task.as_ref() else {
             return Ok(false);
         };
@@ -581,6 +594,10 @@ impl<M: Memory> Memory for StreamingMemory<M> {
 
     fn find_tools(&self, capability: &str) -> Result<Vec<ToolRecord>> {
         self.inner.find_tools(capability)
+    }
+
+    fn agent_registry_snapshot(&self) -> Result<AgentRegistrySnapshot> {
+        self.inner.agent_registry_snapshot()
     }
 
     fn recent_states(&self, limit: usize) -> Result<Vec<TimelineEvent>> {

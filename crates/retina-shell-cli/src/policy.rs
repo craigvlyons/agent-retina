@@ -124,13 +124,32 @@ fn validate_action(authority: &AgentAuthority, action: &Action) -> Result<()> {
             }
             ensure_path_allowed(authority, root)?;
         }
-        Action::WriteFile { path, .. } | Action::AppendFile { path, .. } => {
+        Action::WriteFile { path, .. }
+        | Action::EditFile { path, .. }
+        | Action::AppendFile { path, .. }
+        | Action::EditNotebook { path, .. } => {
             if !authority.allow_file_writes {
                 return Err(KernelError::Unsupported(
                     "file writes are not permitted for this agent".to_string(),
                 ));
             }
             ensure_path_allowed(authority, path)?;
+        }
+        Action::ListMcpResources { .. }
+        | Action::ReadMcpResource { .. }
+        | Action::CallMcpTool { .. } => {
+            if !authority.allow_mcp {
+                return Err(KernelError::Unsupported(
+                    "MCP access is not permitted for this agent".to_string(),
+                ));
+            }
+        }
+        Action::SpawnAgent { .. } => {
+            if !authority.allow_agent_delegation {
+                return Err(KernelError::Unsupported(
+                    "agent delegation is not permitted for this agent".to_string(),
+                ));
+            }
         }
         Action::RecordNote { .. } => {
             if !authority.allow_notes {

@@ -15,6 +15,7 @@ use consolidation::{
 use embedder::Embedder;
 pub use manifest::write_manifest;
 use refinery::embed_migrations;
+use retina_runtime::{RuntimeTask, RuntimeTaskStore};
 use retina_traits::Memory;
 use retina_types::*;
 use retrieval::{rank_experiences, rerank_knowledge};
@@ -27,7 +28,7 @@ use std::sync::Mutex;
 use storage::{
     embedding_json, load_knowledge_nodes, load_recent_experiences, load_rules, parse_datetime,
     persist_knowledge, persist_rule, register_sqlite_vec, row_to_experience, row_to_knowledge,
-    row_to_timeline_event, sanitize_fts_query, to_storage,
+    row_to_runtime_task, row_to_timeline_event, sanitize_fts_query, to_storage,
 };
 
 embed_migrations!("migrations");
@@ -96,6 +97,63 @@ impl SqliteMemory {
 
     fn embed_text(&self, input: &str) -> Vec<f32> {
         self.embedder.embed(input)
+    }
+
+    pub fn upsert_runtime_task(&self, task: &RuntimeTask) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO runtime_tasks
+                 (task_id, parent_task_id, task_kind, owner_agent_id, status, started_at, ended_at, description,
+                  prompt_or_objective, output_path, output_offset, progress_summary, last_activity, notified)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    task.task_id.0,
+                    task.parent_task_id.as_ref().map(|value| value.0.clone()),
+                    serde_json::to_string(&task.task_kind).map_err(to_storage)?,
+                    task.owner_agent_id.0,
+                    serde_json::to_string(&task.status).map_err(to_storage)?,
+                    task.started_at.to_rfc3339(),
+                    task.ended_at.map(|value| value.to_rfc3339()),
+                    task.description,
+                    task.prompt_or_objective,
+                    task.output_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    task.output_offset as i64,
+                    task.progress_summary,
+                    task.last_activity.to_rfc3339(),
+                    if task.notified { 1 } else { 0 },
+                ],
+            )
+            .map_err(to_storage)?;
+            Ok(())
+        })
+    }
+
+    pub fn recent_runtime_tasks(&self, limit: usize) -> Result<Vec<RuntimeTask>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT task_id, parent_task_id, task_kind, owner_agent_id, status, started_at, ended_at,
+                            description, prompt_or_objective, output_path, output_offset,
+                            progress_summary, last_activity, notified
+                     FROM runtime_tasks
+                     ORDER BY last_activity DESC
+                     LIMIT ?1",
+                )
+                .map_err(to_storage)?;
+            let rows = stmt
+                .query_map(params![limit as i64], row_to_runtime_task)
+                .map_err(to_storage)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(to_storage)
+        })
+    }
+}
+
+impl RuntimeTaskStore for SqliteMemory {
+    fn save_runtime_task(&self, task: &RuntimeTask) -> Result<()> {
+        self.upsert_runtime_task(task)
     }
 }
 
@@ -372,6 +430,10 @@ impl Memory for SqliteMemory {
         })
     }
 
+    fn agent_registry_snapshot(&self) -> Result<AgentRegistrySnapshot> {
+        self.agent_registry()
+    }
+
     fn recent_states(&self, limit: usize) -> Result<Vec<TimelineEvent>> {
         self.with_conn(|conn| {
             let mut stmt = conn
@@ -603,6 +665,7 @@ impl Memory for SqliteMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use retina_runtime::{RuntimeTask, RuntimeTaskKind, RuntimeTaskStatus};
     use tempfile::tempdir;
 
     fn must<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
@@ -618,6 +681,32 @@ mod tests {
         let memory = must(SqliteMemory::open_in_memory());
         let events = must(memory.recent_states(10));
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn runtime_tasks_persist_and_load_latest_first() {
+        let memory = must(SqliteMemory::open_in_memory());
+        let mut task = RuntimeTask::new(
+            &Task::new(AgentId::new(), "background task"),
+            RuntimeTaskKind::Session,
+            Some("/tmp/task.output".into()),
+        );
+        task.status = RuntimeTaskStatus::Running;
+        task.progress_summary = Some("running".to_string());
+        must(memory.upsert_runtime_task(&task));
+
+        task.status = RuntimeTaskStatus::Completed;
+        task.ended_at = Some(Utc::now());
+        task.progress_summary = Some("done".to_string());
+        task.notified = true;
+        must(memory.upsert_runtime_task(&task));
+
+        let tasks = must(memory.recent_runtime_tasks(5));
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, task.task_id);
+        assert_eq!(tasks[0].status, RuntimeTaskStatus::Completed);
+        assert_eq!(tasks[0].progress_summary.as_deref(), Some("done"));
+        assert!(tasks[0].notified);
     }
 
     #[test]
@@ -787,10 +876,16 @@ mod tests {
             domain: "orchestrator".to_string(),
             status: AgentStatus::Idle,
             description: "root".to_string(),
+            role_prompt: None,
+            initial_prompt: None,
+            model_id: None,
             created_at: now,
             updated_at: now,
             parent_agent_id: None,
             capabilities: vec!["cli".to_string()],
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            required_mcp_servers: Vec::new(),
             authority: AgentAuthority::default(),
             lifecycle: AgentLifecycle::ready(),
             budget: AgentBudget::default(),
@@ -806,10 +901,16 @@ mod tests {
             domain: "research".to_string(),
             status: AgentStatus::Archived,
             description: "research specialist".to_string(),
+            role_prompt: Some("You are a research specialist.".to_string()),
+            initial_prompt: Some("Return a grounded summary.".to_string()),
+            model_id: Some("claude-sonnet-4-20250514".to_string()),
             created_at: now,
             updated_at: now,
             parent_agent_id: Some(AgentId("root".to_string())),
             capabilities: vec!["web".to_string(), "documents".to_string()],
+            allowed_tools: vec!["read_file".to_string(), "search_text".to_string()],
+            denied_tools: vec!["run_command".to_string()],
+            required_mcp_servers: vec!["docs".to_string()],
             authority: AgentAuthority::default(),
             lifecycle: archived_lifecycle,
             budget: AgentBudget::default(),
@@ -819,6 +920,18 @@ mod tests {
         assert_eq!(registry.active_agents.len(), 1);
         assert_eq!(registry.archived_agents.len(), 1);
         assert_eq!(registry.archived_agents[0].domain, "research");
+        let loaded = must(memory.load_manifest(&AgentId("research-a1".to_string())))
+            .unwrap_or_else(|| panic!("expected persisted research manifest"));
+        assert_eq!(loaded.required_mcp_servers, vec!["docs".to_string()]);
+        assert_eq!(
+            loaded.role_prompt.as_deref(),
+            Some("You are a research specialist.")
+        );
+        assert_eq!(
+            loaded.initial_prompt.as_deref(),
+            Some("Return a grounded summary.")
+        );
+        assert_eq!(loaded.model_id.as_deref(), Some("claude-sonnet-4-20250514"));
     }
 
     #[test]

@@ -22,9 +22,7 @@ pub use tasking::*;
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        Action, ActionId, HashScope, PrivilegedCommandKind, classify_privileged_command,
-    };
+    use crate::{Action, ActionId, HashScope, PrivilegedCommandKind, classify_privileged_command};
     use std::path::PathBuf;
 
     #[test]

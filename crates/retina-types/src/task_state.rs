@@ -6,11 +6,9 @@ use std::fmt::{Display, Formatter};
 pub struct TaskState {
     pub goal: TaskGoal,
     pub progress: TaskProgress,
-    pub frontier: TaskFrontier,
     pub recent_actions: Vec<RecentActionSummary>,
     pub working_sources: Vec<WorkingSource>,
     pub artifact_references: Vec<ArtifactReference>,
-    pub avoid: Vec<AvoidRule>,
     pub compaction: Option<CompactionSnapshot>,
 }
 
@@ -24,13 +22,10 @@ impl TaskState {
         let constraints = render_list(&self.goal.constraints);
         let completed = render_compact_list(&self.progress.completed_checkpoints, 4);
         let verified = render_compact_list(&self.progress.verified_facts, 4);
-        let blockers = render_list(&self.frontier.blockers);
         let recent_actions =
             render_tail_items(&self.recent_actions, 4, RecentActionSummary::render);
         let working_sources = render_tail_items(&self.working_sources, 4, WorkingSource::render);
-        let artifacts =
-            render_tail_items(&self.artifact_references, 4, ArtifactReference::render);
-        let avoid = render_tail_items(&self.avoid, 3, AvoidRule::render);
+        let artifacts = render_tail_items(&self.artifact_references, 4, ArtifactReference::render);
         let compaction = self
             .compaction
             .as_ref()
@@ -38,7 +33,7 @@ impl TaskState {
             .unwrap_or_else(|| "none".to_string());
 
         format!(
-            "Goal:\n- objective: {}\n- constraints:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- recent_completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n\nBlockers:\n{}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nAvoid:\n{}\n\nCompaction:\n{}",
+            "Goal:\n- objective: {}\n- constraints:\n{}\n\nProgress:\n- phase: {}\n- step: {} / {}\n- recent_completed:\n{}\n- verified_facts:\n{}\n- output_written: {}\n- output_verified: {}\n\nRecent meaningful actions:\n{}\n\nWorking sources:\n{}\n\nArtifact references:\n{}\n\nCompaction:\n{}",
             self.goal.objective,
             constraints,
             self.progress.current_phase,
@@ -48,11 +43,9 @@ impl TaskState {
             verified,
             self.progress.output_written,
             self.progress.output_verified,
-            blockers,
             recent_actions,
             working_sources,
             artifacts,
-            avoid,
             compaction
         )
     }
@@ -96,16 +89,20 @@ pub struct TaskProgress {
     pub output_verified: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TaskFrontier {
-    pub blockers: Vec<String>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecentActionStatus {
+    Succeeded,
+    Failed,
+    Blocked,
+    Responded,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecentActionSummary {
     pub step: usize,
     pub action: String,
+    pub status: RecentActionStatus,
     pub outcome: String,
     pub artifact_refs: Vec<ArtifactReference>,
 }
@@ -206,18 +203,6 @@ pub struct ArtifactReference {
 impl ArtifactReference {
     pub fn render(&self) -> String {
         format!("- {} [{}|{}]", self.locator, self.kind, self.status)
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AvoidRule {
-    pub label: String,
-    pub reason: String,
-}
-
-impl AvoidRule {
-    pub fn render(&self) -> String {
-        format!("- {}: {}", self.label, self.reason)
     }
 }
 

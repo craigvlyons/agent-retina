@@ -1,0 +1,20 @@
+[package]
+name = "retina-transport-local"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+retina-kernel = { path = "../retina-kernel" }
+retina-llm-claude = { path = "../retina-llm-claude" }
+retina-mcp-client = { path = "../retina-mcp-client" }
+retina-memory-sqlite = { path = "../retina-memory-sqlite" }
+retina-runtime = { path = "../retina-runtime" }
+retina-shell-cli = { path = "../retina-shell-cli" }
+retina-tools = { path = "../retina-tools" }
+retina-traits = { path = "../retina-traits" }
+retina-types = { path = "../retina-types" }
+serde.workspace = true
+tempfile.workspace = true
+toml.workspace = true

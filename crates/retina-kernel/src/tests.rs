@@ -2,6 +2,8 @@ use super::*;
 use crate::support::recover_mutex;
 
 use retina_test_utils::{MockMemory, MockReasoner, MockShell};
+use retina_tools::ToolPolicy;
+use retina_traits::AgentRuntime;
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
@@ -12,6 +14,7 @@ fn must<T, E: std::fmt::Display>(result: std::result::Result<T, E>) -> T {
 #[derive(Clone)]
 struct GuidanceReasoner {
     seen_task_states: Arc<Mutex<Vec<TaskState>>>,
+    seen_tools: Arc<Mutex<Vec<Vec<ToolDescriptor>>>>,
     responses: Arc<Mutex<Vec<ReasonResponse>>>,
 }
 
@@ -19,6 +22,7 @@ impl GuidanceReasoner {
     fn new(responses: Vec<ReasonResponse>) -> Self {
         Self {
             seen_task_states: Arc::new(Mutex::new(Vec::new())),
+            seen_tools: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(responses)),
         }
     }
@@ -26,11 +30,16 @@ impl GuidanceReasoner {
     fn seen_task_states(&self) -> Vec<TaskState> {
         recover_mutex(&self.seen_task_states).clone()
     }
+
+    fn seen_tools(&self) -> Vec<Vec<ToolDescriptor>> {
+        recover_mutex(&self.seen_tools).clone()
+    }
 }
 
 impl retina_traits::Reasoner for GuidanceReasoner {
     fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
         recover_mutex(&self.seen_task_states).push(request.context.task_state.clone());
+        recover_mutex(&self.seen_tools).push(request.context.tools.clone());
         let mut responses = recover_mutex(&self.responses);
         Ok(if responses.len() > 1 {
             responses.remove(0)
@@ -59,6 +68,33 @@ impl retina_traits::Reasoner for GuidanceReasoner {
             supports_caching: false,
             model_id: "guidance-test".to_string(),
         }
+    }
+}
+
+#[derive(Clone)]
+struct MockLocalAgentRuntime {
+    result: DelegatedTaskResult,
+    calls: Arc<Mutex<usize>>,
+    routed_calls: Arc<Mutex<usize>>,
+}
+
+impl AgentRuntime for MockLocalAgentRuntime {
+    fn spawn_local_agent(
+        &self,
+        _request: &SpawnAgentRequest,
+        _control: Option<&ExecutionControlHandle>,
+    ) -> Result<DelegatedTaskResult> {
+        *recover_mutex(&self.calls) += 1;
+        Ok(self.result.clone())
+    }
+
+    fn execute_routing_decision(
+        &self,
+        _request: &RouteAgentRequest,
+        _control: Option<&ExecutionControlHandle>,
+    ) -> Result<DelegatedTaskResult> {
+        *recover_mutex(&self.routed_calls) += 1;
+        Ok(self.result.clone())
     }
 }
 
@@ -144,7 +180,215 @@ fn assembled_context_includes_output_task_shape() {
 
     let seen = reasoner.seen_task_states();
     assert!(!seen.is_empty());
-    assert_eq!(seen[0].goal.objective, "use dominican_Med.pdf and dominican.txt to create Emily_wittenberge.txt");
+    assert_eq!(
+        seen[0].goal.objective,
+        "use dominican_Med.pdf and dominican.txt to create Emily_wittenberge.txt"
+    );
+}
+
+#[test]
+fn assembled_context_exposes_callable_tools_not_memory_records() {
+    let reasoner = GuidanceReasoner::new(vec![ReasonResponse {
+        action: Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        },
+        task_complete: true,
+        framing: None,
+        reasoning: Some("tool visibility check".to_string()),
+        tokens_used: TokenUsage::default(),
+    }]);
+    let memory = MockMemory::default();
+    must(memory.register_tool(&ToolRecord {
+        id: None,
+        name: "custom_remote_tool".to_string(),
+        description: "not callable through the current runtime".to_string(),
+        source_lang: SourceLanguage::Other("typescript".to_string()),
+        test_status: "passing".to_string(),
+        metadata: serde_json::json!({ "callable": false }),
+    }));
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(memory),
+    ));
+
+    let task = Task::new(AgentId::new(), "read startup.md");
+    let _ = must(kernel.execute_task_with_config(
+        task,
+        ExecutionConfig {
+            max_steps: 1,
+            control: None,
+        },
+    ));
+
+    let tools = reasoner.seen_tools().into_iter().next().unwrap_or_default();
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"read_file"));
+    assert!(names.contains(&"append_file"));
+    assert!(names.contains(&"record_note"));
+    assert!(!names.contains(&"custom_remote_tool"));
+}
+
+#[test]
+fn authority_backed_tool_policy_filters_prompt_tool_pool() {
+    let reasoner = GuidanceReasoner::new(vec![ReasonResponse {
+        action: Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        },
+        task_complete: true,
+        framing: None,
+        reasoning: Some("authority policy check".to_string()),
+        tokens_used: TokenUsage::default(),
+    }]);
+    let kernel = must(Kernel::new_with_registry_and_tool_policy(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(MockMemory::default()),
+        AgentRegistrySnapshot::default(),
+        ToolPolicy::from_authority(&AgentAuthority {
+            allow_command_execution: false,
+            allow_file_reads: true,
+            allow_file_writes: true,
+            allow_file_search: true,
+            allow_mcp: true,
+            allow_agent_delegation: false,
+            allow_notes: false,
+            allow_text_responses: true,
+            accessible_roots: vec![],
+        }),
+    ));
+
+    let task = Task::new(AgentId::new(), "read startup.md");
+    let _ = must(kernel.execute_task_with_config(
+        task,
+        ExecutionConfig {
+            max_steps: 1,
+            control: None,
+        },
+    ));
+
+    let tools = reasoner.seen_tools().into_iter().next().unwrap_or_default();
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"read_file"));
+    assert!(names.contains(&"write_file"));
+    assert!(!names.contains(&"run_command"));
+    assert!(!names.contains(&"record_note"));
+}
+
+#[test]
+fn spawn_agent_action_dispatches_through_local_agent_runtime() {
+    let delegated = DelegatedTaskResult {
+        agent_id: AgentId("local-child".to_string()),
+        task_id: TaskId::new(),
+        parent_task_id: None,
+        status: DelegatedTaskStatus::Completed,
+        summary: "child found the answer".to_string(),
+        output_path: None,
+    };
+    let local_runtime = MockLocalAgentRuntime {
+        result: delegated.clone(),
+        calls: Arc::new(Mutex::new(0)),
+        routed_calls: Arc::new(Mutex::new(0)),
+    };
+    let kernel = must(Kernel::new_with_runtime(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::SpawnAgent {
+                    id: ActionId::new(),
+                    prompt: "Find the answer in startup.md".to_string(),
+                    allowed_tools: vec!["read_file".to_string()],
+                    denied_tools: vec!["run_command".to_string()],
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("delegate bounded reading work".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "child found the answer".to_string(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("integrate delegated result".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(MockMemory::default()),
+        AgentRegistrySnapshot::default(),
+        ToolPolicy::from_authority(&AgentAuthority::default()),
+        Some(Arc::new(local_runtime.clone())),
+        None,
+    ));
+
+    let outcome = must(kernel.execute_task(Task::new(AgentId::new(), "delegate this")));
+    let Outcome::Success(ActionResult::Response { message }) = outcome else {
+        panic!("expected final response");
+    };
+    assert_eq!(local_runtime.call_count(), 1);
+    assert_eq!(message, "child found the answer");
+}
+
+#[test]
+fn router_dispatches_existing_specialist_through_agent_runtime() {
+    let delegated = DelegatedTaskResult {
+        agent_id: AgentId("specialist-research".to_string()),
+        task_id: TaskId::new(),
+        parent_task_id: None,
+        status: DelegatedTaskStatus::Completed,
+        summary: "research specialist completed the task".to_string(),
+        output_path: None,
+    };
+    let local_runtime = MockLocalAgentRuntime {
+        result: delegated.clone(),
+        calls: Arc::new(Mutex::new(0)),
+        routed_calls: Arc::new(Mutex::new(0)),
+    };
+    let registry = AgentRegistrySnapshot {
+        updated_at: chrono::Utc::now(),
+        active_agents: vec![AgentCard {
+            agent_id: AgentId("specialist-research".to_string()),
+            domain: "research".to_string(),
+            description: "research specialist".to_string(),
+            capabilities: vec!["research".to_string(), "browser".to_string()],
+            status: AgentStatus::Idle,
+            lifecycle_phase: AgentLifecyclePhase::Ready,
+            last_active_at: None,
+        }],
+        archived_agents: Vec::new(),
+    };
+    let kernel = must(Kernel::new_with_runtime(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "should not be used".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+        registry,
+        ToolPolicy::from_authority(&AgentAuthority::default()),
+        Some(Arc::new(local_runtime.clone())),
+        None,
+    ));
+
+    let outcome = must(kernel.execute_task(Task::new(
+        AgentId("root".to_string()),
+        "research the browser support matrix",
+    )));
+    let Outcome::Success(ActionResult::DelegatedTask(result)) = outcome else {
+        panic!("expected delegated task result");
+    };
+    assert_eq!(local_runtime.routed_call_count(), 1);
+    assert_eq!(result.agent_id.0, "specialist-research");
 }
 
 #[test]
@@ -175,6 +419,7 @@ fn task_state_keeps_authoritative_progress_without_advisory_frontier() {
     state.recent_action_summaries.push(RecentActionSummary {
         step: 2,
         action: "read_file:startup.md".to_string(),
+        status: RecentActionStatus::Succeeded,
         outcome: "read startup.md".to_string(),
         artifact_refs: vec![ArtifactReference {
             kind: "file".to_string(),
@@ -189,9 +434,8 @@ fn task_state_keeps_authoritative_progress_without_advisory_frontier() {
     });
 
     let task = Task::new(AgentId::new(), "read startup.md and answer what it says");
-    let task_state = kernel.build_task_state(&task, &state, 2, 4, Some("read startup.md".to_string()));
+    let task_state = kernel.build_task_state(&task, &state, 2, 4);
 
-    assert!(task_state.frontier.blockers.is_empty());
     assert_eq!(task_state.working_sources.len(), 1);
     assert_eq!(task_state.working_sources[0].locator, "startup.md");
 }
@@ -224,6 +468,7 @@ fn command_state_keeps_command_evidence_without_file_discovery_guidance() {
     state.recent_action_summaries.push(RecentActionSummary {
         step: 2,
         action: "run_command:ps aux | grep -i docker | grep -v grep".to_string(),
+        status: RecentActionStatus::Succeeded,
         outcome: "command succeeded with exit Some(0)".to_string(),
         artifact_refs: vec![ArtifactReference {
             kind: "command".to_string(),
@@ -238,10 +483,8 @@ fn command_state_keeps_command_evidence_without_file_discovery_guidance() {
     });
 
     let task = Task::new(AgentId::new(), "shutdown docker desktop");
-    let task_state =
-        kernel.build_task_state(&task, &state, 2, 4, Some("docker still running".to_string()));
+    let task_state = kernel.build_task_state(&task, &state, 2, 4);
 
-    assert!(task_state.frontier.blockers.is_empty());
     assert_eq!(task_state.working_sources.len(), 1);
     assert_eq!(
         task_state.working_sources[0].locator,
@@ -292,10 +535,12 @@ fn compaction_preserves_authoritative_sources_before_candidates() {
 
     let decision = state.apply_live_compaction();
     assert!(decision.is_some());
-    assert!(state
-        .working_sources
-        .iter()
-        .any(|source| source.locator == "authoritative.md" && source.role == "authoritative"));
+    assert!(
+        state
+            .working_sources
+            .iter()
+            .any(|source| source.locator == "authoritative.md" && source.role == "authoritative")
+    );
     assert!(state.working_sources.len() <= 6);
 }
 
@@ -331,17 +576,16 @@ fn output_task_state_stays_observational_without_inferred_deliverables() {
 
     let objective = format!("update {} again from startup.md", target.display());
     let task = Task::new(AgentId::new(), &objective);
-    let task_state = kernel.build_task_state(&task, &state, 3, 6, Some("read startup.md".to_string()));
+    let task_state = kernel.build_task_state(&task, &state, 3, 6);
     assert_eq!(task_state.goal.objective, objective);
     assert_eq!(task_state.working_sources.len(), 1);
-    assert!(task_state.frontier.blockers.is_empty());
 }
 
 #[test]
-fn low_value_discovery_is_reconsidered_when_output_target_is_ready() {
+fn output_flow_reaches_write_without_prompt_recovery_layer() {
     let memory = MockMemory::default();
     let kernel = must(Kernel::new(
-        Box::new(MockShell::default().with_files([("startup.md", "hello") ])),
+        Box::new(MockShell::default().with_files([("startup.md", "hello")])),
         Box::new(MockReasoner::sequence(vec![
             ReasonResponse {
                 action: Action::ReadFile {
@@ -434,8 +678,16 @@ fn low_value_discovery_is_reconsidered_when_output_target_is_ready() {
                 .to_string()
         })
         .collect::<Vec<_>>();
-    assert!(dispatched.iter().any(|action| action.starts_with("write_file:summary.md")));
-    assert!(!dispatched.iter().any(|action| action.starts_with("find_files:.:*summary*")));
+    assert!(
+        dispatched
+            .iter()
+            .any(|action| action.starts_with("write_file:summary.md"))
+    );
+    assert!(
+        !dispatched
+            .iter()
+            .any(|action| action.starts_with("find_files:.:*summary*"))
+    );
 }
 
 #[test]
@@ -488,7 +740,8 @@ fn repeated_command_signature_groups_near_duplicate_process_checks() {
 
     let base = crate::result_helpers::repeated_step_signature(&base_action, &result);
     let variant = crate::result_helpers::repeated_step_signature(&variant_action, &result);
-    let head_variant = crate::result_helpers::repeated_step_signature(&head_variant_action, &result);
+    let head_variant =
+        crate::result_helpers::repeated_step_signature(&head_variant_action, &result);
     let pgrep_variant =
         crate::result_helpers::repeated_step_signature(&pgrep_variant_action, &result);
 
@@ -501,9 +754,7 @@ fn repeated_command_signature_groups_near_duplicate_process_checks() {
 fn denied_approval_closes_operational_task_with_grounded_blocker() {
     let memory = MockMemory::default();
     let kernel = must(Kernel::new(
-        Box::new(
-            MockShell::default().with_approvals(vec![ApprovalResponse::Denied])
-        ),
+        Box::new(MockShell::default().with_approvals(vec![ApprovalResponse::Denied])),
         Box::new(MockReasoner::sequence(vec![
             ReasonResponse {
                 action: Action::RunCommand {
@@ -557,7 +808,7 @@ fn denied_approval_closes_operational_task_with_grounded_blocker() {
 }
 
 #[test]
-fn reflection_retry_reenters_main_loop_and_can_finish_normally() {
+fn failed_step_stays_in_main_loop_and_can_finish_normally() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default().with_force_unchanged(true)),
         Box::new(MockReasoner::sequence(vec![
@@ -663,6 +914,44 @@ fn non_response_task_complete_does_not_end_loop_early() {
 }
 
 #[test]
+fn file_write_task_complete_can_finish_via_tool_authored_completion() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![ReasonResponse {
+            action: Action::WriteFile {
+                id: ActionId::new(),
+                path: "summary.md".into(),
+                content: "saved summary".to_string(),
+                overwrite: true,
+            },
+            task_complete: true,
+            framing: Some(ReasonerTaskFraming {
+                intent_kind: Some(TaskKind::Output),
+                deliverable: Some("summary.md".to_string()),
+                completion_basis: Some("saved requested output".to_string()),
+            }),
+            reasoning: Some("write the final artifact".to_string()),
+            tokens_used: TokenUsage::default(),
+        }])),
+        Box::new(MockMemory::default()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        Task::new(AgentId::new(), "create summary.md"),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    let Outcome::Success(ActionResult::Response { message }) = outcome else {
+        panic!("expected tool-authored response");
+    };
+    assert!(message.contains("File created successfully at"));
+    assert!(message.contains("summary.md"));
+}
+
+#[test]
 fn explicit_response_is_the_normal_terminal_path() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default()),
@@ -688,7 +977,7 @@ fn explicit_response_is_the_normal_terminal_path() {
 }
 
 #[test]
-fn unsupported_document_read_is_avoided_after_retry_feedback() {
+fn unsupported_document_read_remains_observable_in_main_loop() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default()),
         Box::new(MockReasoner::sequence(vec![
@@ -753,4 +1042,13 @@ fn unsupported_document_read_is_avoided_after_retry_feedback() {
         outcome,
         Outcome::Success(ActionResult::Response { .. })
     ));
+}
+impl MockLocalAgentRuntime {
+    fn call_count(&self) -> usize {
+        *recover_mutex(&self.calls)
+    }
+
+    fn routed_call_count(&self) -> usize {
+        *recover_mutex(&self.routed_calls)
+    }
 }

@@ -13,8 +13,6 @@ pub struct AssembledContext {
     pub tools: Vec<ToolDescriptor>,
     pub memory_slice: Vec<String>,
     pub last_result: Option<String>,
-    pub last_result_summary: Option<String>,
-    pub recent_steps: Vec<String>,
     pub operator_guidance: Option<String>,
     pub current_step: usize,
     pub max_steps: usize,
@@ -25,7 +23,7 @@ impl AssembledContext {
         let tools = self
             .tools
             .iter()
-            .map(|tool| format!("- {}: {}", tool.name, tool.description))
+            .map(ToolDescriptor::render)
             .collect::<Vec<_>>()
             .join("\n");
         let operator_guidance = self
@@ -89,6 +87,81 @@ impl RecentContext {
 pub struct ToolDescriptor {
     pub name: String,
     pub description: String,
+    #[serde(default)]
+    pub source: ToolSourceKind,
+    #[serde(default)]
+    pub concurrency: ToolConcurrencyClass,
+    #[serde(default)]
+    pub approval: ToolApprovalPolicy,
+    #[serde(default)]
+    pub required_authority: Vec<String>,
+    #[serde(default)]
+    pub streaming: bool,
+}
+
+impl ToolDescriptor {
+    pub fn render(&self) -> String {
+        let mut traits = vec![self.concurrency.label().to_string()];
+        if self.streaming {
+            traits.push("streaming".to_string());
+        }
+        match self.approval {
+            ToolApprovalPolicy::None => {}
+            ToolApprovalPolicy::ExplicitOperatorApproval => {
+                traits.push("approval".to_string());
+            }
+            ToolApprovalPolicy::ToolDefined => {
+                traits.push("conditional_approval".to_string());
+            }
+        }
+        if !self.required_authority.is_empty() {
+            traits.push(format!("requires {}", self.required_authority.join(",")));
+        }
+        format!(
+            "- {} [{}]: {}",
+            self.name,
+            traits.join(", "),
+            self.description
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolSourceKind {
+    #[default]
+    BuiltinShell,
+    MemoryRecord,
+    McpServer,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolConcurrencyClass {
+    #[default]
+    ReadOnly,
+    Mutation,
+    LongRunning,
+    Streaming,
+    Unknown,
+}
+
+impl ToolConcurrencyClass {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::Mutation => "mutation",
+            Self::LongRunning => "long_running",
+            Self::Streaming => "streaming",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ToolApprovalPolicy {
+    #[default]
+    None,
+    ExplicitOperatorApproval,
+    ToolDefined,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -181,21 +254,36 @@ pub struct AgentManifest {
     pub domain: String,
     pub status: crate::AgentStatus,
     pub description: String,
+    #[serde(default)]
+    pub role_prompt: Option<String>,
+    #[serde(default)]
+    pub initial_prompt: Option<String>,
+    #[serde(default)]
+    pub model_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub parent_agent_id: Option<AgentId>,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub denied_tools: Vec<String>,
+    #[serde(default)]
+    pub required_mcp_servers: Vec<String>,
     pub authority: crate::AgentAuthority,
     pub lifecycle: crate::AgentLifecycle,
     pub budget: crate::AgentBudget,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AgentAuthority {
     pub allow_command_execution: bool,
     pub allow_file_reads: bool,
     pub allow_file_writes: bool,
     pub allow_file_search: bool,
+    pub allow_mcp: bool,
+    pub allow_agent_delegation: bool,
     pub allow_notes: bool,
     pub allow_text_responses: bool,
     pub accessible_roots: Vec<PathBuf>,
@@ -208,6 +296,8 @@ impl Default for AgentAuthority {
             allow_file_reads: true,
             allow_file_writes: true,
             allow_file_search: true,
+            allow_mcp: true,
+            allow_agent_delegation: true,
             allow_notes: true,
             allow_text_responses: true,
             accessible_roots: Vec::new(),

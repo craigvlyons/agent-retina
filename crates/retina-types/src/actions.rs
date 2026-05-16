@@ -1,4 +1,4 @@
-use crate::ActionId;
+use crate::{ActionId, AgentId, TaskId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -56,16 +56,52 @@ pub enum Action {
         page_start: Option<usize>,
         page_end: Option<usize>,
     },
+    ListMcpResources {
+        id: ActionId,
+        server: Option<String>,
+    },
+    ReadMcpResource {
+        id: ActionId,
+        server: String,
+        uri: String,
+    },
+    CallMcpTool {
+        id: ActionId,
+        server: String,
+        tool: String,
+        input_json: serde_json::Value,
+    },
     WriteFile {
         id: ActionId,
         path: PathBuf,
         content: String,
         overwrite: bool,
     },
+    EditFile {
+        id: ActionId,
+        path: PathBuf,
+        old_string: String,
+        new_string: String,
+        replace_all: bool,
+    },
     AppendFile {
         id: ActionId,
         path: PathBuf,
         content: String,
+    },
+    EditNotebook {
+        id: ActionId,
+        path: PathBuf,
+        cell_id: Option<String>,
+        new_source: String,
+        cell_type: Option<NotebookCellType>,
+        edit_mode: NotebookEditMode,
+    },
+    SpawnAgent {
+        id: ActionId,
+        prompt: String,
+        allowed_tools: Vec<String>,
+        denied_tools: Vec<String>,
     },
     RecordNote {
         id: ActionId,
@@ -89,8 +125,14 @@ impl Action {
             | Self::ReadFile { id, .. }
             | Self::IngestStructuredData { id, .. }
             | Self::ExtractDocumentText { id, .. }
+            | Self::ListMcpResources { id, .. }
+            | Self::ReadMcpResource { id, .. }
+            | Self::CallMcpTool { id, .. }
             | Self::WriteFile { id, .. }
+            | Self::EditFile { id, .. }
             | Self::AppendFile { id, .. }
+            | Self::EditNotebook { id, .. }
+            | Self::SpawnAgent { id, .. }
             | Self::RecordNote { id, .. }
             | Self::Respond { id, .. } => id.clone(),
         }
@@ -99,7 +141,10 @@ impl Action {
     pub fn expects_change(&self) -> bool {
         match self {
             Self::RunCommand { expect_change, .. } => *expect_change,
-            Self::WriteFile { .. } | Self::AppendFile { .. } => true,
+            Self::WriteFile { .. }
+            | Self::EditFile { .. }
+            | Self::AppendFile { .. }
+            | Self::EditNotebook { .. } => true,
             Self::InspectPath { .. }
             | Self::InspectWorkingDirectory { .. }
             | Self::ListDirectory { .. }
@@ -108,6 +153,10 @@ impl Action {
             | Self::ReadFile { .. }
             | Self::IngestStructuredData { .. }
             | Self::ExtractDocumentText { .. }
+            | Self::ListMcpResources { .. }
+            | Self::ReadMcpResource { .. }
+            | Self::CallMcpTool { .. }
+            | Self::SpawnAgent { .. }
             | Self::RecordNote { .. }
             | Self::Respond { .. } => false,
         }
@@ -153,7 +202,9 @@ impl Action {
             | Self::IngestStructuredData { path, .. }
             | Self::ExtractDocumentText { path, .. }
             | Self::WriteFile { path, .. }
-            | Self::AppendFile { path, .. } => HashScope {
+            | Self::EditFile { path, .. }
+            | Self::AppendFile { path, .. }
+            | Self::EditNotebook { path, .. } => HashScope {
                 tracked_paths: vec![TrackedPath {
                     path: path.clone(),
                     include_content: true,
@@ -161,6 +212,10 @@ impl Action {
                 include_working_directory: false,
                 include_last_command: false,
             },
+            Self::ListMcpResources { .. }
+            | Self::ReadMcpResource { .. }
+            | Self::CallMcpTool { .. } => HashScope::default(),
+            Self::SpawnAgent { .. } => HashScope::default(),
             Self::RecordNote { .. } | Self::Respond { .. } => HashScope::default(),
         }
     }
@@ -282,10 +337,122 @@ pub struct CommandResult {
     pub observed_paths: Vec<PathBuf>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DelegatedTaskStatus {
+    Completed,
+    Failed,
+    Blocked,
+    Killed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DelegatedTaskResult {
+    pub agent_id: AgentId,
+    pub task_id: TaskId,
+    pub parent_task_id: Option<TaskId>,
+    pub status: DelegatedTaskStatus,
+    pub summary: String,
+    pub output_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StructuredDataRow {
     pub row_number: usize,
     pub values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct McpRegistrySnapshot {
+    pub servers: Vec<McpServerSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpServerSnapshot {
+    pub name: String,
+    pub tools: Vec<McpToolSummary>,
+    pub resources: Vec<McpResourceSummary>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpToolSummary {
+    pub server: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub read_only: bool,
+    pub destructive: bool,
+    pub open_world: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpResourceSummary {
+    pub server: String,
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpResourceContentItem {
+    pub uri: String,
+    pub mime_type: Option<String>,
+    pub text: Option<String>,
+    pub blob_base64: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpResourceReadResult {
+    pub server: String,
+    pub uri: String,
+    pub contents: Vec<McpResourceContentItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct McpToolCallResult {
+    pub server: String,
+    pub tool: String,
+    pub content_preview: String,
+    pub structured_content: Option<serde_json::Value>,
+    pub is_error: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FileMutationKind {
+    Create,
+    Overwrite,
+    Append,
+    ExactEdit,
+    NotebookReplace,
+    NotebookInsert,
+    NotebookDelete,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PatchSummary {
+    pub matched_occurrences: usize,
+    pub replaced_occurrences: usize,
+    pub old_preview: String,
+    pub new_preview: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileArtifactPayload {
+    pub original_content: Option<String>,
+    pub final_content: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NotebookEditMode {
+    Replace,
+    Insert,
+    Delete,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum NotebookCellType {
+    Code,
+    Markdown,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -329,13 +496,27 @@ pub enum ActionResult {
         query: String,
         matches: Vec<SearchMatch>,
     },
+    McpResources {
+        server: Option<String>,
+        resources: Vec<McpResourceSummary>,
+    },
+    McpResourceRead(McpResourceReadResult),
+    McpToolCall(McpToolCallResult),
     FileWrite {
         path: PathBuf,
+        mutation_kind: FileMutationKind,
         bytes_written: usize,
         created: bool,
         overwritten: bool,
         appended: bool,
+        original_hash: Option<String>,
+        updated_hash: String,
+        changed_line_count: usize,
+        patch_summary: Option<PatchSummary>,
+        preview_excerpt: Option<String>,
+        artifact: FileArtifactPayload,
     },
+    DelegatedTask(DelegatedTaskResult),
     NoteRecorded {
         note: String,
     },

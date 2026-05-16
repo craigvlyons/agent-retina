@@ -1,9 +1,13 @@
 // File boundary: keep lib.rs focused on shell wiring and the top-level CLI shell
 // type. Move file/process/state helpers into sibling modules before growth.
+mod file_edit;
 mod file_ops;
+mod notebook_edit;
 mod policy;
 mod process_control;
+mod read_state;
 mod state_helpers;
+mod text_write;
 
 pub use policy::ScopedShell;
 
@@ -13,7 +17,8 @@ use chrono::{DateTime, Utc};
 use pdf_extract::{extract_text, extract_text_by_pages};
 use retina_traits::Shell;
 use retina_types::*;
-use std::fs::{self, OpenOptions};
+use std::collections::HashMap;
+use std::fs::{self};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -26,6 +31,7 @@ const DEFAULT_MAX_SEARCH_RESULTS: usize = 50;
 pub struct CliShell {
     last_command: Mutex<Option<CommandResult>>,
     notes: Mutex<Vec<String>>,
+    read_states: Mutex<HashMap<PathBuf, read_state::StoredReadState>>,
 }
 
 fn lock_state<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
@@ -45,6 +51,7 @@ impl CliShell {
         Self {
             last_command: Mutex::new(None),
             notes: Mutex::new(Vec::new()),
+            read_states: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -226,8 +233,10 @@ impl Shell for CliShell {
                 path, max_bytes, ..
             } => {
                 let (content, truncated) = Self::read_file(path, *max_bytes)?;
+                let resolved = Self::resolve_path(path)?;
+                self.maybe_remember_text_read(&resolved, &content, truncated)?;
                 Ok(ActionResult::FileRead {
-                    path: Self::resolve_path(path)?,
+                    path: resolved,
                     content,
                     truncated,
                 })
@@ -275,26 +284,100 @@ impl Shell for CliShell {
                 overwrite,
                 ..
             } => {
-                let (bytes_written, created, overwritten) =
-                    Self::write_file(path, content, *overwrite)?;
+                let result = self.write_file(path, content, *overwrite)?;
                 Ok(ActionResult::FileWrite {
-                    path: Self::resolve_path(path)?,
-                    bytes_written,
-                    created,
-                    overwritten,
-                    appended: false,
+                    path: result.path,
+                    mutation_kind: result.mutation_kind,
+                    bytes_written: result.bytes_written,
+                    created: result.created,
+                    overwritten: result.overwritten,
+                    appended: result.appended,
+                    original_hash: result.original_hash,
+                    updated_hash: result.updated_hash,
+                    changed_line_count: result.changed_line_count,
+                    patch_summary: result.patch_summary,
+                    preview_excerpt: result.preview_excerpt,
+                    artifact: result.artifact,
+                })
+            }
+            Action::EditFile {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+                ..
+            } => {
+                let result = self.edit_file(path, old_string, new_string, *replace_all)?;
+                Ok(ActionResult::FileWrite {
+                    path: result.path,
+                    mutation_kind: result.mutation_kind,
+                    bytes_written: result.bytes_written,
+                    created: result.created,
+                    overwritten: result.overwritten,
+                    appended: result.appended,
+                    original_hash: result.original_hash,
+                    updated_hash: result.updated_hash,
+                    changed_line_count: result.changed_line_count,
+                    patch_summary: result.patch_summary,
+                    preview_excerpt: result.preview_excerpt,
+                    artifact: result.artifact,
                 })
             }
             Action::AppendFile { path, content, .. } => {
-                let (bytes_written, created) = Self::append_file(path, content)?;
+                let result = self.append_file(path, content)?;
                 Ok(ActionResult::FileWrite {
-                    path: Self::resolve_path(path)?,
-                    bytes_written,
-                    created,
-                    overwritten: false,
-                    appended: true,
+                    path: result.path,
+                    mutation_kind: result.mutation_kind,
+                    bytes_written: result.bytes_written,
+                    created: result.created,
+                    overwritten: result.overwritten,
+                    appended: result.appended,
+                    original_hash: result.original_hash,
+                    updated_hash: result.updated_hash,
+                    changed_line_count: result.changed_line_count,
+                    patch_summary: result.patch_summary,
+                    preview_excerpt: result.preview_excerpt,
+                    artifact: result.artifact,
                 })
             }
+            Action::EditNotebook {
+                path,
+                cell_id,
+                new_source,
+                cell_type,
+                edit_mode,
+                ..
+            } => {
+                let result = self.edit_notebook(
+                    path,
+                    cell_id.clone(),
+                    new_source,
+                    cell_type.clone(),
+                    edit_mode.clone(),
+                )?;
+                Ok(ActionResult::FileWrite {
+                    path: result.path,
+                    mutation_kind: result.mutation_kind,
+                    bytes_written: result.bytes_written,
+                    created: result.created,
+                    overwritten: result.overwritten,
+                    appended: result.appended,
+                    original_hash: result.original_hash,
+                    updated_hash: result.updated_hash,
+                    changed_line_count: result.changed_line_count,
+                    patch_summary: result.patch_summary,
+                    preview_excerpt: result.preview_excerpt,
+                    artifact: result.artifact,
+                })
+            }
+            Action::ListMcpResources { .. }
+            | Action::ReadMcpResource { .. }
+            | Action::CallMcpTool { .. } => Err(KernelError::Unsupported(
+                "MCP actions must be dispatched through the MCP runtime".to_string(),
+            )),
+            Action::SpawnAgent { .. } => Err(KernelError::Unsupported(
+                "spawn_agent must be dispatched through the local agent runtime".to_string(),
+            )),
             Action::RecordNote { note, .. } => {
                 lock_state(&self.notes)?.push(note.clone());
                 Ok(ActionResult::NoteRecorded { note: note.clone() })
@@ -468,6 +551,262 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_existing_file_requires_prior_read() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "before"));
+        let shell = CliShell::new();
+        let error = shell
+            .execute(&Action::WriteFile {
+                id: ActionId::new(),
+                path: file.clone(),
+                content: "after".to_string(),
+                overwrite: true,
+            })
+            .unwrap_err();
+        let KernelError::Validation(message) = error else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("must be read before it can be modified"));
+    }
+
+    #[test]
+    fn stale_overwrite_is_rejected_after_file_changes() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "before"));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }));
+        must(fs::write(&file, "changed elsewhere"));
+        let error = shell
+            .execute(&Action::WriteFile {
+                id: ActionId::new(),
+                path: file.clone(),
+                content: "after".to_string(),
+                overwrite: true,
+            })
+            .unwrap_err();
+        let KernelError::Validation(message) = error else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("changed after it was read"));
+    }
+
+    #[test]
+    fn edit_file_replaces_exact_match_after_read() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "alpha\nbeta\n"));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }));
+        let result = must(shell.execute(&Action::EditFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            old_string: "beta".to_string(),
+            new_string: "gamma".to_string(),
+            replace_all: false,
+        }));
+        let ActionResult::FileWrite {
+            mutation_kind,
+            patch_summary,
+            ..
+        } = result
+        else {
+            panic!("expected file write result");
+        };
+        assert_eq!(mutation_kind, FileMutationKind::ExactEdit);
+        assert_eq!(must(fs::read_to_string(&file)), "alpha\ngamma\n");
+        let summary = patch_summary.expect("expected patch summary");
+        assert_eq!(summary.replaced_occurrences, 1);
+    }
+
+    #[test]
+    fn edit_file_rejects_ambiguous_match_without_replace_all() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "beta\nbeta\n"));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }));
+        let error = shell
+            .execute(&Action::EditFile {
+                id: ActionId::new(),
+                path: file.clone(),
+                old_string: "beta".to_string(),
+                new_string: "gamma".to_string(),
+                replace_all: false,
+            })
+            .unwrap_err();
+        let KernelError::Validation(message) = error else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("set replace_all=true"));
+    }
+
+    #[test]
+    fn edit_file_rejects_noop_edit() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "beta\n"));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }));
+        let error = shell
+            .execute(&Action::EditFile {
+                id: ActionId::new(),
+                path: file,
+                old_string: "beta".to_string(),
+                new_string: "beta".to_string(),
+                replace_all: false,
+            })
+            .unwrap_err();
+        let KernelError::Validation(message) = error else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("nothing to change"));
+    }
+
+    #[test]
+    fn edit_file_matches_quote_normalized_text() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "say “hello”\n"));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }));
+        let result = must(shell.execute(&Action::EditFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            old_string: "say \"hello\"".to_string(),
+            new_string: "say goodbye".to_string(),
+            replace_all: false,
+        }));
+        let ActionResult::FileWrite { artifact, .. } = result else {
+            panic!("expected file write result");
+        };
+        assert_eq!(must(fs::read_to_string(&file)), "say goodbye\n");
+        assert_eq!(artifact.final_content, "say goodbye\n");
+    }
+
+    #[test]
+    fn text_mutation_rejects_notebooks() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.ipynb");
+        must(fs::write(&file, notebook_fixture()));
+        let shell = CliShell::new();
+        let error = shell
+            .execute(&Action::WriteFile {
+                id: ActionId::new(),
+                path: file,
+                content: "{}".to_string(),
+                overwrite: true,
+            })
+            .unwrap_err();
+        let KernelError::Unsupported(message) = error else {
+            panic!("expected unsupported error");
+        };
+        assert!(message.contains("edit_notebook"));
+    }
+
+    #[test]
+    fn edit_notebook_rewrites_selected_cell() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.ipynb");
+        must(fs::write(&file, notebook_fixture()));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }));
+        let result = must(shell.execute(&Action::EditNotebook {
+            id: ActionId::new(),
+            path: file.clone(),
+            cell_id: Some("intro".to_string()),
+            new_source: "# Updated\n".to_string(),
+            cell_type: Some(NotebookCellType::Markdown),
+            edit_mode: NotebookEditMode::Replace,
+        }));
+        let ActionResult::FileWrite { mutation_kind, .. } = result else {
+            panic!("expected file write");
+        };
+        assert_eq!(mutation_kind, FileMutationKind::NotebookReplace);
+        let updated = must(fs::read_to_string(&file));
+        assert!(updated.contains("# Updated"));
+    }
+
+    #[test]
+    fn edit_notebook_insert_requires_cell_type() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.ipynb");
+        must(fs::write(&file, notebook_fixture()));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            max_bytes: None,
+        }));
+        let error = shell
+            .execute(&Action::EditNotebook {
+                id: ActionId::new(),
+                path: file,
+                cell_id: Some("intro".to_string()),
+                new_source: "print('hi')\n".to_string(),
+                cell_type: None,
+                edit_mode: NotebookEditMode::Insert,
+            })
+            .unwrap_err();
+        let KernelError::Validation(message) = error else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("requires cell_type"));
+    }
+
+    #[test]
+    fn edit_notebook_replace_requires_cell_id() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.ipynb");
+        must(fs::write(&file, notebook_fixture()));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file,
+            max_bytes: None,
+        }));
+        let error = shell
+            .execute(&Action::EditNotebook {
+                id: ActionId::new(),
+                path: dir.path().join("note.ipynb"),
+                cell_id: None,
+                new_source: "# Updated\n".to_string(),
+                cell_type: Some(NotebookCellType::Markdown),
+                edit_mode: NotebookEditMode::Replace,
+            })
+            .unwrap_err();
+        let KernelError::Validation(message) = error else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("requires cell_id"));
+    }
+
+    #[test]
     fn inspect_path_resolves_known_folder_aliases() {
         let Some(desktop) = dirs::desktop_dir() else {
             return;
@@ -485,7 +824,10 @@ mod tests {
         let ActionResult::Inspection(world) = result else {
             panic!("expected inspection result");
         };
-        let inspected = world.files.first().unwrap_or_else(|| panic!("expected inspected file"));
+        let inspected = world
+            .files
+            .first()
+            .unwrap_or_else(|| panic!("expected inspected file"));
         assert_eq!(inspected.path, file);
         assert!(inspected.exists);
         assert_eq!(inspected.size, Some("alias inspect content".len() as u64));
@@ -797,5 +1139,22 @@ mod tests {
         document
             .save(path)
             .unwrap_or_else(|error| panic!("failed to save test PDF: {error}"));
+    }
+
+    fn notebook_fixture() -> String {
+        serde_json::json!({
+            "cells": [
+                {
+                    "cell_type": "markdown",
+                    "id": "intro",
+                    "metadata": {},
+                    "source": ["# Hello\n"]
+                }
+            ],
+            "metadata": {},
+            "nbformat": 4,
+            "nbformat_minor": 5
+        })
+        .to_string()
     }
 }

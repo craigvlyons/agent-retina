@@ -355,31 +355,4 @@ impl CliShell {
             structured_rows_detected,
         ))
     }
-
-    pub(crate) fn write_file(path: &Path, content: &str, overwrite: bool) -> Result<(usize, bool, bool)> {
-        let path = Self::resolve_path(path)?;
-        let existed_before = path.exists();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        if existed_before && !overwrite {
-            return Err(KernelError::Validation(format!(
-                "refusing to overwrite existing file {} without overwrite=true",
-                path.display()
-            )));
-        }
-        fs::write(&path, content)?;
-        Ok((content.len(), !existed_before, existed_before))
-    }
-
-    pub(crate) fn append_file(path: &Path, content: &str) -> Result<(usize, bool)> {
-        let path = Self::resolve_path(path)?;
-        let existed_before = path.exists();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-        file.write_all(content.as_bytes())?;
-        Ok((content.len(), !existed_before))
-    }
 }

@@ -97,24 +97,77 @@ pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
             query,
             preview_search_matches(matches)
         ),
+        ActionResult::McpResources { server, resources } => format!(
+            "listed {} MCP resource{}{}",
+            resources.len(),
+            if resources.len() == 1 { "" } else { "s" },
+            server
+                .as_ref()
+                .map(|name| format!(" from {name}"))
+                .unwrap_or_default()
+        ),
+        ActionResult::McpResourceRead(result) => format!(
+            "read MCP resource {} from {} ({} content item{})",
+            result.uri,
+            result.server,
+            result.contents.len(),
+            if result.contents.len() == 1 { "" } else { "s" }
+        ),
+        ActionResult::McpToolCall(result) => format!(
+            "called MCP tool {}/{}{}",
+            result.server,
+            result.tool,
+            if result.is_error { " with error" } else { "" }
+        ),
         ActionResult::FileWrite {
             path,
+            mutation_kind,
             bytes_written,
-            created,
-            overwritten,
-            appended,
+            patch_summary,
+            preview_excerpt,
+            artifact,
+            ..
         } => {
-            let verb = if *appended {
-                if *created { "created and appended to" } else { "appended to" }
-            } else if *overwritten {
-                "overwrote"
-            } else if *created {
-                "created"
-            } else {
-                "wrote"
+            let verb = match mutation_kind {
+                FileMutationKind::Create => "created",
+                FileMutationKind::Overwrite => "overwrote",
+                FileMutationKind::Append => "appended to",
+                FileMutationKind::ExactEdit => "edited",
+                FileMutationKind::NotebookReplace => "updated notebook",
+                FileMutationKind::NotebookInsert => "inserted notebook cells into",
+                FileMutationKind::NotebookDelete => "deleted notebook cells from",
             };
-            format!("{verb} {} ({} bytes)", path.display(), bytes_written)
+            let patch = patch_summary
+                .as_ref()
+                .map(|summary| {
+                    format!(
+                        " [{} match(es), {} replacement(s)]",
+                        summary.matched_occurrences, summary.replaced_occurrences
+                    )
+                })
+                .unwrap_or_default();
+            let preview = preview_excerpt
+                .as_ref()
+                .map(|value| format!(": {}", preview_text(value, 120)))
+                .unwrap_or_default();
+            let content_note = if artifact.final_content.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " [artifact chars={}]",
+                    artifact.final_content.chars().count()
+                )
+            };
+            format!(
+                "{verb} {} ({} bytes){patch}{content_note}{preview}",
+                path.display(),
+                bytes_written,
+            )
         }
+        ActionResult::DelegatedTask(result) => format!(
+            "delegated child {} finished with {:?}: {}",
+            result.agent_id, result.status, result.summary
+        ),
         ActionResult::NoteRecorded { note } => format!("recorded note: {}", note),
         ActionResult::Response { message } => format!("responded: {}", message),
     }
@@ -235,19 +288,65 @@ pub(crate) fn compact_action_result_for_context(
                 }))
                 .collect::<Vec<_>>(),
         }),
+        ActionResult::McpResources { server, resources } => serde_json::json!({
+            "type": "mcp_resources",
+            "server": server,
+            "count": resources.len(),
+            "resources": resources.iter().take(12).collect::<Vec<_>>(),
+        }),
+        ActionResult::McpResourceRead(result) => serde_json::json!({
+            "type": "mcp_resource_read",
+            "server": result.server,
+            "uri": result.uri,
+            "contents": result.contents,
+        }),
+        ActionResult::McpToolCall(result) => serde_json::json!({
+            "type": "mcp_tool_call",
+            "server": result.server,
+            "tool": result.tool,
+            "is_error": result.is_error,
+            "content_preview": preview_text(&result.content_preview, 4000),
+            "structured_content": result.structured_content,
+        }),
         ActionResult::FileWrite {
             path,
+            mutation_kind,
             bytes_written,
             created,
             overwritten,
             appended,
+            original_hash,
+            updated_hash,
+            changed_line_count,
+            patch_summary,
+            preview_excerpt,
+            artifact,
         } => serde_json::json!({
             "type": "file_write",
             "path": path,
+            "mutation_kind": mutation_kind,
             "bytes_written": bytes_written,
             "created": created,
             "overwritten": overwritten,
             "appended": appended,
+            "original_hash": original_hash,
+            "updated_hash": updated_hash,
+            "changed_line_count": changed_line_count,
+            "patch_summary": patch_summary,
+            "preview_excerpt": preview_excerpt,
+            "artifact": {
+                "original_content": artifact.original_content.as_ref().map(|content| preview_text(content, 4000)),
+                "final_content": preview_text(&artifact.final_content, 8000),
+            },
+        }),
+        ActionResult::DelegatedTask(result) => serde_json::json!({
+            "type": "delegated_task",
+            "agent_id": result.agent_id,
+            "task_id": result.task_id,
+            "parent_task_id": result.parent_task_id,
+            "status": result.status,
+            "summary": preview_text(&result.summary, 200),
+            "output_path": result.output_path,
         }),
         ActionResult::NoteRecorded { note } => serde_json::json!({
             "type": "note",
@@ -357,14 +456,23 @@ pub(crate) fn summarize_verified_facts(
 ) -> Vec<String> {
     let mut facts = Vec::new();
 
-    for source in prioritized_working_sources(working_sources).into_iter().take(5) {
+    for source in prioritized_working_sources(working_sources)
+        .into_iter()
+        .take(5)
+    {
         let fact = match (source.role.as_str(), source.status.as_str()) {
             ("authoritative", "read") => format!("authoritative file read from {}", source.locator),
             ("authoritative", "excerpted") => {
-                format!("authoritative document text extracted from {}", source.locator)
+                format!(
+                    "authoritative document text extracted from {}",
+                    source.locator
+                )
             }
             ("authoritative", "ingested") => {
-                format!("authoritative structured data ingested from {}", source.locator)
+                format!(
+                    "authoritative structured data ingested from {}",
+                    source.locator
+                )
             }
             ("generated", status) => format!("produced artifact {} ({status})", source.locator),
             (_, "matched") => format!("candidate source identified at {}", source.locator),
@@ -376,15 +484,26 @@ pub(crate) fn summarize_verified_facts(
         push_unique(&mut facts, fact);
     }
 
-    for reference in prioritized_artifact_references(references).into_iter().take(5) {
+    for reference in prioritized_artifact_references(references)
+        .into_iter()
+        .take(5)
+    {
         let fact = match reference.status.as_str() {
             "read" => format!("exact evidence kept for {}", reference.locator),
-            "structured_read" => format!("exact structured evidence kept for {}", reference.locator),
+            "structured_read" => {
+                format!("exact structured evidence kept for {}", reference.locator)
+            }
             "extracted" => format!("exact extracted evidence kept for {}", reference.locator),
-            "matched" => format!("candidate artifact reference kept for {}", reference.locator),
+            "matched" => format!(
+                "candidate artifact reference kept for {}",
+                reference.locator
+            ),
             "searched" => format!("search evidence kept for {}", reference.locator),
             "created" | "written" | "overwritten" | "appended" | "command_changed" => {
-                format!("output or changed artifact tracked at {}", reference.locator)
+                format!(
+                    "output or changed artifact tracked at {}",
+                    reference.locator
+                )
             }
             _ => format!("{} {}", reference.status, reference.locator),
         };
@@ -523,6 +642,29 @@ pub(crate) fn artifact_references_for_result(result: &ActionResult) -> Vec<Artif
                 status: "searched".to_string(),
             })
             .collect(),
+        ActionResult::McpResources { resources, .. } => resources
+            .iter()
+            .take(8)
+            .map(|resource| ArtifactReference {
+                kind: "mcp_resource".to_string(),
+                locator: format!("{}/{}", resource.server, resource.uri),
+                status: "listed".to_string(),
+            })
+            .collect(),
+        ActionResult::McpResourceRead(result) => vec![ArtifactReference {
+            kind: "mcp_resource".to_string(),
+            locator: format!("{}/{}", result.server, result.uri),
+            status: "read".to_string(),
+        }],
+        ActionResult::McpToolCall(result) => vec![ArtifactReference {
+            kind: "mcp_tool".to_string(),
+            locator: format!("{}/{}", result.server, result.tool),
+            status: if result.is_error {
+                "failed".to_string()
+            } else {
+                "executed".to_string()
+            },
+        }],
         ActionResult::FileWrite {
             path,
             created,
@@ -542,6 +684,21 @@ pub(crate) fn artifact_references_for_result(result: &ActionResult) -> Vec<Artif
                 "written".to_string()
             },
         }],
+        ActionResult::DelegatedTask(result) => {
+            let mut refs = vec![ArtifactReference {
+                kind: "task".to_string(),
+                locator: result.task_id.to_string(),
+                status: format!("delegated_{:?}", result.status).to_lowercase(),
+            }];
+            if let Some(path) = &result.output_path {
+                refs.push(ArtifactReference {
+                    kind: "file".to_string(),
+                    locator: path.display().to_string(),
+                    status: "child_output".to_string(),
+                });
+            }
+            refs
+        }
         ActionResult::NoteRecorded { .. } | ActionResult::Response { .. } => Vec::new(),
     }
 }
@@ -673,11 +830,68 @@ pub(crate) fn working_sources_for_result(
                 preview_excerpt: Some(preview_text(&item.line, 100)),
             })
             .collect(),
+        ActionResult::McpResources { resources, .. } => resources
+            .iter()
+            .take(8)
+            .map(|resource| WorkingSource {
+                kind: "mcp_resource".to_string(),
+                locator: format!("{}/{}", resource.server, resource.uri),
+                role: "candidate".to_string(),
+                status: "listed".to_string(),
+                why_it_matters: "MCP resource discovered as potential task evidence".to_string(),
+                last_used_step: step_index,
+                evidence_refs: vec![format!("{}/{}", resource.server, resource.uri)],
+                page_reference: None,
+                extraction_method: Some("mcp_list_resources".to_string()),
+                structured_summary: None,
+                preview_excerpt: resource.description.clone(),
+            })
+            .collect(),
+        ActionResult::McpResourceRead(result) => vec![WorkingSource {
+            kind: "mcp_resource".to_string(),
+            locator: format!("{}/{}", result.server, result.uri),
+            role: "authoritative".to_string(),
+            status: "read".to_string(),
+            why_it_matters: "MCP resource content is informing the current task".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![format!("{}/{}", result.server, result.uri)],
+            page_reference: None,
+            extraction_method: Some("mcp_read_resource".to_string()),
+            structured_summary: None,
+            preview_excerpt: result
+                .contents
+                .iter()
+                .find_map(|content| content.text.clone())
+                .map(|text| preview_text(&text, 100)),
+        }],
+        ActionResult::McpToolCall(result) => vec![WorkingSource {
+            kind: "mcp_tool".to_string(),
+            locator: format!("{}/{}", result.server, result.tool),
+            role: if result.is_error {
+                "supporting".to_string()
+            } else {
+                "authoritative".to_string()
+            },
+            status: if result.is_error {
+                "failed".to_string()
+            } else {
+                "executed".to_string()
+            },
+            why_it_matters: "MCP tool output contributed external task evidence".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![format!("{}/{}", result.server, result.tool)],
+            page_reference: None,
+            extraction_method: Some("mcp_call".to_string()),
+            structured_summary: None,
+            preview_excerpt: Some(preview_text(&result.content_preview, 100)),
+        }],
         ActionResult::FileWrite {
             path,
             created,
             overwritten,
             appended,
+            preview_excerpt,
+            artifact,
             ..
         } => vec![WorkingSource {
             kind: "file".to_string(),
@@ -698,7 +912,9 @@ pub(crate) fn working_sources_for_result(
             page_reference: None,
             extraction_method: Some("file_write".to_string()),
             structured_summary: None,
-            preview_excerpt: None,
+            preview_excerpt: preview_excerpt
+                .clone()
+                .or_else(|| Some(preview_text(&artifact.final_content, 100))),
         }],
         ActionResult::Command(command) => {
             let mut sources = vec![WorkingSource {
@@ -735,6 +951,19 @@ pub(crate) fn working_sources_for_result(
             }));
             sources
         }
+        ActionResult::DelegatedTask(result) => vec![WorkingSource {
+            kind: "local_agent".to_string(),
+            locator: result.task_id.to_string(),
+            role: "supporting".to_string(),
+            status: format!("{:?}", result.status).to_lowercase(),
+            why_it_matters: "delegated child worker completed bounded subtask work".to_string(),
+            last_used_step: step_index,
+            evidence_refs: vec![result.task_id.to_string()],
+            page_reference: None,
+            extraction_method: Some("agent_spawn".to_string()),
+            structured_summary: None,
+            preview_excerpt: Some(preview_text(&result.summary, 100)),
+        }],
         ActionResult::NoteRecorded { note } => vec![WorkingSource {
             kind: "note".to_string(),
             locator: preview_text(note, 80),
@@ -776,21 +1005,29 @@ fn normalize_command_family(command: &str) -> String {
     }
 
     if normalized.starts_with("pgrep ") {
-        if let Some(target) = subject.clone().or_else(|| extract_last_non_flag_token(&normalized)) {
+        if let Some(target) = subject
+            .clone()
+            .or_else(|| extract_last_non_flag_token(&normalized))
+        {
             return format!("process_check:{target}");
         }
         return "process_check".to_string();
     }
 
     if normalized.contains("pkill ") || normalized.starts_with("killall ") {
-        if let Some(target) = subject.clone().or_else(|| extract_last_non_flag_token(&normalized)) {
+        if let Some(target) = subject
+            .clone()
+            .or_else(|| extract_last_non_flag_token(&normalized))
+        {
             return format!("process_kill:{target}");
         }
         return "process_kill".to_string();
     }
 
     if normalized.contains("osascript") && normalized.contains("quit app") {
-        if let Some(target) = subject.or_else(|| extract_quoted_app_name(command).map(|name| name.to_ascii_lowercase())) {
+        if let Some(target) = subject
+            .or_else(|| extract_quoted_app_name(command).map(|name| name.to_ascii_lowercase()))
+        {
             return format!("app_quit:{}", target.to_ascii_lowercase());
         }
         return "app_quit".to_string();
@@ -842,7 +1079,11 @@ fn extract_grep_target(command: &str) -> Option<String> {
             if candidate == "grep" || candidate == "|" {
                 break;
             }
-            return Some(candidate.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase());
+            return Some(
+                candidate
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_ascii_lowercase(),
+            );
         }
     }
     None
@@ -853,7 +1094,11 @@ fn extract_last_non_flag_token(command: &str) -> Option<String> {
         .split_whitespace()
         .rev()
         .find(|token| !token.starts_with('-') && *token != "|" && *token != "&&")
-        .map(|token| token.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase())
+        .map(|token| {
+            token
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_ascii_lowercase()
+        })
 }
 
 fn extract_quoted_app_name(command: &str) -> Option<String> {

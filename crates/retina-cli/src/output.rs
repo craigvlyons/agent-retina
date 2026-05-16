@@ -1,5 +1,6 @@
 use crate::controller::WorkerOverview;
 use retina_memory_sqlite::MemoryStats;
+use retina_runtime::RuntimeTask;
 use retina_types::*;
 use serde_json::Value;
 
@@ -148,21 +149,145 @@ pub fn render_action_result(result: &ActionResult) -> String {
         ),
         ActionResult::FileWrite {
             path,
+            mutation_kind,
             bytes_written,
-            created,
-            overwritten,
-            appended,
+            original_hash,
+            updated_hash,
+            changed_line_count,
+            patch_summary,
+            preview_excerpt,
+            artifact,
+            ..
         } => {
-            let verb = if *appended {
-                if *created { "Created and appended" } else { "Appended" }
-            } else if *overwritten {
-                "Overwrote"
-            } else if *created {
-                "Created"
-            } else {
-                "Wrote"
+            let verb = match mutation_kind {
+                FileMutationKind::Create => "Created",
+                FileMutationKind::Overwrite => "Overwrote",
+                FileMutationKind::Append => "Appended",
+                FileMutationKind::ExactEdit => "Edited",
+                FileMutationKind::NotebookReplace => "Updated notebook cell(s) in",
+                FileMutationKind::NotebookInsert => "Inserted notebook cell(s) into",
+                FileMutationKind::NotebookDelete => "Deleted notebook cell(s) from",
             };
-            format!("{verb} {} byte(s) {}", bytes_written, path.display())
+            let hash_note = original_hash
+                .as_ref()
+                .map(|hash| format!("\nprevious_hash: {hash}"))
+                .unwrap_or_default();
+            let patch_note = patch_summary
+                .as_ref()
+                .map(|summary| {
+                    format!(
+                        "\npatch: matched={} replaced={} old=`{}` new=`{}`",
+                        summary.matched_occurrences,
+                        summary.replaced_occurrences,
+                        summary.old_preview,
+                        summary.new_preview
+                    )
+                })
+                .unwrap_or_default();
+            let preview_note = preview_excerpt
+                .as_ref()
+                .map(|preview| format!("\npreview: {}", preview))
+                .unwrap_or_default();
+            let original_note = artifact
+                .original_content
+                .as_ref()
+                .map(|content| format!("\noriginal_chars: {}", content.chars().count()))
+                .unwrap_or_default();
+            let final_note = format!("\nfinal_chars: {}", artifact.final_content.chars().count());
+            format!(
+                "{verb} {} ({} byte(s), {} changed line(s))\nupdated_hash: {}{}{}{}{}{}",
+                path.display(),
+                bytes_written,
+                changed_line_count,
+                updated_hash,
+                hash_note,
+                original_note,
+                final_note,
+                patch_note,
+                preview_note
+            )
+        }
+        ActionResult::DelegatedTask(result) => format!(
+            "Delegated child {} finished with {:?} for task {}{}\n{}",
+            result.agent_id,
+            result.status,
+            result.task_id,
+            result
+                .output_path
+                .as_ref()
+                .map(|path| format!(" output={}", path.display()))
+                .unwrap_or_default(),
+            result.summary
+        ),
+        ActionResult::McpResources { server, resources } => {
+            let scope = server
+                .as_ref()
+                .map(|value| format!(" for server {value}"))
+                .unwrap_or_else(|| " across configured servers".to_string());
+            let body = if resources.is_empty() {
+                "(no MCP resources found)".to_string()
+            } else {
+                resources
+                    .iter()
+                    .map(|resource| {
+                        format!(
+                            "- [{}] {} ({})",
+                            resource.server, resource.name, resource.uri
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!("MCP resources{scope}\n{body}")
+        }
+        ActionResult::McpResourceRead(result) => {
+            let body = if result.contents.is_empty() {
+                "(resource returned no content)".to_string()
+            } else {
+                result
+                    .contents
+                    .iter()
+                    .map(|item| {
+                        let mime = item
+                            .mime_type
+                            .as_deref()
+                            .map(|value| format!(" mime={value}"))
+                            .unwrap_or_default();
+                        let text = item
+                            .text
+                            .as_deref()
+                            .map(str::to_string)
+                            .or_else(|| {
+                                item.blob_base64.as_ref().map(|blob| {
+                                    format!("[binary content: {} base64 chars]", blob.len())
+                                })
+                            })
+                            .unwrap_or_else(|| "(empty item)".to_string());
+                        format!("- {}{}\n{}", item.uri, mime, text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            format!(
+                "Read MCP resource [{}] {}\n{}",
+                result.server, result.uri, body
+            )
+        }
+        ActionResult::McpToolCall(result) => {
+            let content = result
+                .structured_content
+                .as_ref()
+                .map(|value| {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                })
+                .unwrap_or_else(|| result.content_preview.clone());
+            format!(
+                "Called MCP tool [{}] {}\nerror: {}\n{}",
+                result.server,
+                result.tool,
+                if result.is_error { "yes" } else { "no" },
+                content,
+            )
         }
         ActionResult::NoteRecorded { note } => format!("Recorded note: {note}"),
         ActionResult::Response { message } => message.clone(),
@@ -192,11 +317,6 @@ pub fn render_timeline_event(event: &TimelineEvent) -> String {
 }
 
 pub fn render_task_state(task_state: &TaskState) -> String {
-    let blockers = if task_state.frontier.blockers.is_empty() {
-        "(none)".to_string()
-    } else {
-        task_state.frontier.blockers.join("\n- ")
-    };
     let sources = if task_state.working_sources.is_empty() {
         "(none)".to_string()
     } else {
@@ -274,18 +394,13 @@ pub fn render_task_state(task_state: &TaskState) -> String {
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "goal: {}\nphase: {}\nstep: {} / {}\noutput_written: {}\noutput_verified: {}\nblockers:\n{}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
+        "goal: {}\nphase: {}\nstep: {} / {}\noutput_written: {}\noutput_verified: {}\n\nworking_sources:\n{}\n\nartifacts:\n{}\n\ncompaction:\n{}\n",
         task_state.goal.objective,
         task_state.progress.current_phase,
         task_state.progress.current_step,
         task_state.progress.max_steps,
         task_state.progress.output_written,
         task_state.progress.output_verified,
-        if blockers == "(none)" {
-            blockers
-        } else {
-            format!("- {blockers}")
-        },
         sources,
         artifacts,
         compaction
@@ -380,47 +495,12 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .get("task_state")
             .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
             .map(|_| "context ready".to_string()),
-        TimelineEventType::TaskStepCompleted => event
+        TimelineEventType::ActionResultReceived => event
             .payload_json
-            .get("task_state")
-            .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
-            .and_then(|task_state| {
-                let responded = task_state
-                    .recent_actions
-                    .last()
-                    .map(|summary| summary.action.starts_with("respond:"))
-                    .unwrap_or(false);
-                if responded {
-                    return None;
-                }
-                task_state
-                    .frontier
-                    .blockers
-                    .first()
-                    .map(|blocker| format!("blocked: {blocker}"))
-                    .or_else(|| {
-                        task_state
-                            .working_sources
-                            .iter()
-                            .max_by_key(|source| source.last_used_step)
-                            .map(|source| {
-                            let preview = source
-                                .preview_excerpt
-                                .as_ref()
-                                .map(|value| format!(" | {}", value))
-                                .unwrap_or_default();
-                            let method = source
-                                .extraction_method
-                                .as_ref()
-                                .map(|value| format!(" via {value}"))
-                                .unwrap_or_default();
-                            format!(
-                                "observed: {} [{}{}]{}",
-                                source.locator, source.status, method, preview
-                            )
-                        })
-                    })
-            }),
+            .get("result")
+            .and_then(|value| serde_json::from_value::<ActionResult>(value.clone()).ok())
+            .and_then(render_observed_result),
+        TimelineEventType::TaskStepCompleted => None,
         TimelineEventType::ReflectionRequested => event
             .payload_json
             .get("reason")
@@ -449,6 +529,166 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
     line.map(|line| format!("{line}\n")).unwrap_or_default()
 }
 
+fn render_observed_result(result: ActionResult) -> Option<String> {
+    match result {
+        ActionResult::Command(result) => {
+            let preview = compact_preview(&result.stdout)
+                .or_else(|| compact_preview(&result.stderr))
+                .unwrap_or_default();
+            let suffix = if preview.is_empty() {
+                String::new()
+            } else {
+                format!(" | {preview}")
+            };
+            Some(format!(
+                "observed: {} [executed via run_command]{}",
+                result.command, suffix
+            ))
+        }
+        ActionResult::Inspection(state) => {
+            Some(format!("observed: {} [inspected]", state.cwd.display()))
+        }
+        ActionResult::DirectoryListing { root, .. } => {
+            Some(format!("observed: {} [listed]", root.display()))
+        }
+        ActionResult::FileMatches {
+            root,
+            pattern,
+            matches,
+        } => Some(format!(
+            "observed: {} [matched {} under {}]",
+            pattern,
+            matches.len(),
+            root.display()
+        )),
+        ActionResult::FileRead {
+            path,
+            content,
+            truncated,
+        } => Some(format!(
+            "observed: {} [read via text_read]{}",
+            path.display(),
+            preview_suffix(&content, truncated)
+        )),
+        ActionResult::StructuredData {
+            path,
+            extraction_method,
+            headers,
+            ..
+        } => {
+            let preview = if headers.is_empty() {
+                String::new()
+            } else {
+                format!(" | headers: {}", headers.join(", "))
+            };
+            Some(format!(
+                "observed: {} [structured_read via {}]{}",
+                path.display(),
+                extraction_method,
+                preview
+            ))
+        }
+        ActionResult::DocumentText {
+            path,
+            content,
+            truncated,
+            extraction_method,
+            ..
+        } => Some(format!(
+            "observed: {} [extracted via {}]{}",
+            path.display(),
+            extraction_method,
+            preview_suffix(&content, truncated)
+        )),
+        ActionResult::TextSearch {
+            root,
+            query,
+            matches,
+        } => Some(format!(
+            "observed: {} [search '{}' matched {}]",
+            root.display(),
+            query,
+            matches.len()
+        )),
+        ActionResult::FileWrite {
+            path,
+            mutation_kind,
+            preview_excerpt,
+            ..
+        } => {
+            let status = match mutation_kind {
+                FileMutationKind::Create => "created",
+                FileMutationKind::Overwrite => "written",
+                FileMutationKind::Append => "appended",
+                FileMutationKind::ExactEdit => "edited",
+                FileMutationKind::NotebookReplace
+                | FileMutationKind::NotebookInsert
+                | FileMutationKind::NotebookDelete => "updated",
+            };
+            let preview = preview_excerpt
+                .as_deref()
+                .and_then(compact_preview)
+                .map(|value| format!(" | {value}"))
+                .unwrap_or_default();
+            Some(format!(
+                "observed: {} [{} via file_write]{}",
+                path.display(),
+                status,
+                preview
+            ))
+        }
+        ActionResult::DelegatedTask(result) => Some(format!(
+            "observed: delegated child {} [{:?}] | {}",
+            result.agent_id, result.status, result.summary
+        )),
+        ActionResult::McpResources { server, resources } => Some(format!(
+            "observed: MCP resources [{}] | {} item(s)",
+            server.unwrap_or_else(|| "all servers".to_string()),
+            resources.len()
+        )),
+        ActionResult::McpResourceRead(result) => Some(format!(
+            "observed: MCP resource {} [{}]",
+            result.uri, result.server
+        )),
+        ActionResult::McpToolCall(result) => {
+            let preview = compact_preview(&result.content_preview)
+                .map(|value| format!(" | {value}"))
+                .unwrap_or_default();
+            Some(format!(
+                "observed: MCP tool {} [{}]{}",
+                result.tool, result.server, preview
+            ))
+        }
+        ActionResult::NoteRecorded { note } => Some(format!("observed: note recorded | {note}")),
+        ActionResult::Response { .. } => None,
+    }
+}
+
+fn preview_suffix(content: &str, truncated: bool) -> String {
+    compact_preview(content)
+        .map(|value| {
+            if truncated {
+                format!(" | {}...", value.trim_end_matches("..."))
+            } else {
+                format!(" | {value}")
+            }
+        })
+        .unwrap_or_default()
+}
+
+fn compact_preview(content: &str) -> Option<String> {
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    const MAX_CHARS: usize = 120;
+    if collapsed.chars().count() <= MAX_CHARS {
+        return Some(collapsed);
+    }
+    let preview = collapsed.chars().take(MAX_CHARS).collect::<String>();
+    Some(format!("{preview}..."))
+}
+
 fn humanize_action_label(label: &str) -> String {
     if let Some(value) = label.strip_prefix("run_command:") {
         return format!("run command `{value}`");
@@ -469,8 +709,14 @@ fn humanize_action_label(label: &str) -> String {
     if let Some(value) = label.strip_prefix("write_file:") {
         return format!("write file {}", value);
     }
+    if let Some(value) = label.strip_prefix("edit_file:") {
+        return format!("edit file {}", value);
+    }
     if let Some(value) = label.strip_prefix("append_file:") {
         return format!("append file {}", value);
+    }
+    if let Some(value) = label.strip_prefix("edit_notebook:") {
+        return format!("edit notebook {}", value);
     }
     if let Some(value) = label.strip_prefix("inspect_path:") {
         return format!("inspect path {}", value);
@@ -608,9 +854,40 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let allowed_tools = if overview.manifest.allowed_tools.is_empty() {
+        "(inherited from authority)".to_string()
+    } else {
+        overview.manifest.allowed_tools.join(", ")
+    };
+    let denied_tools = if overview.manifest.denied_tools.is_empty() {
+        "(none)".to_string()
+    } else {
+        overview.manifest.denied_tools.join(", ")
+    };
+    let required_mcp_servers = if overview.manifest.required_mcp_servers.is_empty() {
+        "(none)".to_string()
+    } else {
+        overview.manifest.required_mcp_servers.join(", ")
+    };
+    let role_prompt = overview
+        .manifest
+        .role_prompt
+        .clone()
+        .unwrap_or_else(|| "(none)".to_string());
+    let initial_prompt = overview
+        .manifest
+        .initial_prompt
+        .clone()
+        .unwrap_or_else(|| "(none)".to_string());
+    let agent_model = overview
+        .manifest
+        .model_id
+        .clone()
+        .unwrap_or_else(|| "(inherit runtime default)".to_string());
+    let runtime_tasks = render_runtime_tasks_inline(&overview.runtime_tasks);
 
     format!(
-        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\ncompaction:\n- task_compactions: {}\n- cache_reads: {}\n- cache_creations: {}\n\nclaude_runtime:\n- model: {}\n- prompt_caching: {}\n- context_editing: {}\n- tool_result_trigger_tokens: {}\n- server_compaction_requested: {}\n- server_compaction_supported: {}\n- server_compaction_effective: {}\n- compaction_trigger_tokens: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
+        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\nruntime_tasks:\n{}\ncompaction:\n- task_compactions: {}\n- cache_reads: {}\n- cache_creations: {}\n\nclaude_runtime:\n- model: {}\n- prompt_caching: {}\n- context_editing: {}\n- tool_result_trigger_tokens: {}\n- server_compaction_requested: {}\n- server_compaction_supported: {}\n- server_compaction_effective: {}\n- compaction_trigger_tokens: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nagent_model:\n{}\n\nrole_prompt:\n{}\n\ninitial_prompt:\n{}\n\ntool_scope:\n- allowed: {}\n- denied: {}\n- required_mcp_servers: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
         overview.manifest.agent_id.0,
         overview.manifest.domain,
         overview.manifest.status,
@@ -638,6 +915,7 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
         overview.terminal_tasks.failed,
         overview.terminal_tasks.cancelled,
         overview.terminal_tasks.blocked,
+        runtime_tasks,
         overview.compaction_stats.compaction_events,
         overview.compaction_stats.cache_reads,
         overview.compaction_stats.cache_creations,
@@ -658,9 +936,66 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
             .idle_archive_after_hours
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string()),
+        agent_model,
+        role_prompt,
+        initial_prompt,
+        allowed_tools,
+        denied_tools,
+        required_mcp_servers,
         authority_roots,
         active_rule_preview
     )
+}
+
+pub fn render_runtime_tasks(tasks: &[RuntimeTask]) -> String {
+    if tasks.is_empty() {
+        return "runtime_tasks:\n- (none)\n".to_string();
+    }
+    format!("runtime_tasks:\n{}", render_runtime_tasks_inline(tasks))
+}
+
+fn render_runtime_tasks_inline(tasks: &[RuntimeTask]) -> String {
+    if tasks.is_empty() {
+        return "- (none)\n".to_string();
+    }
+    tasks
+        .iter()
+        .map(|task| {
+            let terminal = if task.status.is_terminal() {
+                " terminal"
+            } else {
+                ""
+            };
+            let output = task
+                .output_path
+                .as_ref()
+                .map(|path| format!(" output={}", path.display()))
+                .unwrap_or_default();
+            let parent = task
+                .parent_task_id
+                .as_ref()
+                .map(|parent| format!(" parent={parent}"))
+                .unwrap_or_default();
+            let summary = task
+                .progress_summary
+                .as_deref()
+                .unwrap_or("(no progress summary)");
+            format!(
+                "- {} [{:?}|{:?}{}] owner={}{} updated={}{} :: {}",
+                task.task_id,
+                task.task_kind,
+                task.status,
+                terminal,
+                task.owner_agent_id,
+                parent,
+                task.last_activity.to_rfc3339(),
+                output,
+                summary
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 pub fn render_stats(stats: &MemoryStats) -> String {
@@ -677,49 +1012,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn task_step_completed_prefers_frontier_blockers_in_chat_output() {
-        let task_state = TaskState {
-            goal: TaskGoal {
-                objective: "create output".to_string(),
-                constraints: vec![],
-            },
-            progress: TaskProgress {
-                current_phase: "working".to_string(),
-                current_step: 2,
-                max_steps: 6,
-                completed_checkpoints: vec![],
-                verified_facts: vec![],
-                output_written: false,
-                output_verified: false,
-            },
-            frontier: TaskFrontier {
-                blockers: vec!["required input still not ingested: dominican_Med.pdf".to_string()],
-            },
-            recent_actions: vec![],
-            working_sources: vec![WorkingSource {
-                locator: "dominican.txt".to_string(),
-                kind: "text".to_string(),
-                role: "supporting".to_string(),
-                status: "read".to_string(),
-                why_it_matters: "source".to_string(),
-                last_used_step: 1,
-                evidence_refs: vec![],
-                page_reference: None,
-                extraction_method: None,
-                structured_summary: None,
-                preview_excerpt: None,
-            }],
-            artifact_references: vec![],
-            avoid: vec![],
-            compaction: None,
-        };
-
+    fn action_result_received_renders_file_read_observation() {
         let event = TimelineEvent {
             event_id: EventId::new(),
             session_id: SessionId::new(),
             task_id: TaskId::new(),
             agent_id: AgentId::new(),
-            event_type: TimelineEventType::TaskStepCompleted,
+            event_type: TimelineEventType::ActionResultReceived,
             timestamp: Utc::now(),
             intent_id: None,
             action_id: None,
@@ -727,59 +1026,29 @@ mod tests {
             post_state_hash: None,
             duration_ms: None,
             payload_json: json!({
-                "task_state": task_state
+                "result": ActionResult::FileRead {
+                    path: "/tmp/plan.pdf".into(),
+                    content: "panel schedule and electrical notes".to_string(),
+                    truncated: false,
+                }
             }),
             delta_summary: None,
         };
 
         assert_eq!(
             render_chat_event(&event, false),
-            "blocked: required input still not ingested: dominican_Med.pdf\n"
+            "observed: /tmp/plan.pdf [read via text_read] | panel schedule and electrical notes\n"
         );
     }
 
     #[test]
-    fn task_step_completed_uses_observed_status_for_sources() {
-        let task_state = TaskState {
-            goal: TaskGoal {
-                objective: "summarize pdf".to_string(),
-                constraints: vec![],
-            },
-            progress: TaskProgress {
-                current_phase: "working".to_string(),
-                current_step: 2,
-                max_steps: 50,
-                completed_checkpoints: vec![],
-                verified_facts: vec![],
-                output_written: false,
-                output_verified: false,
-            },
-            frontier: TaskFrontier { blockers: vec![] },
-            recent_actions: vec![],
-            working_sources: vec![WorkingSource {
-                locator: "plan.pdf".to_string(),
-                kind: "document".to_string(),
-                role: "authoritative".to_string(),
-                status: "excerpted".to_string(),
-                why_it_matters: "source".to_string(),
-                last_used_step: 2,
-                evidence_refs: vec!["plan.pdf".to_string()],
-                page_reference: None,
-                extraction_method: Some("pdf_extract".to_string()),
-                structured_summary: None,
-                preview_excerpt: Some("panel schedule and electrical notes".to_string()),
-            }],
-            artifact_references: vec![],
-            avoid: vec![],
-            compaction: None,
-        };
-
+    fn action_result_received_renders_file_write_preview() {
         let event = TimelineEvent {
             event_id: EventId::new(),
             session_id: SessionId::new(),
             task_id: TaskId::new(),
             agent_id: AgentId::new(),
-            event_type: TimelineEventType::TaskStepCompleted,
+            event_type: TimelineEventType::ActionResultReceived,
             timestamp: Utc::now(),
             intent_id: None,
             action_id: None,
@@ -787,52 +1056,41 @@ mod tests {
             post_state_hash: None,
             duration_ms: None,
             payload_json: json!({
-                "task_state": task_state
+                "result": ActionResult::FileWrite {
+                    path: "/Users/macc/Desktop/transcript/notes_summary.md".into(),
+                    mutation_kind: FileMutationKind::Create,
+                    bytes_written: 10,
+                    created: true,
+                    overwritten: false,
+                    appended: false,
+                    original_hash: None,
+                    updated_hash: "hash".to_string(),
+                    changed_line_count: 2,
+                    patch_summary: None,
+                    preview_excerpt: Some("# Summary of Desktop/Notes Files".to_string()),
+                    artifact: FileArtifactPayload {
+                        original_content: None,
+                        final_content: "# Summary of Desktop/Notes Files".to_string(),
+                    },
+                }
             }),
             delta_summary: None,
         };
 
         assert_eq!(
             render_chat_event(&event, false),
-            "observed: plan.pdf [excerpted via pdf_extract] | panel schedule and electrical notes\n"
+            "observed: /Users/macc/Desktop/transcript/notes_summary.md [created via file_write] | # Summary of Desktop/Notes Files\n"
         );
     }
 
     #[test]
-    fn task_step_completed_suppresses_next_gap_after_response() {
-        let task_state = TaskState {
-            goal: TaskGoal {
-                objective: "answer question".to_string(),
-                constraints: vec![],
-            },
-            progress: TaskProgress {
-                current_phase: "working".to_string(),
-                current_step: 2,
-                max_steps: 50,
-                completed_checkpoints: vec![],
-                verified_facts: vec![],
-                output_written: false,
-                output_verified: false,
-            },
-            frontier: TaskFrontier { blockers: vec![] },
-            recent_actions: vec![RecentActionSummary {
-                step: 2,
-                action: "respond:done".to_string(),
-                outcome: "responded to operator".to_string(),
-                artifact_refs: vec![],
-            }],
-            working_sources: vec![],
-            artifact_references: vec![],
-            avoid: vec![],
-            compaction: None,
-        };
-
+    fn action_result_received_prefers_latest_command_result_without_stale_blockers() {
         let event = TimelineEvent {
             event_id: EventId::new(),
             session_id: SessionId::new(),
             task_id: TaskId::new(),
             agent_id: AgentId::new(),
-            event_type: TimelineEventType::TaskStepCompleted,
+            event_type: TimelineEventType::ActionResultReceived,
             timestamp: Utc::now(),
             intent_id: None,
             action_id: None,
@@ -840,79 +1098,18 @@ mod tests {
             post_state_hash: None,
             duration_ms: None,
             payload_json: json!({
-                "task_state": task_state
-            }),
-            delta_summary: None,
-        };
-
-        assert_eq!(render_chat_event(&event, false), "");
-    }
-
-    #[test]
-    fn task_step_completed_prefers_latest_command_observation() {
-        let task_state = TaskState {
-            goal: TaskGoal {
-                objective: "shutdown docker".to_string(),
-                constraints: vec![],
-            },
-            progress: TaskProgress {
-                current_phase: "working".to_string(),
-                current_step: 3,
-                max_steps: 50,
-                completed_checkpoints: vec![],
-                verified_facts: vec![],
-                output_written: false,
-                output_verified: false,
-            },
-            frontier: TaskFrontier { blockers: vec![] },
-            recent_actions: vec![],
-            working_sources: vec![
-                WorkingSource {
-                    locator: "osascript -e 'quit app \"Docker\"'".to_string(),
-                    kind: "command".to_string(),
-                    role: "supporting".to_string(),
-                    status: "executed".to_string(),
-                    why_it_matters: "quit".to_string(),
-                    last_used_step: 2,
-                    evidence_refs: vec![],
-                    page_reference: None,
-                    extraction_method: Some("run_command".to_string()),
-                    structured_summary: None,
-                    preview_excerpt: Some(String::new()),
-                },
-                WorkingSource {
-                    locator: "ps aux | grep -i docker | grep -v grep".to_string(),
-                    kind: "command".to_string(),
-                    role: "supporting".to_string(),
-                    status: "executed".to_string(),
-                    why_it_matters: "status".to_string(),
-                    last_used_step: 3,
-                    evidence_refs: vec![],
-                    page_reference: None,
-                    extraction_method: Some("run_command".to_string()),
-                    structured_summary: None,
-                    preview_excerpt: Some("Docker helper still running".to_string()),
-                },
-            ],
-            artifact_references: vec![],
-            avoid: vec![],
-            compaction: None,
-        };
-
-        let event = TimelineEvent {
-            event_id: EventId::new(),
-            session_id: SessionId::new(),
-            task_id: TaskId::new(),
-            agent_id: AgentId::new(),
-            event_type: TimelineEventType::TaskStepCompleted,
-            timestamp: Utc::now(),
-            intent_id: None,
-            action_id: None,
-            pre_state_hash: None,
-            post_state_hash: None,
-            duration_ms: None,
-            payload_json: json!({
-                "task_state": task_state
+                "result": ActionResult::Command(CommandResult {
+                    command: "ps aux | grep -i docker | grep -v grep".to_string(),
+                    cwd: "/Users/macc/projects/personal/agent-retina".into(),
+                    stdout: "Docker helper still running".to_string(),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    success: true,
+                    duration_ms: 12,
+                    cancelled: false,
+                    termination: None,
+                    observed_paths: vec![],
+                })
             }),
             delta_summary: None,
         };
@@ -921,5 +1118,28 @@ mod tests {
             render_chat_event(&event, false),
             "observed: ps aux | grep -i docker | grep -v grep [executed via run_command] | Docker helper still running\n"
         );
+    }
+
+    #[test]
+    fn task_step_completed_is_silent_in_normal_chat_mode() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskStepCompleted,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "task_state": TaskState::default()
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(render_chat_event(&event, false), "");
     }
 }

@@ -1,4 +1,4 @@
-use crate::{Action, AgentId, HashScope, IntentId, RecentContext, TaskId};
+use crate::{Action, AgentId, HashScope, IntentId, RecentContext, RoutingDecision, TaskId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -8,6 +8,8 @@ pub struct Task {
     pub id: TaskId,
     pub session_id: crate::SessionId,
     pub agent_id: AgentId,
+    #[serde(default)]
+    pub parent_task_id: Option<TaskId>,
     pub description: String,
     pub created_at: DateTime<Utc>,
     #[serde(default)]
@@ -21,9 +23,28 @@ impl Task {
             id: TaskId::new(),
             session_id: crate::SessionId::new(),
             agent_id,
+            parent_task_id: None,
             description: description.into(),
             created_at: Utc::now(),
             recent_context: None,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    pub fn spawn_child(
+        parent: &Task,
+        agent_id: AgentId,
+        description: impl Into<String>,
+        recent_context: Option<RecentContext>,
+    ) -> Self {
+        Self {
+            id: TaskId::new(),
+            session_id: parent.session_id.clone(),
+            agent_id,
+            parent_task_id: Some(parent.id.clone()),
+            description: description.into(),
+            created_at: Utc::now(),
+            recent_context,
             metadata: BTreeMap::new(),
         }
     }
@@ -58,4 +79,18 @@ impl Intent {
             metadata: task.metadata.clone(),
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SpawnAgentRequest {
+    pub parent_task: Task,
+    pub prompt: String,
+    pub allowed_tools: Vec<String>,
+    pub denied_tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RouteAgentRequest {
+    pub parent_task: Task,
+    pub decision: RoutingDecision,
 }

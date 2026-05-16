@@ -95,6 +95,10 @@ impl Memory for MockMemory {
         Ok(recover_mutex(&self.tools).clone())
     }
 
+    fn agent_registry_snapshot(&self) -> Result<AgentRegistrySnapshot> {
+        Ok(AgentRegistrySnapshot::default())
+    }
+
     fn recent_states(&self, limit: usize) -> Result<Vec<TimelineEvent>> {
         Ok(self
             .timeline
@@ -368,14 +372,13 @@ impl Shell for MockShell {
                         exists: content.is_some(),
                         size: content.as_ref().map(|value| value.len() as u64),
                         modified_at: None,
-                        content_hash: content
-                            .as_ref()
-                            .filter(|_| tracked.include_content)
-                            .map(|value| {
+                        content_hash: content.as_ref().filter(|_| tracked.include_content).map(
+                            |value| {
                                 let mut hasher = DefaultHasher::new();
                                 value.hash(&mut hasher);
                                 hasher.finish().to_string()
-                            }),
+                            },
+                        ),
                     }
                 })
                 .collect(),
@@ -524,31 +527,155 @@ impl Shell for MockShell {
                 }),
                 structured_rows_detected: false,
             }),
+            Action::ListMcpResources { server, .. } => Ok(ActionResult::McpResources {
+                server: server.clone(),
+                resources: vec![McpResourceSummary {
+                    server: server.clone().unwrap_or_else(|| "mock".to_string()),
+                    uri: "mock://resource".to_string(),
+                    name: "resource".to_string(),
+                    description: Some("mock resource".to_string()),
+                    mime_type: Some("text/plain".to_string()),
+                }],
+            }),
+            Action::ReadMcpResource { server, uri, .. } => {
+                Ok(ActionResult::McpResourceRead(McpResourceReadResult {
+                    server: server.clone(),
+                    uri: uri.clone(),
+                    contents: vec![McpResourceContentItem {
+                        uri: uri.clone(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: Some("mock MCP resource".to_string()),
+                        blob_base64: None,
+                    }],
+                }))
+            }
+            Action::CallMcpTool { server, tool, .. } => {
+                Ok(ActionResult::McpToolCall(McpToolCallResult {
+                    server: server.clone(),
+                    tool: tool.clone(),
+                    content_preview: "mock MCP tool output".to_string(),
+                    structured_content: None,
+                    is_error: false,
+                }))
+            }
             Action::WriteFile { path, content, .. } => {
                 let mut files = recover_mutex(&self.files);
                 let existed_before = files.insert(path.clone(), content.clone()).is_some();
                 Ok(ActionResult::FileWrite {
                     path: path.clone(),
+                    mutation_kind: if existed_before {
+                        FileMutationKind::Overwrite
+                    } else {
+                        FileMutationKind::Create
+                    },
                     bytes_written: content.len(),
                     created: !existed_before,
                     overwritten: existed_before,
                     appended: false,
+                    original_hash: None,
+                    updated_hash: "mock-hash".to_string(),
+                    changed_line_count: content.lines().count(),
+                    patch_summary: None,
+                    preview_excerpt: Some(content.chars().take(120).collect()),
+                    artifact: FileArtifactPayload {
+                        original_content: None,
+                        final_content: content.clone(),
+                    },
+                })
+            }
+            Action::EditFile {
+                path,
+                old_string,
+                new_string,
+                replace_all,
+                ..
+            } => {
+                let mut files = recover_mutex(&self.files);
+                let current = files.get(path).cloned().unwrap_or_default();
+                let updated = if *replace_all {
+                    current.replace(old_string, new_string)
+                } else {
+                    current.replacen(old_string, new_string, 1)
+                };
+                files.insert(path.clone(), updated.clone());
+                Ok(ActionResult::FileWrite {
+                    path: path.clone(),
+                    mutation_kind: FileMutationKind::ExactEdit,
+                    bytes_written: updated.len(),
+                    created: false,
+                    overwritten: true,
+                    appended: false,
+                    original_hash: None,
+                    updated_hash: "mock-hash".to_string(),
+                    changed_line_count: updated.lines().count(),
+                    patch_summary: Some(PatchSummary {
+                        matched_occurrences: current.matches(old_string).count(),
+                        replaced_occurrences: if *replace_all {
+                            current.matches(old_string).count()
+                        } else {
+                            1
+                        },
+                        old_preview: old_string.clone(),
+                        new_preview: new_string.clone(),
+                    }),
+                    preview_excerpt: Some(updated.chars().take(120).collect()),
+                    artifact: FileArtifactPayload {
+                        original_content: Some(current),
+                        final_content: updated,
+                    },
                 })
             }
             Action::AppendFile { path, content, .. } => {
                 let mut files = recover_mutex(&self.files);
                 let existed_before = files.contains_key(path);
-                files.entry(path.clone())
+                files
+                    .entry(path.clone())
                     .and_modify(|existing| existing.push_str(content))
                     .or_insert_with(|| content.clone());
                 Ok(ActionResult::FileWrite {
                     path: path.clone(),
+                    mutation_kind: FileMutationKind::Append,
                     bytes_written: content.len(),
                     created: !existed_before,
                     overwritten: false,
                     appended: true,
+                    original_hash: None,
+                    updated_hash: "mock-hash".to_string(),
+                    changed_line_count: content.lines().count(),
+                    patch_summary: None,
+                    preview_excerpt: Some(content.chars().take(120).collect()),
+                    artifact: FileArtifactPayload {
+                        original_content: None,
+                        final_content: content.clone(),
+                    },
                 })
             }
+            Action::EditNotebook {
+                path, new_source, ..
+            } => {
+                let mut files = recover_mutex(&self.files);
+                files.insert(path.clone(), new_source.clone());
+                Ok(ActionResult::FileWrite {
+                    path: path.clone(),
+                    mutation_kind: FileMutationKind::NotebookReplace,
+                    bytes_written: new_source.len(),
+                    created: false,
+                    overwritten: true,
+                    appended: false,
+                    original_hash: None,
+                    updated_hash: "mock-hash".to_string(),
+                    changed_line_count: new_source.lines().count(),
+                    patch_summary: None,
+                    preview_excerpt: Some(new_source.chars().take(120).collect()),
+                    artifact: FileArtifactPayload {
+                        original_content: None,
+                        final_content: new_source.clone(),
+                    },
+                })
+            }
+            Action::SpawnAgent { .. } => Err(KernelError::Unsupported(
+                "mock shell cannot spawn agents directly".to_string(),
+            )),
             Action::RecordNote { note, .. } => {
                 Ok(ActionResult::NoteRecorded { note: note.clone() })
             }

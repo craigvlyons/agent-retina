@@ -9,6 +9,7 @@ blake3.workspace = true
 chrono.workspace = true
 fastembed.workspace = true
 refinery.workspace = true
+retina-runtime = { path = "../retina-runtime" }
 retina-traits = { path = "../retina-traits" }
 retina-types = { path = "../retina-types" }
 rusqlite.workspace = true

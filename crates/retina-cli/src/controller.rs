@@ -1,26 +1,25 @@
 use crate::chat::StreamingMemory;
 use crate::runtime::{
     normalize_root_manifest, open_memory, retina_home, root_agent_id, root_db_path, root_manifest,
+    root_task_output_dir,
 };
 use retina_kernel::Kernel;
 use retina_llm_claude::{ClaudeReasoner, ClaudeRuntimeConfigSnapshot};
+use retina_mcp_client::{ConfiguredMcpRuntime, default_config_path};
 use retina_memory_sqlite::{MemoryStats, SqliteMemory};
+use retina_runtime::{RuntimeTask, RuntimeTaskKind, RuntimeTaskRegistry, TaskSupervisor};
 use retina_shell_cli::{CliShell, ScopedShell};
+use retina_tools::ToolPolicy;
 use retina_traits::{Memory, Shell};
+use retina_transport_local::{LocalAgentRuntimeService, LocalTransportConfig};
 use retina_types::*;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool, mpsc};
-use std::thread;
+use std::sync::{Arc, atomic::AtomicBool};
 
 pub struct AgentController {
     kernel: Arc<Kernel>,
-}
-
-pub struct RunningTask {
-    pub task: Task,
-    pub control: ExecutionControlHandle,
-    receiver: mpsc::Receiver<Result<Outcome>>,
+    supervisor: TaskSupervisor,
 }
 
 impl AgentController {
@@ -39,8 +38,18 @@ impl AgentController {
                 .load_manifest(&root_agent_id())?
                 .unwrap_or(root_manifest()?),
         );
+        let supervisor = TaskSupervisor::new(root_task_output_dir()?)
+            .with_store(Arc::new(open_memory(root_db_path()?)?));
+        let agent_runtime = Arc::new(LocalAgentRuntimeService::new(
+            supervisor.clone(),
+            local_transport_config()?,
+            manifest.authority.clone(),
+        ));
+        let mcp_runtime = Arc::new(ConfiguredMcpRuntime::new(default_config_path(
+            &retina_home()?,
+        )));
         let kernel = if stream_events {
-            Kernel::new_with_registry(
+            Kernel::new_with_runtime(
                 Box::new(ScopedShell::new(
                     CliShell::new(),
                     manifest.authority.clone(),
@@ -51,9 +60,12 @@ impl AgentController {
                     debug_events.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
                 )),
                 registry,
+                ToolPolicy::from_authority(&manifest.authority),
+                Some(agent_runtime.clone()),
+                Some(mcp_runtime.clone()),
             )?
         } else {
-            Kernel::new_with_registry(
+            Kernel::new_with_runtime(
                 Box::new(ScopedShell::new(
                     CliShell::new(),
                     manifest.authority.clone(),
@@ -61,27 +73,46 @@ impl AgentController {
                 Box::new(ClaudeReasoner::new()),
                 Box::new(memory),
                 registry,
+                ToolPolicy::from_authority(&manifest.authority),
+                Some(agent_runtime),
+                Some(mcp_runtime),
             )?
         };
         Ok(Self {
             kernel: Arc::new(kernel),
+            supervisor,
         })
     }
 
     pub fn new_with_streaming_and_shell(
         shell: Box<dyn Shell>,
+        authority: AgentAuthority,
         debug_events: Arc<AtomicBool>,
     ) -> Result<Self> {
         let memory = open_memory(root_db_path()?)?;
         let registry = memory.agent_registry()?;
-        let kernel = Kernel::new_with_registry(
+        let supervisor = TaskSupervisor::new(root_task_output_dir()?)
+            .with_store(Arc::new(open_memory(root_db_path()?)?));
+        let agent_runtime = Arc::new(LocalAgentRuntimeService::new(
+            supervisor.clone(),
+            local_transport_config()?,
+            authority.clone(),
+        ));
+        let mcp_runtime = Arc::new(ConfiguredMcpRuntime::new(default_config_path(
+            &retina_home()?,
+        )));
+        let kernel = Kernel::new_with_runtime(
             shell,
             Box::new(ClaudeReasoner::new()),
             Box::new(StreamingMemory::new(memory, debug_events)),
             registry,
+            ToolPolicy::from_authority(&authority),
+            Some(agent_runtime),
+            Some(mcp_runtime),
         )?;
         Ok(Self {
             kernel: Arc::new(kernel),
+            supervisor,
         })
     }
 
@@ -94,17 +125,14 @@ impl AgentController {
         task_description: impl Into<String>,
         config: ExecutionConfig,
     ) -> Result<Outcome> {
-        let task = build_task_for_description(task_description.into())?;
-        self.execute_with_root_state(task, move |kernel, task| {
-            kernel.execute_task_with_config(task, config)
-        })
+        self.spawn_task(task_description, config).recv()
     }
 
     pub fn spawn_task(
         &self,
         task_description: impl Into<String>,
         mut config: ExecutionConfig,
-    ) -> RunningTask {
+    ) -> retina_runtime::RuntimeTaskHandle {
         let task_description = task_description.into();
         let task = build_task_for_description(task_description.clone())
             .unwrap_or_else(|_| Task::new(root_agent_id(), task_description));
@@ -113,26 +141,21 @@ impl AgentController {
         config.control = Some(control_handle.clone());
         let kernel = Arc::clone(&self.kernel);
         let task_for_thread = task.clone();
-        let (sender, receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let _ = update_root_manifest_state(
-                AgentStatus::Running,
-                AgentLifecyclePhase::Busy,
-                Some("executing task"),
-            );
-            let outcome = run_task_catching_panics(&kernel, task_for_thread, config);
-            let _ = update_root_manifest_state(
-                AgentStatus::Idle,
-                AgentLifecyclePhase::CoolingDown,
-                Some("waiting for next task"),
-            );
-            let _ = sender.send(outcome);
-        });
-        RunningTask {
-            task,
-            control: control_handle,
-            receiver,
-        }
+        self.supervisor
+            .spawn(task, RuntimeTaskKind::Session, control_handle, move || {
+                let _ = update_root_manifest_state(
+                    AgentStatus::Running,
+                    AgentLifecyclePhase::Busy,
+                    Some("executing task"),
+                );
+                let outcome = run_task_catching_panics(&kernel, task_for_thread, config);
+                let _ = update_root_manifest_state(
+                    AgentStatus::Idle,
+                    AgentLifecyclePhase::CoolingDown,
+                    Some("waiting for next task"),
+                );
+                outcome
+            })
     }
 }
 
@@ -140,116 +163,13 @@ fn build_task_for_description(task_description: String) -> Result<Task> {
     Ok(Task::new(root_agent_id(), task_description))
 }
 
-#[cfg(test)]
-fn latest_recent_context_from_events(events: &[TimelineEvent]) -> Option<RecentContext> {
-    let completed = events
-        .iter()
-        .find(|event| matches!(event.event_type, TimelineEventType::TaskCompleted))?;
-    let task_state = completed
-        .payload_json
-        .get("task_state")
-        .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())?;
-
-    let prior_answer_summary = completed
-        .payload_json
-        .get("final_answer_summary")
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            task_state.recent_actions.iter().rev().find_map(|action| {
-                action
-                    .action
-                    .strip_prefix("respond:")
-                    .map(compact_answer_summary)
-            })
-        });
-
-    Some(RecentContext {
-        prior_objective: task_state.goal.objective.clone(),
-        prior_answer_summary,
-        sources: select_recent_sources(&task_state.working_sources),
-        artifacts: select_recent_artifacts(&task_state.artifact_references),
+fn local_transport_config() -> Result<LocalTransportConfig> {
+    let home = retina_home()?;
+    Ok(LocalTransportConfig {
+        db_path: root_db_path()?,
+        agents_dir: home.join("agents"),
+        retina_home: home,
     })
-}
-
-#[cfg(test)]
-fn select_recent_sources(sources: &[WorkingSource]) -> Vec<WorkingSource> {
-    let mut ranked = sources
-        .iter()
-        .filter(|source| source.kind != "command")
-        .cloned()
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        source_rank(right)
-            .cmp(&source_rank(left))
-            .then_with(|| right.last_used_step.cmp(&left.last_used_step))
-            .then_with(|| left.locator.cmp(&right.locator))
-    });
-    ranked.truncate(5);
-    ranked
-}
-
-#[cfg(test)]
-fn select_recent_artifacts(artifacts: &[ArtifactReference]) -> Vec<ArtifactReference> {
-    let mut ranked = artifacts
-        .iter()
-        .filter(|artifact| artifact.kind != "command")
-        .cloned()
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        artifact_rank(right)
-            .cmp(&artifact_rank(left))
-            .then_with(|| left.locator.cmp(&right.locator))
-    });
-    ranked.truncate(5);
-    ranked
-}
-
-#[cfg(test)]
-fn source_rank(source: &WorkingSource) -> u8 {
-    let role_rank = match source.role.as_str() {
-        "authoritative" => 4,
-        "generated" => 3,
-        "supporting" => 2,
-        "candidate" => 1,
-        _ => 0,
-    };
-    let status_rank = match source.status.as_str() {
-        "read" | "excerpted" | "ingested" => 4,
-        "created" | "written" | "overwritten" | "appended" | "command_changed" => 4,
-        "matched_text" => 3,
-        "matched" => 2,
-        "listed" | "inspected" => 1,
-        _ => 0,
-    };
-    role_rank * 10 + status_rank
-}
-
-#[cfg(test)]
-fn artifact_rank(artifact: &ArtifactReference) -> u8 {
-    match artifact.status.as_str() {
-        "read" | "structured_read" | "extracted" => 5,
-        "created" | "written" | "overwritten" | "appended" | "command_changed" => 4,
-        "searched" => 3,
-        "matched" => 2,
-        "listed" | "inspected" => 1,
-        _ => 0,
-    }
-}
-
-fn compact_answer_summary(message: &str) -> String {
-    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut preview = normalized.chars().take(240).collect::<String>();
-    if normalized.chars().count() > 240 {
-        preview.push_str("...");
-    }
-    preview
-}
-
-impl RunningTask {
-    pub fn try_recv(&self) -> std::result::Result<Result<Outcome>, mpsc::TryRecvError> {
-        self.receiver.try_recv()
-    }
 }
 
 pub struct InspectController {
@@ -265,6 +185,7 @@ pub struct WorkerOverview {
     pub active_rules: Vec<ReflexiveRule>,
     pub compaction_stats: CompactionStats,
     pub claude_runtime: ClaudeRuntimeConfigSnapshot,
+    pub runtime_tasks: Vec<RuntimeTask>,
 }
 
 pub struct TerminalTaskStats {
@@ -318,6 +239,17 @@ impl InspectController {
         self.memory.stats()
     }
 
+    pub fn recent_runtime_tasks(&self, limit: usize) -> Result<Vec<RuntimeTask>> {
+        let tasks = self.memory.recent_runtime_tasks(limit)?;
+        if !tasks.is_empty() {
+            return Ok(tasks);
+        }
+        let events = self.memory.recent_states(500)?;
+        let mut tasks = RuntimeTaskRegistry::from_timeline(&events).snapshots();
+        tasks.truncate(limit);
+        Ok(tasks)
+    }
+
     pub fn worker_overview(&self) -> Result<WorkerOverview> {
         let db_path = root_db_path()?;
         let manifest = normalize_root_manifest(
@@ -342,6 +274,17 @@ impl InspectController {
             active_rules,
             compaction_stats: summarize_compaction_stats(&recent_events),
             claude_runtime: ClaudeReasoner::runtime_config_snapshot(),
+            runtime_tasks: {
+                let mut tasks = self.memory.recent_runtime_tasks(10)?;
+                if tasks.is_empty() {
+                    tasks = RuntimeTaskRegistry::from_timeline(&recent_events)
+                        .snapshots()
+                        .into_iter()
+                        .take(10)
+                        .collect();
+                }
+                tasks
+            },
         })
     }
 
@@ -355,33 +298,6 @@ impl InspectController {
 
     pub fn append_timeline_event(&self, event: &TimelineEvent) -> Result<()> {
         self.memory.append_timeline_event(event)
-    }
-}
-
-impl AgentController {
-    fn execute_with_root_state(
-        &self,
-        task: Task,
-        run: impl FnOnce(&Kernel, Task) -> Result<Outcome>,
-    ) -> Result<Outcome> {
-        update_root_manifest_state(
-            AgentStatus::Running,
-            AgentLifecyclePhase::Busy,
-            Some("executing task"),
-        )?;
-        let outcome = panic::catch_unwind(AssertUnwindSafe(|| run(&self.kernel, task)))
-            .unwrap_or_else(|panic_payload| Err(task_panic_error(panic_payload)));
-        let reset_result = update_root_manifest_state(
-            AgentStatus::Idle,
-            AgentLifecyclePhase::CoolingDown,
-            Some("waiting for next task"),
-        );
-        match (outcome, reset_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(primary), Err(_secondary)) => Err(primary),
-        }
     }
 }
 
@@ -440,12 +356,6 @@ fn summarize_terminal_tasks(events: &[TimelineEvent]) -> TerminalTaskStats {
             TimelineEventType::TaskFailed => stats.failed += 1,
             TimelineEventType::TaskCancelled => stats.cancelled += 1,
             _ => {
-                if matches!(event.event_type, TimelineEventType::TaskStepCompleted) {
-                    continue;
-                }
-                if let TimelineEventType::TaskFailed = event.event_type {
-                    continue;
-                }
                 if event
                     .payload_json
                     .get("reason")
@@ -484,145 +394,4 @@ fn summarize_compaction_stats(events: &[TimelineEvent]) -> CompactionStats {
     }
 
     stats
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-    use serde_json::json;
-
-    fn completed_event(
-        objective: &str,
-        final_answer_summary: Option<&str>,
-        mut task_state: TaskState,
-        timestamp: chrono::DateTime<Utc>,
-    ) -> TimelineEvent {
-        task_state.goal.objective = objective.to_string();
-        TimelineEvent {
-            event_id: EventId::new(),
-            session_id: SessionId::new(),
-            task_id: TaskId::new(),
-            agent_id: root_agent_id(),
-            timestamp,
-            event_type: TimelineEventType::TaskCompleted,
-            intent_id: None,
-            action_id: None,
-            pre_state_hash: None,
-            post_state_hash: None,
-            delta_summary: None,
-            duration_ms: None,
-            payload_json: json!({
-                "final_answer_summary": final_answer_summary,
-                "task_state": task_state
-            }),
-        }
-    }
-
-    fn sample_task_state() -> TaskState {
-        TaskState {
-            goal: TaskGoal {
-                objective: "placeholder".to_string(),
-                constraints: vec![],
-            },
-            progress: TaskProgress {
-                current_phase: "working".to_string(),
-                current_step: 2,
-                max_steps: 50,
-                completed_checkpoints: vec![],
-                verified_facts: vec![],
-                output_written: false,
-                output_verified: false,
-            },
-            frontier: TaskFrontier::default(),
-            recent_actions: vec![RecentActionSummary {
-                step: 2,
-                action: "respond:summary".to_string(),
-                outcome: "responded to operator".to_string(),
-                artifact_refs: vec![],
-            }],
-            working_sources: vec![
-                WorkingSource {
-                    kind: "command".to_string(),
-                    locator: "dir".to_string(),
-                    role: "supporting".to_string(),
-                    status: "executed".to_string(),
-                    why_it_matters: "noise".to_string(),
-                    last_used_step: 1,
-                    evidence_refs: vec![],
-                    page_reference: None,
-                    extraction_method: Some("run_command".to_string()),
-                    structured_summary: None,
-                    preview_excerpt: None,
-                },
-                WorkingSource {
-                    kind: "file".to_string(),
-                    locator: "C:/texts/Watcher.txt".to_string(),
-                    role: "authoritative".to_string(),
-                    status: "read".to_string(),
-                    why_it_matters: "real source".to_string(),
-                    last_used_step: 2,
-                    evidence_refs: vec![],
-                    page_reference: None,
-                    extraction_method: Some("text_read".to_string()),
-                    structured_summary: None,
-                    preview_excerpt: Some("watcher notes".to_string()),
-                },
-            ],
-            artifact_references: vec![
-                ArtifactReference {
-                    kind: "command".to_string(),
-                    locator: "dir".to_string(),
-                    status: "executed".to_string(),
-                },
-                ArtifactReference {
-                    kind: "file".to_string(),
-                    locator: "C:/texts/Watcher.txt".to_string(),
-                    status: "read".to_string(),
-                },
-            ],
-            avoid: vec![],
-            compaction: None,
-        }
-    }
-
-    #[test]
-    fn latest_recent_context_uses_only_latest_completed_task() {
-        let older = completed_event(
-            "list files in texts",
-            Some("older"),
-            sample_task_state(),
-            Utc::now() - chrono::Duration::minutes(2),
-        );
-        let newer = completed_event(
-            "what is Watcher.txt about?",
-            Some("newer"),
-            sample_task_state(),
-            Utc::now(),
-        );
-
-        let recent = latest_recent_context_from_events(&[newer.clone(), older]).unwrap();
-        assert_eq!(recent.prior_objective, "what is Watcher.txt about?");
-        assert_eq!(recent.prior_answer_summary.as_deref(), Some("newer"));
-    }
-
-    #[test]
-    fn latest_recent_context_prefers_authoritative_sources_and_non_command_artifacts() {
-        let recent = latest_recent_context_from_events(&[completed_event(
-            "list files in texts",
-            None,
-            sample_task_state(),
-            Utc::now(),
-        )])
-        .unwrap();
-
-        assert_eq!(recent.sources.len(), 1);
-        assert_eq!(recent.sources[0].locator, "C:/texts/Watcher.txt");
-        assert_eq!(recent.artifacts.len(), 1);
-        assert_eq!(recent.artifacts[0].locator, "C:/texts/Watcher.txt");
-        assert_eq!(
-            recent.prior_answer_summary.as_deref(),
-            Some("summary")
-        );
-    }
 }

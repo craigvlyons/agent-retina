@@ -1,5 +1,6 @@
 use crate::Embedder;
 use chrono::{DateTime, Utc};
+use retina_runtime::{RuntimeTask, RuntimeTaskKind, RuntimeTaskStatus};
 use retina_types::*;
 use rusqlite::{Connection, params};
 use serde_json::json;
@@ -234,5 +235,31 @@ pub(crate) fn row_to_timeline_event(row: &rusqlite::Row<'_>) -> rusqlite::Result
         delta_summary: row.get(10)?,
         duration_ms: row.get::<_, Option<i64>>(11)?.map(|value| value as u64),
         payload_json: serde_json::from_str(&payload_json).unwrap_or_else(|_| json!({})),
+    })
+}
+
+pub(crate) fn row_to_runtime_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeTask> {
+    let task_kind_json: String = row.get(2)?;
+    let status_json: String = row.get(4)?;
+    let started_at: String = row.get(5)?;
+    let ended_at: Option<String> = row.get(6)?;
+    let output_path: Option<String> = row.get(9)?;
+    let last_activity: String = row.get(12)?;
+
+    Ok(RuntimeTask {
+        task_id: TaskId(row.get(0)?),
+        parent_task_id: row.get::<_, Option<String>>(1)?.map(TaskId),
+        task_kind: serde_json::from_str(&task_kind_json).unwrap_or(RuntimeTaskKind::Session),
+        owner_agent_id: AgentId(row.get(3)?),
+        status: serde_json::from_str(&status_json).unwrap_or(RuntimeTaskStatus::Failed),
+        started_at: parse_datetime(&started_at),
+        ended_at: ended_at.as_deref().map(parse_datetime),
+        description: row.get(7)?,
+        prompt_or_objective: row.get(8)?,
+        output_path: output_path.map(std::path::PathBuf::from),
+        output_offset: row.get::<_, i64>(10)? as usize,
+        progress_summary: row.get(11)?,
+        last_activity: parse_datetime(&last_activity),
+        notified: row.get::<_, i64>(13)? == 1,
     })
 }
