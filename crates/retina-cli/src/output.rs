@@ -23,9 +23,16 @@ pub fn render_action_result(result: &ActionResult) -> String {
         ActionResult::Inspection(state) => {
             format!("Inspection complete for cwd {}", state.cwd.display())
         }
-        ActionResult::DirectoryListing { root, entries } => format!(
-            "Directory listing for {}\n{}",
+        ActionResult::DirectoryListing {
+            root,
+            entries,
+            summary,
+        } => format!(
+            "Directory listing for {} (files: {}, dirs: {}, hidden: {})\n{}",
             root.display(),
+            summary.file_count,
+            summary.dir_count,
+            summary.hidden_count,
             entries
                 .iter()
                 .map(|entry| {
@@ -207,18 +214,26 @@ pub fn render_action_result(result: &ActionResult) -> String {
                 preview_note
             )
         }
-        ActionResult::DelegatedTask(result) => format!(
-            "Delegated child {} finished with {:?} for task {}{}\n{}",
-            result.agent_id,
-            result.status,
-            result.task_id,
-            result
-                .output_path
-                .as_ref()
-                .map(|path| format!(" output={}", path.display()))
-                .unwrap_or_default(),
-            result.summary
-        ),
+        ActionResult::DelegatedTask(result) => {
+            let transcript = result
+                .transcript_excerpt
+                .as_deref()
+                .map(|value| format!("\nchild trace:\n{value}"))
+                .unwrap_or_default();
+            format!(
+                "Delegated child {} finished with {:?} for task {}{}\n{}{}",
+                result.agent_id,
+                result.status,
+                result.task_id,
+                result
+                    .output_path
+                    .as_ref()
+                    .map(|path| format!(" output={}", path.display()))
+                    .unwrap_or_default(),
+                result.summary,
+                transcript
+            )
+        }
         ActionResult::McpResources { server, resources } => {
             let scope = server
                 .as_ref()
@@ -500,7 +515,23 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .get("result")
             .and_then(|value| serde_json::from_value::<ActionResult>(value.clone()).ok())
             .and_then(render_observed_result),
-        TimelineEventType::TaskStepCompleted => None,
+        TimelineEventType::TaskStepCompleted => event
+            .payload_json
+            .get("task_state")
+            .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
+            .and_then(|task_state| {
+                task_state.recent_actions.last().and_then(|summary| {
+                    match summary.status {
+                        RecentActionStatus::Failed => {
+                            Some(format!("failed: {}", summary.outcome))
+                        }
+                        RecentActionStatus::Blocked => {
+                            Some(format!("blocked: {}", summary.outcome))
+                        }
+                        RecentActionStatus::Succeeded | RecentActionStatus::Responded => None,
+                    }
+                })
+            }),
         TimelineEventType::ReflectionRequested => event
             .payload_json
             .get("reason")
@@ -639,7 +670,15 @@ fn render_observed_result(result: ActionResult) -> Option<String> {
         }
         ActionResult::DelegatedTask(result) => Some(format!(
             "observed: delegated child {} [{:?}] | {}",
-            result.agent_id, result.status, result.summary
+            result.agent_id,
+            result.status,
+            compact_preview(
+                result
+                    .transcript_excerpt
+                    .as_deref()
+                    .unwrap_or(&result.summary)
+            )
+            .unwrap_or_else(|| result.summary.clone())
         )),
         ActionResult::McpResources { server, resources } => Some(format!(
             "observed: MCP resources [{}] | {} item(s)",
@@ -690,6 +729,13 @@ fn compact_preview(content: &str) -> Option<String> {
 }
 
 fn humanize_action_label(label: &str) -> String {
+    if let Some((server, tool)) = parse_mcp_tool_name(label) {
+        return format!(
+            "mcp tool {}:{}",
+            server.replace('_', "-"),
+            tool.replace('_', " ")
+        );
+    }
     if let Some(value) = label.strip_prefix("run_command:") {
         return format!("run command `{value}`");
     }
@@ -728,10 +774,18 @@ fn humanize_action_label(label: &str) -> String {
         return format!("respond {}", value);
     }
     if let Some(value) = label.strip_prefix("find_files:") {
-        let mut parts = value.splitn(2, ':');
+        let mut parts = value.splitn(3, ':');
         let root = parts.next().unwrap_or(".");
         let pattern = parts.next().unwrap_or("*");
-        return format!("find `{pattern}` under {root}");
+        let recursive = parts
+            .next()
+            .and_then(|value| value.strip_prefix("recursive="))
+            .unwrap_or("true");
+        return if recursive == "true" {
+            format!("find `{pattern}` under {root} recursively")
+        } else {
+            format!("find `{pattern}` under {root}")
+        };
     }
     if let Some(value) = label.strip_prefix("search_text:") {
         let mut parts = value.splitn(2, ':');
@@ -808,6 +862,47 @@ pub fn render_agent_registry(registry: &AgentRegistrySnapshot) -> String {
         }
     }
     output
+}
+
+pub fn render_mcp_snapshot(snapshot: &McpRegistrySnapshot) -> String {
+    if snapshot.servers.is_empty() {
+        return "mcp:\n- no configured servers discovered\n".to_string();
+    }
+
+    let mut out = String::from("mcp:\n");
+    for server in &snapshot.servers {
+        if let Some(error) = &server.error {
+            out.push_str(&format!("- {} [error]\n  error: {}\n", server.name, error));
+            continue;
+        }
+
+        out.push_str(&format!(
+            "- {} [connected]\n  tools: {}\n  resources: {}\n",
+            server.name,
+            server.tools.len(),
+            server.resources.len()
+        ));
+        if !server.tools.is_empty() {
+            let tool_names = server
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("  tool_names: {}\n", tool_names));
+        }
+        if !server.resources.is_empty() {
+            let resource_names = server
+                .resources
+                .iter()
+                .take(5)
+                .map(|resource| resource.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("  resource_names: {}\n", resource_names));
+        }
+    }
+    out
 }
 
 pub fn render_cleanup_report(
@@ -1141,5 +1236,39 @@ mod tests {
         };
 
         assert_eq!(render_chat_event(&event, false), "");
+    }
+
+    #[test]
+    fn task_step_completed_surfaces_failed_step_summary() {
+        let mut task_state = TaskState::default();
+        task_state.recent_actions.push(RecentActionSummary {
+            step: 2,
+            action: "read_file:mcp-tool://brave/brave_web_search".to_string(),
+            status: RecentActionStatus::Failed,
+            outcome: "mcp-tool://brave/brave_web_search is MCP output, not a filesystem path".to_string(),
+            artifact_refs: Vec::new(),
+        });
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskStepCompleted,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "task_state": task_state
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "failed: mcp-tool://brave/brave_web_search is MCP output, not a filesystem path\n"
+        );
     }
 }

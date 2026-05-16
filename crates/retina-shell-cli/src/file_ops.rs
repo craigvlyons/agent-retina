@@ -27,6 +27,44 @@ impl CliShell {
         Ok(entries)
     }
 
+    pub(crate) fn summarize_directory_entries(
+        entries: &[DirectoryEntry],
+    ) -> DirectoryListingSummary {
+        let total_entries = entries.len();
+        let file_count = entries.iter().filter(|entry| !entry.is_dir).count();
+        let dir_count = entries.iter().filter(|entry| entry.is_dir).count();
+        let hidden_count = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|name| name.starts_with('.'))
+                    .unwrap_or(false)
+            })
+            .count();
+        let sample_names = entries
+            .iter()
+            .take(8)
+            .filter_map(|entry| {
+                entry
+                    .path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .map(|name| name.to_string())
+            })
+            .collect::<Vec<_>>();
+
+        DirectoryListingSummary {
+            total_entries,
+            file_count,
+            dir_count,
+            hidden_count,
+            sample_names,
+        }
+    }
+
     fn collect_directory_entries(
         dir: &Path,
         recursive: bool,
@@ -62,6 +100,7 @@ impl CliShell {
     pub(crate) fn find_files(
         root: &Path,
         pattern: &str,
+        recursive: bool,
         max_results: usize,
     ) -> Result<Vec<PathBuf>> {
         let root = Self::resolve_path(root)?;
@@ -69,6 +108,7 @@ impl CliShell {
         Self::collect_matching_files(
             &root,
             &pattern.to_lowercase(),
+            recursive,
             max_results.max(1),
             &mut matches,
         )?;
@@ -79,6 +119,7 @@ impl CliShell {
     fn collect_matching_files(
         root: &Path,
         pattern: &str,
+        recursive: bool,
         max_results: usize,
         matches: &mut Vec<PathBuf>,
     ) -> Result<()> {
@@ -99,15 +140,15 @@ impl CliShell {
                 .to_lowercase();
             let path_text = path.display().to_string().to_lowercase();
 
-            if name.contains(pattern) || path_text.contains(pattern) {
+            if path_matches_pattern(&name, &path_text, pattern) {
                 matches.push(path.clone());
                 if matches.len() >= max_results {
                     break;
                 }
             }
 
-            if metadata.is_dir() {
-                Self::collect_matching_files(&path, pattern, max_results, matches)?;
+            if recursive && metadata.is_dir() {
+                Self::collect_matching_files(&path, pattern, true, max_results, matches)?;
                 continue;
             }
         }
@@ -355,4 +396,46 @@ impl CliShell {
             structured_rows_detected,
         ))
     }
+}
+
+fn path_matches_pattern(name: &str, path_text: &str, pattern: &str) -> bool {
+    let lowered = pattern.to_lowercase();
+    if lowered.contains('*') || lowered.contains('?') {
+        wildcard_matches(name, &lowered) || wildcard_matches(path_text, &lowered)
+    } else {
+        name.contains(&lowered) || path_text.contains(&lowered)
+    }
+}
+
+fn wildcard_matches(text: &str, pattern: &str) -> bool {
+    let text = text.as_bytes();
+    let pattern = pattern.as_bytes();
+    let (mut text_ix, mut pattern_ix) = (0usize, 0usize);
+    let mut star_ix = None;
+    let mut match_ix = 0usize;
+
+    while text_ix < text.len() {
+        if pattern_ix < pattern.len()
+            && (pattern[pattern_ix] == b'?' || pattern[pattern_ix] == text[text_ix])
+        {
+            text_ix += 1;
+            pattern_ix += 1;
+        } else if pattern_ix < pattern.len() && pattern[pattern_ix] == b'*' {
+            star_ix = Some(pattern_ix);
+            match_ix = text_ix;
+            pattern_ix += 1;
+        } else if let Some(star_pos) = star_ix {
+            pattern_ix = star_pos + 1;
+            match_ix += 1;
+            text_ix = match_ix;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_ix < pattern.len() && pattern[pattern_ix] == b'*' {
+        pattern_ix += 1;
+    }
+
+    pattern_ix == pattern.len()
 }

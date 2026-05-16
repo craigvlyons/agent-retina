@@ -4,7 +4,8 @@ use crate::controller::{AgentController, InspectController};
 use crate::maintenance::run_cleanup;
 use crate::output::{
     render_action_result, render_agent_registry, render_cleanup_report, render_memory_inspection,
-    render_runtime_tasks, render_stats, render_task_state, render_timeline, render_worker_overview,
+    render_mcp_snapshot, render_runtime_tasks, render_stats, render_task_state, render_timeline,
+    render_worker_overview,
 };
 use crate::runtime::init_runtime;
 use clap::Parser;
@@ -71,6 +72,10 @@ pub fn inspect(command: InspectCommands) -> Result<()> {
         InspectCommands::Overview => {
             let overview = inspector.worker_overview()?;
             print!("{}", render_worker_overview(&overview));
+        }
+        InspectCommands::Mcp => {
+            let snapshot = inspector.mcp_snapshot()?;
+            print!("{}", render_mcp_snapshot(&snapshot));
         }
         InspectCommands::Agents => {
             let registry = inspector.agent_registry()?;

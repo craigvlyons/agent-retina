@@ -471,6 +471,13 @@ impl Shell for MockShell {
             Action::ListDirectory { path, .. } => Ok(ActionResult::DirectoryListing {
                 root: path.clone(),
                 entries: Vec::new(),
+                summary: DirectoryListingSummary {
+                    total_entries: 0,
+                    file_count: 0,
+                    dir_count: 0,
+                    hidden_count: 0,
+                    sample_names: Vec::new(),
+                },
             }),
             Action::FindFiles { root, pattern, .. } => Ok(ActionResult::FileMatches {
                 root: root.clone(),

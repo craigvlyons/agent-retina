@@ -26,32 +26,36 @@ impl ToolExecutor {
 
     pub fn descriptor_for_action(&self, action: &Action) -> Option<&ToolDescriptor> {
         let name = tool_name_for_action(action);
-        let tool = self.registry.get(name)?;
+        let tool = self.registry.get(&name)?;
         self.policy.permits(tool).then_some(tool)
     }
 }
 
-pub fn tool_name_for_action(action: &Action) -> &'static str {
+pub fn tool_name_for_action(action: &Action) -> String {
     match action {
-        Action::RunCommand { .. } => "run_command",
-        Action::InspectPath { .. } => "inspect_path",
-        Action::InspectWorkingDirectory { .. } => "inspect_working_directory",
-        Action::ListDirectory { .. } => "list_directory",
-        Action::FindFiles { .. } => "find_files",
-        Action::SearchText { .. } => "search_text",
-        Action::ReadFile { .. } => "read_file",
-        Action::IngestStructuredData { .. } => "ingest_structured_data",
-        Action::ExtractDocumentText { .. } => "extract_document_text",
-        Action::ListMcpResources { .. } => "list_mcp_resources",
-        Action::ReadMcpResource { .. } => "read_mcp_resource",
-        Action::CallMcpTool { .. } => "mcp_call",
-        Action::WriteFile { .. } => "write_file",
-        Action::EditFile { .. } => "edit_file",
-        Action::AppendFile { .. } => "append_file",
-        Action::EditNotebook { .. } => "edit_notebook",
-        Action::SpawnAgent { .. } => "agent_spawn",
-        Action::RecordNote { .. } => "record_note",
-        Action::Respond { .. } => "respond",
+        Action::RunCommand { .. } => "run_command".to_string(),
+        Action::InspectPath { .. } => "inspect_path".to_string(),
+        Action::InspectWorkingDirectory { .. } => "inspect_working_directory".to_string(),
+        Action::ListDirectory { .. } => "list_directory".to_string(),
+        Action::FindFiles { .. } => "find_files".to_string(),
+        Action::SearchText { .. } => "search_text".to_string(),
+        Action::ReadFile { .. } => "read_file".to_string(),
+        Action::IngestStructuredData { .. } => "ingest_structured_data".to_string(),
+        Action::ExtractDocumentText { .. } => "extract_document_text".to_string(),
+        Action::ListMcpResources { .. } => "list_mcp_resources".to_string(),
+        Action::ReadMcpResource { .. } => "read_mcp_resource".to_string(),
+        Action::CallMcpTool {
+            resolved_tool_name, ..
+        } => resolved_tool_name
+            .clone()
+            .unwrap_or_else(|| "mcp_call".to_string()),
+        Action::WriteFile { .. } => "write_file".to_string(),
+        Action::EditFile { .. } => "edit_file".to_string(),
+        Action::AppendFile { .. } => "append_file".to_string(),
+        Action::EditNotebook { .. } => "edit_notebook".to_string(),
+        Action::SpawnAgent { .. } => "agent_spawn".to_string(),
+        Action::RecordNote { .. } => "record_note".to_string(),
+        Action::Respond { .. } => "respond".to_string(),
     }
 }
 

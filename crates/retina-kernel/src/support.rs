@@ -237,8 +237,8 @@ pub(crate) fn action_utility(action: &Action, result: &ActionResult, delta: &Sta
                 0.45
             }
         }
-        ActionResult::DirectoryListing { entries, .. } => {
-            if entries.is_empty() {
+        ActionResult::DirectoryListing { summary, .. } => {
+            if summary.total_entries == 0 {
                 0.15
             } else {
                 0.55

@@ -429,8 +429,16 @@ pub(crate) fn action_label(action: &Action) -> String {
         } => {
             format!("list_directory:{}:recursive={recursive}", path.display())
         }
-        Action::FindFiles { root, pattern, .. } => {
-            format!("find_files:{}:{pattern}", root.display())
+        Action::FindFiles {
+            root,
+            pattern,
+            recursive,
+            ..
+        } => {
+            format!(
+                "find_files:{}:{pattern}:recursive={recursive}",
+                root.display()
+            )
         }
         Action::SearchText { root, query, .. } => format!("search_text:{}:{query}", root.display()),
         Action::ReadFile { path, .. } => format!("read_file:{}", path.display()),
@@ -458,7 +466,14 @@ pub(crate) fn action_label(action: &Action) -> String {
         Action::ReadMcpResource { server, uri, .. } => {
             format!("read_mcp_resource:{server}:{uri}")
         }
-        Action::CallMcpTool { server, tool, .. } => format!("mcp_call:{server}:{tool}"),
+        Action::CallMcpTool {
+            server,
+            tool,
+            resolved_tool_name,
+            ..
+        } => resolved_tool_name
+            .clone()
+            .unwrap_or_else(|| format!("mcp_call:{server}:{tool}")),
         Action::WriteFile { path, .. } => format!("write_file:{}", path.display()),
         Action::EditFile { path, .. } => format!("edit_file:{}", path.display()),
         Action::AppendFile { path, .. } => format!("append_file:{}", path.display()),

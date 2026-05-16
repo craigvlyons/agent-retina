@@ -1,8 +1,11 @@
 use chrono::Utc;
 use dotenvy::dotenv;
+use retina_mcp_client::{default_config_path, default_config_template};
 use retina_memory_sqlite::{SqliteMemory, write_manifest};
 use retina_types::*;
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -18,17 +21,24 @@ pub fn load_environment() -> Result<()> {
 pub fn init_runtime() -> Result<()> {
     load_environment()?;
     let home = retina_home()?;
+    ensure_runtime_layout(&home)?;
+    println!("Initialized Retina runtime at {}", home.display());
+    Ok(())
+}
+
+fn ensure_runtime_layout(home: &Path) -> Result<()> {
     let root = home.join("root");
     let agents = home.join("agents");
     let shared = home.join("shared").join("promoted_tools");
-    std::fs::create_dir_all(root.join("tools"))?;
-    std::fs::create_dir_all(root_task_output_dir()?)?;
-    std::fs::create_dir_all(agents)?;
-    std::fs::create_dir_all(shared)?;
+    fs::create_dir_all(root.join("tools"))?;
+    fs::create_dir_all(root.join("runtime").join("tasks"))?;
+    fs::create_dir_all(agents)?;
+    fs::create_dir_all(shared)?;
+    ensure_mcp_layout(home)?;
 
     let config_path = home.join("config.toml");
     if !config_path.exists() {
-        std::fs::write(
+        fs::write(
             &config_path,
             "default_agent = \"root\"\nreasoner = \"claude\"\n",
         )?;
@@ -43,7 +53,21 @@ pub fn init_runtime() -> Result<()> {
     );
     memory.save_manifest(&manifest)?;
     write_manifest(root.join("manifest.toml"), &manifest)?;
-    println!("Initialized Retina runtime at {}", home.display());
+    Ok(())
+}
+
+fn ensure_mcp_layout(home: &Path) -> Result<()> {
+    let config_path = default_config_path(home);
+    let parent = config_path.parent().ok_or_else(|| {
+        KernelError::Configuration(format!(
+            "invalid MCP config path: {}",
+            config_path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent)?;
+    if !config_path.exists() {
+        fs::write(&config_path, default_config_template())?;
+    }
     Ok(())
 }
 
@@ -129,5 +153,18 @@ mod tests {
             .push(PathBuf::from("/tmp"));
         let normalized = normalize_root_manifest(manifest);
         assert!(normalized.authority.accessible_roots.is_empty());
+    }
+
+    #[test]
+    fn ensure_mcp_layout_creates_default_servers_config() {
+        let temp = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let home = temp.path().join(".retina");
+        ensure_mcp_layout(&home).unwrap_or_else(|error| panic!("ensure mcp layout: {error}"));
+        let config_path = default_config_path(&home);
+        let content =
+            fs::read_to_string(&config_path).unwrap_or_else(|error| panic!("read config: {error}"));
+        assert!(config_path.exists());
+        assert!(content.contains("[servers.brave]"));
+        assert!(content.contains("BRAVE_API_KEY"));
     }
 }

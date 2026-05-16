@@ -10,7 +10,7 @@ use retina_memory_sqlite::{MemoryStats, SqliteMemory};
 use retina_runtime::{RuntimeTask, RuntimeTaskKind, RuntimeTaskRegistry, TaskSupervisor};
 use retina_shell_cli::{CliShell, ScopedShell};
 use retina_tools::ToolPolicy;
-use retina_traits::{Memory, Shell};
+use retina_traits::{McpRuntime, Memory, Shell};
 use retina_transport_local::{LocalAgentRuntimeService, LocalTransportConfig};
 use retina_types::*;
 use std::panic::{self, AssertUnwindSafe};
@@ -290,6 +290,10 @@ impl InspectController {
 
     pub fn cleanup_memory(&self, config: ConsolidationConfig) -> Result<ConsolidationReport> {
         self.memory.consolidate(&config)
+    }
+
+    pub fn mcp_snapshot(&self) -> Result<McpRegistrySnapshot> {
+        Ok(ConfiguredMcpRuntime::new(default_config_path(&retina_home()?)).snapshot()?)
     }
 
     pub fn agent_registry(&self) -> Result<AgentRegistrySnapshot> {

@@ -8,9 +8,12 @@ use retina_memory_sqlite::{SqliteMemory, write_manifest};
 use retina_runtime::{RuntimeTaskKind, RuntimeTaskStatus, TaskSupervisor, outcome_summary};
 use retina_shell_cli::{CliShell, ScopedShell};
 use retina_tools::ToolPolicy;
-use retina_traits::{AgentRuntime, McpRuntime};
+use retina_traits::{AgentRuntime, McpRuntime, Memory};
 use retina_types::*;
+use serde_json::Value;
 use specialists::{apply_definition, resolve_definition, scoped_authority};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -247,12 +250,18 @@ impl LocalAgentRuntimeService {
             .and_then(|task| task.progress_summary.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| outcome_summary(&Ok(outcome.clone())));
+        let transcript_excerpt = delegated_task_transcript(&self.config.db_path, &runtime_task_id);
+        append_transcript_to_output(
+            snapshot.as_ref().and_then(|task| task.output_path.as_ref()),
+            transcript_excerpt.as_deref(),
+        );
         Ok(DelegatedTaskResult {
             agent_id: manifest.agent_id,
             task_id: runtime_task_id,
             parent_task_id: Some(parent_task.id.clone()),
             status,
             summary,
+            transcript_excerpt,
             output_path: snapshot.and_then(|task| task.output_path),
         })
     }
@@ -325,12 +334,18 @@ impl AgentRuntime for LocalAgentRuntimeService {
             .and_then(|task| task.progress_summary.clone())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| outcome_summary(&Ok(outcome.clone())));
+        let transcript_excerpt = delegated_task_transcript(&self.config.db_path, &child_task_id);
+        append_transcript_to_output(
+            snapshot.as_ref().and_then(|task| task.output_path.as_ref()),
+            transcript_excerpt.as_deref(),
+        );
         Ok(DelegatedTaskResult {
             agent_id: child_agent_id,
             task_id: child_task_id,
             parent_task_id: Some(request.parent_task.id.clone()),
             status,
             summary,
+            transcript_excerpt,
             output_path: snapshot.and_then(|task| task.output_path),
         })
     }
@@ -502,6 +517,162 @@ fn specialist_capability_summary(domain: &str, capability: &str) -> Vec<String> 
     caps
 }
 
+fn delegated_task_transcript(db_path: &std::path::Path, task_id: &TaskId) -> Option<String> {
+    let memory = SqliteMemory::open(db_path).ok()?;
+    let mut events = memory.recent_states(256).ok()?;
+    events.retain(|event| event.task_id == *task_id);
+    events.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    let mut lines = Vec::new();
+    for event in events {
+        match event.event_type {
+            TimelineEventType::ActionDispatched => {
+                if let Some(action) = event
+                    .payload_json
+                    .get("action")
+                    .and_then(|value| value.as_str())
+                {
+                    lines.push(format!("action: {}", compact_action_trace(action)));
+                }
+            }
+            TimelineEventType::ActionResultReceived => {
+                if let Some(line) = summarize_action_result(&event.payload_json) {
+                    lines.push(line);
+                }
+            }
+            TimelineEventType::TaskFailed => {
+                if let Some(reason) = event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                {
+                    lines.push(format!("blocked: {reason}"));
+                }
+            }
+            TimelineEventType::TaskCompleted => {
+                if let Some(summary) = event
+                    .payload_json
+                    .get("final_answer_summary")
+                    .and_then(|value| value.as_str())
+                {
+                    lines.push(format!("done: {summary}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        let start = lines.len().saturating_sub(8);
+        Some(lines.into_iter().skip(start).collect::<Vec<_>>().join("\n"))
+    }
+}
+
+fn summarize_action_result(payload_json: &Value) -> Option<String> {
+    let result = payload_json.get("result")?;
+    if let Some(directory) = result.get("DirectoryListing") {
+        let root = directory.get("root").and_then(|value| value.as_str())?;
+        let summary = directory.get("summary");
+        let total = summary
+            .and_then(|value| value.get("total_entries"))
+            .and_then(|value| value.as_u64())
+            .or_else(|| {
+                directory
+                    .get("entries")
+                    .and_then(|value| value.as_array())
+                    .map(|entries| entries.len() as u64)
+            })
+            .unwrap_or_default();
+        let file_count = summary
+            .and_then(|value| value.get("file_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let dir_count = summary
+            .and_then(|value| value.get("dir_count"))
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        return Some(format!(
+            "observed: listed {root} ({total} entries, {file_count} files, {dir_count} dirs)"
+        ));
+    }
+    if let Some(file) = result.get("FileRead") {
+        let path = file.get("path").and_then(|value| value.as_str())?;
+        return Some(format!("observed: read file {path}"));
+    }
+    if let Some(doc) = result.get("DocumentText") {
+        let path = doc.get("path").and_then(|value| value.as_str())?;
+        return Some(format!("observed: extracted document text {path}"));
+    }
+    if let Some(command) = result.get("Command") {
+        let raw = command
+            .get("stdout")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .trim();
+        let preview = compact_transcript_text(raw, 80);
+        return Some(if preview.is_empty() {
+            "observed: command completed".to_string()
+        } else {
+            format!("observed: command output {preview}")
+        });
+    }
+    if let Some(inspection) = result.get("Inspection") {
+        let count = inspection
+            .get("files")
+            .and_then(|value| value.as_array())
+            .map(|entries| entries.len())
+            .unwrap_or_default();
+        return Some(format!("observed: inspected path ({count} item(s))"));
+    }
+    if let Some(response) = result.get("Response") {
+        let message = response.get("message").and_then(|value| value.as_str())?;
+        return Some(format!(
+            "observed: response {}",
+            compact_transcript_text(message, 180)
+        ));
+    }
+    None
+}
+
+fn compact_transcript_text(value: &str, max_chars: usize) -> String {
+    let collapsed = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let mut preview = collapsed.chars().take(max_chars).collect::<String>();
+    preview.push_str("...");
+    preview
+}
+
+fn append_transcript_to_output(output_path: Option<&PathBuf>, transcript: Option<&str>) {
+    let Some(path) = output_path else {
+        return;
+    };
+    let Some(transcript) = transcript else {
+        return;
+    };
+    if transcript.trim().is_empty() {
+        return;
+    }
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return;
+    };
+    if existing.contains(transcript) {
+        return;
+    }
+    if let Ok(mut file) = OpenOptions::new().append(true).open(path) {
+        let _ = writeln!(file, "\nchild_trace:\n{transcript}");
+    }
+}
+
+fn compact_action_trace(action: &str) -> String {
+    if let Some(message) = action.strip_prefix("respond:") {
+        return format!("respond:{}", compact_transcript_text(message, 180));
+    }
+    compact_transcript_text(action, 180)
+}
+
 fn slug(input: &str) -> String {
     let mut slug = String::new();
     let mut last_was_dash = false;
@@ -603,19 +774,9 @@ mod tests {
             "read and summarize documents",
         ));
 
-        assert!(
-            manifest
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == "read_file")
-        );
-        assert!(
-            manifest
-                .denied_tools
-                .iter()
-                .any(|tool| tool == "run_command")
-        );
-        assert!(!manifest.authority.allow_command_execution);
+        assert_eq!(manifest.allowed_tools, vec!["*".to_string()]);
+        assert!(manifest.denied_tools.is_empty());
+        assert!(manifest.authority.allow_command_execution);
     }
 
     #[test]

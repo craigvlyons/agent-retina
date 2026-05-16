@@ -29,6 +29,7 @@ impl ToolPolicy {
             allowed.insert("search_text".to_string());
         }
         if authority.allow_mcp {
+            allowed.insert("mcp:*".to_string());
             allowed.insert("list_mcp_resources".to_string());
             allowed.insert("read_mcp_resource".to_string());
             allowed.insert("mcp_call".to_string());
@@ -70,7 +71,11 @@ impl ToolPolicy {
         let allowed = self
             .allowed
             .as_ref()
-            .map(|set| set.contains(&tool.name))
+            .map(|set| {
+                set.contains(&tool.name)
+                    || (tool.source == retina_types::ToolSourceKind::McpServer
+                        && set.contains("mcp:*"))
+            })
             .unwrap_or(true);
         allowed && !self.denied.contains(&tool.name)
     }
@@ -95,6 +100,9 @@ impl ToolPolicy {
 
 fn parse_tool_list(value: Option<&String>) -> Option<BTreeSet<String>> {
     let value = value?;
+    if value.split(',').map(str::trim).any(|item| item == "*") {
+        return None;
+    }
     let parsed = value
         .split(',')
         .map(str::trim)
@@ -167,6 +175,17 @@ mod tests {
 
         assert!(policy.permits(&allowed));
         assert!(!policy.permits(&denied));
+
+        let mcp_tool = ToolDescriptor {
+            name: "mcp__brave__brave_web_search".to_string(),
+            description: "search".to_string(),
+            source: ToolSourceKind::McpServer,
+            concurrency: ToolConcurrencyClass::Streaming,
+            approval: ToolApprovalPolicy::None,
+            required_authority: vec!["mcp".to_string()],
+            streaming: true,
+        };
+        assert!(!policy.permits(&mcp_tool));
     }
 
     #[test]
@@ -205,5 +224,73 @@ mod tests {
 
         assert!(policy.permits(&allowed));
         assert!(!policy.permits(&denied));
+    }
+
+    #[test]
+    fn authority_mcp_permission_allows_concrete_mcp_tools() {
+        let policy = ToolPolicy::from_authority(&AgentAuthority {
+            allow_command_execution: false,
+            allow_file_reads: false,
+            allow_file_writes: false,
+            allow_file_search: false,
+            allow_mcp: true,
+            allow_agent_delegation: false,
+            allow_notes: false,
+            allow_text_responses: true,
+            accessible_roots: vec![],
+        });
+
+        let mcp_tool = ToolDescriptor {
+            name: "mcp__brave__brave_web_search".to_string(),
+            description: "search".to_string(),
+            source: ToolSourceKind::McpServer,
+            concurrency: ToolConcurrencyClass::Streaming,
+            approval: ToolApprovalPolicy::None,
+            required_authority: vec!["mcp".to_string()],
+            streaming: true,
+        };
+
+        assert!(policy.permits(&mcp_tool));
+    }
+
+    #[test]
+    fn wildcard_allowed_tools_means_inherit_full_surface() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert("allowed_tools".to_string(), "*,read_file".to_string());
+        metadata.insert("denied_tools".to_string(), "run_command".to_string());
+        let policy = ToolPolicy::from_authority(&AgentAuthority {
+            allow_command_execution: true,
+            allow_file_reads: true,
+            allow_file_writes: false,
+            allow_file_search: true,
+            allow_mcp: false,
+            allow_agent_delegation: false,
+            allow_notes: false,
+            allow_text_responses: true,
+            accessible_roots: vec![],
+        })
+        .with_task_metadata(&metadata);
+
+        let read_file = ToolDescriptor {
+            name: "read_file".to_string(),
+            description: "read".to_string(),
+            source: ToolSourceKind::BuiltinShell,
+            concurrency: ToolConcurrencyClass::ReadOnly,
+            approval: ToolApprovalPolicy::None,
+            required_authority: vec![],
+            streaming: false,
+        };
+        let list_directory = ToolDescriptor {
+            name: "list_directory".to_string(),
+            ..read_file.clone()
+        };
+        let run_command = ToolDescriptor {
+            name: "run_command".to_string(),
+            ..read_file.clone()
+        };
+
+        assert!(policy.permits(&read_file));
+        assert!(policy.permits(&list_directory));
+        assert!(!policy.permits(&run_command));
     }
 }

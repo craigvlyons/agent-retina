@@ -55,7 +55,7 @@ impl Kernel {
                 .iter()
                 .map(|constraint| format!("{constraint:?}"))
                 .collect(),
-            max_tokens: Some(768),
+            max_tokens: Some(1536),
         })?;
         self.emit_event(EventSpec::new(
             task,
@@ -161,6 +161,11 @@ impl Kernel {
             "before action execution",
         )? {
             return Ok(ActionExecution::Outcome(outcome));
+        }
+
+        if let Some(reason) = self.invalid_mcp_fileish_reference_reason(&action)? {
+            self.circuit_breaker.record_failure(intent);
+            return Ok(ActionExecution::Outcome(Outcome::Failure(reason)));
         }
 
         let mut result = match &action {
@@ -540,6 +545,34 @@ impl Kernel {
         };
         self.memory.append_timeline_event(&event)
     }
+
+    fn invalid_mcp_fileish_reference_reason(&self, action: &Action) -> Result<Option<String>> {
+        let Some(runtime) = &self.mcp_runtime else {
+            return Ok(None);
+        };
+        let snapshot = runtime.snapshot()?;
+
+        let target = match action {
+            Action::ReadFile { path, .. }
+            | Action::InspectPath { path, .. }
+            | Action::ListDirectory { path, .. }
+            | Action::ExtractDocumentText { path, .. } => path.to_str().map(str::to_string),
+            Action::FindFiles { root, .. } | Action::SearchText { root, .. } => {
+                root.to_str().map(str::to_string)
+            }
+            _ => None,
+        };
+
+        let Some(target) = target else {
+            return Ok(None);
+        };
+        if let Some(locator) = resolve_mcp_locator_reference(&snapshot, &target) {
+            return Ok(Some(format!(
+                "{locator} is MCP output, not a filesystem path; use the MCP result directly or call another MCP tool instead"
+            )));
+        }
+        Ok(None)
+    }
 }
 
 fn describe_task_phase(state: &TaskLoopState, current_step: usize, max_steps: usize) -> String {
@@ -586,4 +619,27 @@ fn synthesize_approval_denied_blocker(
         latest_status,
         action_label(action)
     )
+}
+
+fn resolve_mcp_locator_reference(snapshot: &McpRegistrySnapshot, target: &str) -> Option<String> {
+    if target.starts_with("mcp-tool://") || target.starts_with("mcp-resource://") {
+        return Some(target.to_string());
+    }
+
+    let (server, remainder) = target.split_once('/')?;
+    let server_snapshot = snapshot.servers.iter().find(|entry| entry.name == server)?;
+
+    if server_snapshot.tools.iter().any(|tool| tool.name == remainder) {
+        return Some(format!("mcp-tool://{server}/{remainder}"));
+    }
+
+    if server_snapshot
+        .resources
+        .iter()
+        .any(|resource| resource.uri == remainder)
+    {
+        return Some(format!("mcp-resource://{server}/{remainder}"));
+    }
+
+    None
 }

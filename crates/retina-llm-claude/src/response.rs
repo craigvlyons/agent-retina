@@ -38,12 +38,9 @@ pub(crate) fn extract_json_blob(text: &str) -> Result<String> {
         return Ok(trimmed.to_string());
     }
 
-    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if start < end {
-            let candidate = trimmed[start..=end].trim();
-            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
-                return Ok(candidate.to_string());
-            }
+    if let Some(candidate) = extract_balanced_json_object(trimmed) {
+        if serde_json::from_str::<serde_json::Value>(&candidate).is_ok() {
+            return Ok(candidate);
         }
     }
 
@@ -51,6 +48,46 @@ pub(crate) fn extract_json_blob(text: &str) -> Result<String> {
         "Claude did not return parseable JSON. Raw response: {}",
         trimmed
     )))
+}
+
+fn extract_balanced_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset;
+                    return Some(text[start..=end].trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,7 +186,7 @@ pub(crate) struct ClaudeAction {
 
 impl ClaudeAction {
     pub(crate) fn into_reason_response(self) -> Result<ReasonResponse> {
-        let task_complete = self.task_complete.unwrap_or(true);
+        let task_complete = self.task_complete.unwrap_or(false);
         let framing = if self.intent_kind.is_some()
             || self.deliverable.is_some()
             || self.completion_basis.is_some()
@@ -166,7 +203,7 @@ impl ClaudeAction {
         let action = match self.action_type.as_str() {
             "run_command" => Action::RunCommand {
                 id: ActionId::new(),
-                command: self.command.unwrap_or_else(|| "pwd".to_string()),
+                command: required_string(self.command, "run_command", "command")?,
                 cwd: None,
                 require_approval: self.require_approval.unwrap_or(false),
                 expect_change: self.expect_change.unwrap_or(self.path.is_some()),
@@ -187,40 +224,41 @@ impl ClaudeAction {
             },
             "inspect_path" => Action::InspectPath {
                 id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
+                path: required_string(self.path, "inspect_path", "path")?.into(),
                 include_content: self.include_content.unwrap_or(true),
             },
             "list_directory" => Action::ListDirectory {
                 id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
+                path: required_string(self.path, "list_directory", "path")?.into(),
                 recursive: self.recursive.unwrap_or(false),
                 max_entries: self.max_entries.unwrap_or(100),
             },
             "find_files" => Action::FindFiles {
                 id: ActionId::new(),
-                root: self.root.unwrap_or_else(|| ".".to_string()).into(),
-                pattern: self.pattern.unwrap_or_else(|| "*".to_string()),
+                root: required_string(self.root, "find_files", "root")?.into(),
+                pattern: required_string(self.pattern, "find_files", "pattern")?,
+                recursive: self.recursive.unwrap_or(true),
                 max_results: self.max_results.unwrap_or(50),
             },
             "search_text" => Action::SearchText {
                 id: ActionId::new(),
-                root: self.root.unwrap_or_else(|| ".".to_string()).into(),
-                query: self.query.unwrap_or_default(),
+                root: required_string(self.root, "search_text", "root")?.into(),
+                query: required_string(self.query, "search_text", "query")?,
                 max_results: self.max_results.unwrap_or(25),
             },
             "read_file" => Action::ReadFile {
                 id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
+                path: required_string(self.path, "read_file", "path")?.into(),
                 max_bytes: self.max_bytes,
             },
             "ingest_structured_data" => Action::IngestStructuredData {
                 id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
+                path: required_string(self.path, "ingest_structured_data", "path")?.into(),
                 max_rows: self.max_rows,
             },
             "extract_document_text" => Action::ExtractDocumentText {
                 id: ActionId::new(),
-                path: self.path.unwrap_or_else(|| ".".to_string()).into(),
+                path: required_string(self.path, "extract_document_text", "path")?.into(),
                 max_chars: self.max_chars,
                 page_start: self.page_start,
                 page_end: self.page_end,
@@ -244,11 +282,12 @@ impl ClaudeAction {
                             .to_string(),
                     )
                 })?,
+                resolved_tool_name: None,
             },
             "write_file" => Action::WriteFile {
                 id: ActionId::new(),
                 path: required_string(self.path, "write_file", "path")?.into(),
-                content: self.content.unwrap_or_default(),
+                content: required_string(self.content, "write_file", "content")?,
                 overwrite: self.overwrite.unwrap_or(false),
             },
             "edit_file" => Action::EditFile {
@@ -261,7 +300,7 @@ impl ClaudeAction {
             "append_file" => Action::AppendFile {
                 id: ActionId::new(),
                 path: required_string(self.path, "append_file", "path")?.into(),
-                content: self.content.unwrap_or_default(),
+                content: required_string(self.content, "append_file", "content")?,
             },
             "edit_notebook" => Action::EditNotebook {
                 id: ActionId::new(),
@@ -291,23 +330,47 @@ impl ClaudeAction {
             },
             "spawn_agent" => Action::SpawnAgent {
                 id: ActionId::new(),
-                prompt: self
-                    .prompt
-                    .or(self.message.clone())
-                    .unwrap_or_else(|| "Investigate the delegated subtask.".to_string()),
+                prompt: required_string(
+                    self.prompt.or(self.message.clone()),
+                    "spawn_agent",
+                    "prompt",
+                )?,
                 allowed_tools: self.allowed_tools.unwrap_or_default(),
                 denied_tools: self.denied_tools.unwrap_or_default(),
             },
             "record_note" => Action::RecordNote {
                 id: ActionId::new(),
-                note: self.note.unwrap_or_else(|| "No note provided".to_string()),
+                note: required_string(self.note, "record_note", "note")?,
             },
-            _ => Action::Respond {
+            "respond" => Action::Respond {
                 id: ActionId::new(),
-                message: self
-                    .message
-                    .unwrap_or_else(|| "I need a more specific task.".to_string()),
+                message: required_string(
+                    self.message.or(self.content),
+                    "respond",
+                    "message",
+                )?,
             },
+            other => {
+                if let Some((server, tool)) = parse_mcp_tool_name(other) {
+                    Action::CallMcpTool {
+                        id: ActionId::new(),
+                        server,
+                        tool,
+                        input_json: self.input_json.ok_or_else(|| {
+                            KernelError::Reasoning(format!(
+                                "invalid Claude action '{}': missing required field 'input_json'",
+                                other
+                            ))
+                        })?,
+                        resolved_tool_name: Some(other.to_string()),
+                    }
+                } else {
+                    return Err(KernelError::Reasoning(format!(
+                        "invalid Claude action type '{}'",
+                        other
+                    )));
+                }
+            }
         };
 
         Ok(ReasonResponse {

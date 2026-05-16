@@ -36,6 +36,7 @@ pub enum InspectCommands {
     TaskState,
     Tasks,
     Overview,
+    Mcp,
     Agents,
     Memory {
         #[arg(default_value = "")]

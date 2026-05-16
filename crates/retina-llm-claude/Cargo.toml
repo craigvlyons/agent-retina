@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+chrono.workspace = true
 dirs.workspace = true
 reqwest.workspace = true
 retina-traits = { path = "../retina-traits" }

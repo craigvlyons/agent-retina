@@ -3,7 +3,7 @@ use crate::support::recover_mutex;
 
 use retina_test_utils::{MockMemory, MockReasoner, MockShell};
 use retina_tools::ToolPolicy;
-use retina_traits::AgentRuntime;
+use retina_traits::{AgentRuntime, McpRuntime};
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
 
@@ -76,6 +76,34 @@ struct MockLocalAgentRuntime {
     result: DelegatedTaskResult,
     calls: Arc<Mutex<usize>>,
     routed_calls: Arc<Mutex<usize>>,
+}
+
+#[derive(Clone, Default)]
+struct MockMcpRuntime {
+    snapshot: McpRegistrySnapshot,
+}
+
+impl McpRuntime for MockMcpRuntime {
+    fn snapshot(&self) -> Result<McpRegistrySnapshot> {
+        Ok(self.snapshot.clone())
+    }
+
+    fn list_resources(&self, _server: Option<&str>) -> Result<Vec<McpResourceSummary>> {
+        Ok(Vec::new())
+    }
+
+    fn read_resource(&self, _server: &str, _uri: &str) -> Result<McpResourceReadResult> {
+        Err(KernelError::Unsupported("not used in test".to_string()))
+    }
+
+    fn call_tool(
+        &self,
+        _server: &str,
+        _tool: &str,
+        _input_json: &serde_json::Value,
+    ) -> Result<McpToolCallResult> {
+        Err(KernelError::Unsupported("not used in test".to_string()))
+    }
 }
 
 impl AgentRuntime for MockLocalAgentRuntime {
@@ -234,6 +262,96 @@ fn assembled_context_exposes_callable_tools_not_memory_records() {
 }
 
 #[test]
+fn invalid_mcp_fileish_read_is_recorded_as_failed_step() {
+    let reasoner = GuidanceReasoner::new(vec![
+        ReasonResponse {
+            action: Action::ReadFile {
+                id: ActionId::new(),
+                path: "brave/brave_web_search".into(),
+                max_bytes: None,
+            },
+            task_complete: false,
+            framing: None,
+            reasoning: Some("try opening the MCP result".to_string()),
+            tokens_used: TokenUsage::default(),
+        },
+        ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "answered from the MCP result".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("recover after bad MCP file step".to_string()),
+            tokens_used: TokenUsage::default(),
+        },
+    ]);
+    let kernel = must(Kernel::new_with_runtime(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(MockMemory::default()),
+        AgentRegistrySnapshot::default(),
+        ToolPolicy::from_authority(&AgentAuthority {
+            allow_command_execution: false,
+            allow_file_reads: true,
+            allow_file_writes: false,
+            allow_file_search: false,
+            allow_mcp: true,
+            allow_agent_delegation: false,
+            allow_notes: false,
+            allow_text_responses: true,
+            accessible_roots: vec![],
+        }),
+        None,
+        Some(Arc::new(MockMcpRuntime {
+            snapshot: McpRegistrySnapshot {
+                servers: vec![McpServerSnapshot {
+                    name: "brave".to_string(),
+                    tools: vec![McpToolSummary {
+                        server: "brave".to_string(),
+                        name: "brave_web_search".to_string(),
+                        description: Some("Search the web".to_string()),
+                        input_schema: serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "query": { "type": "string" }
+                            },
+                            "required": ["query"]
+                        }),
+                        read_only: true,
+                        destructive: false,
+                        open_world: true,
+                    }],
+                    resources: Vec::new(),
+                    error: None,
+                }],
+            },
+        })),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        Task::new(AgentId::new(), "search the web for what is happening this weekend"),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let seen = reasoner.seen_task_states();
+    assert_eq!(seen.len(), 2);
+    let last = seen[1]
+        .recent_actions
+        .last()
+        .unwrap_or_else(|| panic!("expected recent failed action"));
+    assert!(matches!(last.status, RecentActionStatus::Failed));
+    assert!(last.outcome.contains("mcp-tool://brave/brave_web_search"));
+}
+
+#[test]
 fn authority_backed_tool_policy_filters_prompt_tool_pool() {
     let reasoner = GuidanceReasoner::new(vec![ReasonResponse {
         action: Action::Respond {
@@ -291,6 +409,9 @@ fn spawn_agent_action_dispatches_through_local_agent_runtime() {
         parent_task_id: None,
         status: DelegatedTaskStatus::Completed,
         summary: "child found the answer".to_string(),
+        transcript_excerpt: Some(
+            "action: read_file:/tmp/startup.md\nobserved: read file /tmp/startup.md".to_string(),
+        ),
         output_path: None,
     };
     let local_runtime = MockLocalAgentRuntime {
@@ -347,6 +468,9 @@ fn router_dispatches_existing_specialist_through_agent_runtime() {
         parent_task_id: None,
         status: DelegatedTaskStatus::Completed,
         summary: "research specialist completed the task".to_string(),
+        transcript_excerpt: Some(
+            "action: list_directory:/tmp\nobserved: listed /tmp (4 entries)".to_string(),
+        ),
         output_path: None,
     };
     let local_runtime = MockLocalAgentRuntime {
@@ -607,6 +731,7 @@ fn output_flow_reaches_write_without_prompt_recovery_layer() {
                     id: ActionId::new(),
                     root: ".".into(),
                     pattern: "*summary*".to_string(),
+                    recursive: true,
                     max_results: 20,
                 },
                 task_complete: false,
@@ -686,7 +811,7 @@ fn output_flow_reaches_write_without_prompt_recovery_layer() {
     assert!(
         !dispatched
             .iter()
-            .any(|action| action.starts_with("find_files:.:*summary*"))
+            .any(|action| action.starts_with("find_files:.:*summary*:recursive=true"))
     );
 }
 

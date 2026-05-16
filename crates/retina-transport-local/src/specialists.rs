@@ -75,7 +75,7 @@ pub fn scoped_authority(
 ) -> AgentAuthority {
     let mut scoped = parent.clone();
     scoped.allow_agent_delegation = allow_agent_delegation_default;
-    if !allowed_tools.is_empty() {
+    if !allowed_tools.is_empty() && !uses_full_parent_toolset(allowed_tools) {
         scoped.allow_command_execution = allowed_tools.iter().any(|tool| tool == "run_command");
         scoped.allow_file_reads = allowed_tools.iter().any(|tool| {
             matches!(
@@ -126,6 +126,10 @@ pub fn scoped_authority(
     scoped
 }
 
+fn uses_full_parent_toolset(allowed_tools: &[String]) -> bool {
+    allowed_tools.iter().any(|tool| tool.trim() == "*")
+}
+
 fn validate_definition(definition: &SpecialistDefinition, path: &Path) -> Result<()> {
     if definition.description.trim().is_empty() {
         return Err(KernelError::Configuration(format!(
@@ -170,6 +174,14 @@ fn builtin_definition_for(domain: &str) -> SpecialistDefinition {
     }
 }
 
+fn general_purpose_role_prompt() -> String {
+    "You are a local general-purpose specialist. Use the available tools to complete the delegated task fully. Search broadly when you do not yet know where something lives, stay grounded in observed evidence, and return only the essential result for the parent worker.".to_string()
+}
+
+fn general_purpose_initial_prompt() -> String {
+    "Complete the delegated task fully. Search broadly when the location or answer is not yet clear, narrow down from the strongest evidence, and once you have enough grounded information, return a concise factual result for the parent worker. For simple directory or file inventory tasks, one grounded listing is usually enough; do not repeat the same listing or open child files unless the task actually needs file contents. Treat requests for files on or in a folder as top-level scope by default; only descend into nested folders when the task says under, recursively, across subfolders, or otherwise clearly asks for nested contents. When matching files for a top-level folder request, keep the file-match scope top-level as well instead of mixing nested results into the same answer. Keep simple inventory and summary answers short: counts, notable items, and brief content summaries are enough unless the task asks for full detail.".to_string()
+}
+
 fn code_specialist() -> SpecialistDefinition {
     SpecialistDefinition {
         description: "Local code specialist for implementation, patches, and command-backed verification.".to_string(),
@@ -208,9 +220,9 @@ fn code_specialist() -> SpecialistDefinition {
 
 fn research_specialist() -> SpecialistDefinition {
     SpecialistDefinition {
-        description: "Local research specialist for reading, extracting, and synthesizing local sources.".to_string(),
-        role_prompt: "You are a local research specialist. Focus on reading available sources, extracting grounded facts, and returning a concise synthesis for the parent worker.".to_string(),
-        initial_prompt: "Read the available sources, extract the strongest grounded facts, and return a concise synthesis for the parent worker without unnecessary interpretation.".to_string(),
+        description: "Local general-purpose research specialist for complex questions, file search, and multi-step delegated tasks.".to_string(),
+        role_prompt: general_purpose_role_prompt(),
+        initial_prompt: general_purpose_initial_prompt(),
         model_id: None,
         capabilities: vec![
             "research".to_string(),
@@ -218,25 +230,10 @@ fn research_specialist() -> SpecialistDefinition {
             "synthesis".to_string(),
             "search".to_string(),
         ],
-        allowed_tools: vec![
-            "inspect_path".to_string(),
-            "list_directory".to_string(),
-            "find_files".to_string(),
-            "search_text".to_string(),
-            "read_file".to_string(),
-            "ingest_structured_data".to_string(),
-            "extract_document_text".to_string(),
-            "edit_file".to_string(),
-            "write_file".to_string(),
-            "append_file".to_string(),
-            "edit_notebook".to_string(),
-            "record_note".to_string(),
-            "respond".to_string(),
-            "agent_spawn".to_string(),
-        ],
-        denied_tools: vec!["run_command".to_string()],
+        allowed_tools: vec!["*".to_string()],
+        denied_tools: Vec::new(),
         required_mcp_servers: Vec::new(),
-        max_steps: 12,
+        max_steps: 14,
     }
 }
 
@@ -307,9 +304,9 @@ fn ops_specialist() -> SpecialistDefinition {
 
 fn generalist_specialist() -> SpecialistDefinition {
     SpecialistDefinition {
-        description: "Local generalist specialist for reusable multi-step work.".to_string(),
-        role_prompt: "You are a local generalist specialist. Focus on bounded multi-step execution, grounded use of available tools, and a concise result for the parent worker.".to_string(),
-        initial_prompt: "Stay within the delegated scope, use the available tools in grounded steps, and return a concise result that the parent worker can use directly.".to_string(),
+        description: "Local general-purpose specialist for reusable multi-step work.".to_string(),
+        role_prompt: general_purpose_role_prompt(),
+        initial_prompt: general_purpose_initial_prompt(),
         model_id: None,
         capabilities: vec![
             "generalist".to_string(),
@@ -317,25 +314,10 @@ fn generalist_specialist() -> SpecialistDefinition {
             "search".to_string(),
             "notes".to_string(),
         ],
-        allowed_tools: vec![
-            "inspect_path".to_string(),
-            "list_directory".to_string(),
-            "find_files".to_string(),
-            "search_text".to_string(),
-            "read_file".to_string(),
-            "ingest_structured_data".to_string(),
-            "extract_document_text".to_string(),
-            "edit_file".to_string(),
-            "write_file".to_string(),
-            "append_file".to_string(),
-            "edit_notebook".to_string(),
-            "record_note".to_string(),
-            "respond".to_string(),
-            "agent_spawn".to_string(),
-        ],
-        denied_tools: vec!["run_command".to_string()],
+        allowed_tools: vec!["*".to_string()],
+        denied_tools: Vec::new(),
         required_mcp_servers: Vec::new(),
-        max_steps: 12,
+        max_steps: 14,
     }
 }
 
@@ -362,7 +344,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn research_definition_scopes_command_execution_off() {
+    fn research_definition_inherits_full_parent_tool_surface() {
         let now = Utc::now();
         let manifest = AgentManifest {
             agent_id: AgentId("specialist-research".to_string()),
@@ -390,29 +372,47 @@ mod tests {
         assert_eq!(
             manifest.role_prompt.as_deref(),
             Some(
-                "You are a local research specialist. Focus on reading available sources, extracting grounded facts, and returning a concise synthesis for the parent worker."
+                "You are a local general-purpose specialist. Use the available tools to complete the delegated task fully. Search broadly when you do not yet know where something lives, stay grounded in observed evidence, and return only the essential result for the parent worker."
             )
         );
         assert_eq!(
             manifest.initial_prompt.as_deref(),
             Some(
-                "Read the available sources, extract the strongest grounded facts, and return a concise synthesis for the parent worker without unnecessary interpretation."
+                "Complete the delegated task fully. Search broadly when the location or answer is not yet clear, narrow down from the strongest evidence, and once you have enough grounded information, return a concise factual result for the parent worker. For simple directory or file inventory tasks, one grounded listing is usually enough; do not repeat the same listing or open child files unless the task actually needs file contents. Treat requests for files on or in a folder as top-level scope by default; only descend into nested folders when the task says under, recursively, across subfolders, or otherwise clearly asks for nested contents. When matching files for a top-level folder request, keep the file-match scope top-level as well instead of mixing nested results into the same answer. Keep simple inventory and summary answers short: counts, notable items, and brief content summaries are enough unless the task asks for full detail."
             )
         );
         assert_eq!(manifest.model_id, None);
-        assert!(
-            manifest
-                .allowed_tools
-                .iter()
-                .any(|tool| tool == "read_file")
+        assert_eq!(manifest.allowed_tools, vec!["*".to_string()]);
+        assert!(manifest.denied_tools.is_empty());
+        assert!(manifest.authority.allow_command_execution);
+        assert!(manifest.authority.allow_file_reads);
+        assert!(manifest.authority.allow_file_search);
+    }
+
+    #[test]
+    fn wildcard_allowed_tools_preserves_parent_authority() {
+        let authority = scoped_authority(
+            &AgentAuthority {
+                allow_command_execution: true,
+                allow_file_reads: true,
+                allow_file_writes: false,
+                allow_file_search: true,
+                allow_mcp: false,
+                allow_agent_delegation: true,
+                allow_notes: false,
+                allow_text_responses: true,
+                accessible_roots: vec![],
+            },
+            &["*".to_string()],
+            &[],
+            true,
         );
-        assert!(
-            manifest
-                .denied_tools
-                .iter()
-                .any(|tool| tool == "run_command")
-        );
-        assert!(!manifest.authority.allow_command_execution);
+
+        assert!(authority.allow_command_execution);
+        assert!(authority.allow_file_reads);
+        assert!(authority.allow_file_search);
+        assert!(!authority.allow_file_writes);
+        assert!(authority.allow_agent_delegation);
     }
 
     #[test]

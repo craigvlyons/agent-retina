@@ -49,19 +49,22 @@ impl ConfiguredMcpRuntime {
     ) -> Result<T> {
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|error| KernelError::Execution(format!("start tokio runtime: {error}")))?;
-        let mut command = tokio::process::Command::new(&config.command);
-        command.args(&config.args);
-        if let Some(cwd) = &config.cwd {
-            command.current_dir(cwd);
-        }
-        for (key, value) in &config.env {
-            command.env(key, value);
-        }
-        let transport = TokioChildProcess::new(command)
-            .map_err(|error| KernelError::Execution(format!("spawn MCP server: {error}")))?;
-        let client = runtime
-            .block_on(async { ().serve(transport).await })
-            .map_err(|error| KernelError::Execution(format!("connect MCP server: {error}")))?;
+        let client = runtime.block_on(async {
+            let mut command = tokio::process::Command::new(&config.command);
+            command.args(&config.args);
+            if let Some(cwd) = &config.cwd {
+                command.current_dir(cwd);
+            }
+            for (key, value) in &config.env {
+                command.env(key, value);
+            }
+            let transport = TokioChildProcess::new(command).map_err(|error| {
+                KernelError::Execution(format!("spawn MCP server: {error}"))
+            })?;
+            ().serve(transport)
+                .await
+                .map_err(|error| KernelError::Execution(format!("connect MCP server: {error}")))
+        })?;
         op(&runtime, client)
     }
 
@@ -87,11 +90,17 @@ impl McpRuntime for ConfiguredMcpRuntime {
                     .map_err(|error| {
                         KernelError::Execution(format!("list MCP tools for {name}: {error}"))
                     })?;
-                let resources = runtime
+                let resources = match runtime
                     .block_on(async { client.peer().list_all_resources().await })
-                    .map_err(|error| {
-                        KernelError::Execution(format!("list MCP resources for {name}: {error}"))
-                    })?;
+                {
+                    Ok(resources) => resources,
+                    Err(error) if is_method_not_found_error(&error.to_string()) => Vec::new(),
+                    Err(error) => {
+                        return Err(KernelError::Execution(format!(
+                            "list MCP resources for {name}: {error}"
+                        )));
+                    }
+                };
                 Ok(McpServerSnapshot {
                     name: name.clone(),
                     tools: tools
@@ -185,6 +194,10 @@ impl McpRuntime for ConfiguredMcpRuntime {
     }
 }
 
+fn is_method_not_found_error(message: &str) -> bool {
+    message.contains("-32601") || message.to_ascii_lowercase().contains("method not found")
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct McpConfigFile {
     #[serde(default)]
@@ -208,6 +221,7 @@ fn summarize_tool(server: &str, tool: rmcp::model::Tool) -> McpToolSummary {
         server: server.to_string(),
         name: tool.name.to_string(),
         description: tool.description.map(|value| value.to_string()),
+        input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
         read_only: annotations
             .and_then(|value| value.read_only_hint)
             .unwrap_or(false),
@@ -282,4 +296,21 @@ fn summarize_tool_content(content: &[rmcp::model::Content]) -> String {
 
 pub fn default_config_path(retina_home: &Path) -> PathBuf {
     retina_home.join("mcp").join("servers.toml")
+}
+
+pub fn default_config_template() -> String {
+    r#"# Retina MCP server configuration
+#
+# Each server runs as a stdio MCP process.
+# Enable the ones you actually want the agent to use.
+#
+# Example Brave Search server:
+# [servers.brave]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-brave-search"]
+# enabled = false
+# [servers.brave.env]
+# BRAVE_API_KEY = "${BRAVE_API_KEY}"
+"#
+    .to_string()
 }

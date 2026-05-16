@@ -193,17 +193,24 @@ impl Shell for CliShell {
                 recursive,
                 max_entries,
                 ..
-            } => Ok(ActionResult::DirectoryListing {
-                root: Self::resolve_path(path)?,
-                entries: Self::list_directory(
+            } => {
+                let root = Self::resolve_path(path)?;
+                let entries = Self::list_directory(
                     path,
                     *recursive,
                     (*max_entries).min(DEFAULT_MAX_LIST_ENTRIES),
-                )?,
-            }),
+                )?;
+                let summary = Self::summarize_directory_entries(&entries);
+                Ok(ActionResult::DirectoryListing {
+                    root,
+                    entries,
+                    summary,
+                })
+            }
             Action::FindFiles {
                 root,
                 pattern,
+                recursive,
                 max_results,
                 ..
             } => Ok(ActionResult::FileMatches {
@@ -212,6 +219,7 @@ impl Shell for CliShell {
                 matches: Self::find_files(
                     root,
                     pattern,
+                    *recursive,
                     (*max_results).min(DEFAULT_MAX_SEARCH_RESULTS),
                 )?,
             }),
@@ -857,6 +865,23 @@ mod tests {
     }
 
     #[test]
+    fn read_file_rejects_mcp_tool_locator() {
+        let shell = CliShell::new();
+        let error = match shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: PathBuf::from("mcp-tool://brave/brave_web_search"),
+            max_bytes: None,
+        }) {
+            Ok(_) => panic!("expected unsupported error"),
+            Err(error) => error,
+        };
+        let KernelError::Unsupported(message) = error else {
+            panic!("expected unsupported error");
+        };
+        assert!(message.contains("MCP locator"));
+    }
+
+    #[test]
     fn find_files_returns_matches() {
         let dir = must_tempdir();
         let target = dir.path().join("target.txt");
@@ -866,12 +891,57 @@ mod tests {
             id: ActionId::new(),
             root: dir.path().to_path_buf(),
             pattern: "target".to_string(),
+            recursive: true,
             max_results: 10,
         }));
         let ActionResult::FileMatches { matches, .. } = result else {
             panic!("expected file matches");
         };
         assert_eq!(matches, vec![target]);
+    }
+
+    #[test]
+    fn find_files_supports_simple_glob_patterns() {
+        let dir = must_tempdir();
+        let target = dir.path().join("report.txt");
+        let other = dir.path().join("report.md");
+        must(fs::write(&target, "hello"));
+        must(fs::write(&other, "hello"));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::FindFiles {
+            id: ActionId::new(),
+            root: dir.path().to_path_buf(),
+            pattern: "*.txt".to_string(),
+            recursive: true,
+            max_results: 10,
+        }));
+        let ActionResult::FileMatches { matches, .. } = result else {
+            panic!("expected file matches");
+        };
+        assert_eq!(matches, vec![target]);
+    }
+
+    #[test]
+    fn find_files_can_stay_top_level_only() {
+        let dir = must_tempdir();
+        let top_level = dir.path().join("top.txt");
+        let nested_dir = dir.path().join("nested");
+        let nested = nested_dir.join("deep.txt");
+        must(fs::create_dir_all(&nested_dir));
+        must(fs::write(&top_level, "hello"));
+        must(fs::write(&nested, "hello"));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::FindFiles {
+            id: ActionId::new(),
+            root: dir.path().to_path_buf(),
+            pattern: "*.txt".to_string(),
+            recursive: false,
+            max_results: 10,
+        }));
+        let ActionResult::FileMatches { matches, .. } = result else {
+            panic!("expected file matches");
+        };
+        assert_eq!(matches, vec![top_level]);
     }
 
     #[test]

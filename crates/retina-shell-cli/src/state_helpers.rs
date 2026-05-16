@@ -37,6 +37,13 @@ impl CliShell {
     }
 
     pub(crate) fn resolve_path(path: &Path) -> Result<PathBuf> {
+        if let Some(raw) = path.to_str() {
+            if raw.starts_with("mcp-tool://") || raw.starts_with("mcp-resource://") {
+                return Err(KernelError::Unsupported(format!(
+                    "{raw} is an MCP locator, not a filesystem path; use the MCP result directly or call another MCP tool instead"
+                )));
+            }
+        }
         if let Some(expanded) = expand_homeish_path(path) {
             return Ok(expanded);
         }

@@ -22,11 +22,18 @@ pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
             }
         ),
         ActionResult::Inspection(world) => format!("inspected {} path(s)", world.files.len()),
-        ActionResult::DirectoryListing { root, entries } => format!(
-            "listed {} entr{} under {} [{}]",
+        ActionResult::DirectoryListing {
+            root,
+            entries,
+            summary,
+        } => format!(
+            "listed {} entr{} under {} (files={}, dirs={}, hidden={}) [{}]",
             entries.len(),
             if entries.len() == 1 { "y" } else { "ies" },
             root.display(),
+            summary.file_count,
+            summary.dir_count,
+            summary.hidden_count,
             preview_paths(entries.iter().map(|entry| entry.path.clone()).collect())
         ),
         ActionResult::FileMatches {
@@ -114,10 +121,11 @@ pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
             if result.contents.len() == 1 { "" } else { "s" }
         ),
         ActionResult::McpToolCall(result) => format!(
-            "called MCP tool {}/{}{}",
+            "called MCP tool {}/{}{}{}",
             result.server,
             result.tool,
-            if result.is_error { " with error" } else { "" }
+            if result.is_error { " with error" } else { "" },
+            summarize_mcp_tool_signal(result)
         ),
         ActionResult::FileWrite {
             path,
@@ -199,10 +207,21 @@ pub(crate) fn compact_action_result_for_context(
                 .map(|path| path.path.display().to_string())
                 .collect::<Vec<_>>(),
         }),
-        ActionResult::DirectoryListing { root, entries } => serde_json::json!({
+        ActionResult::DirectoryListing {
+            root,
+            entries,
+            summary,
+        } => serde_json::json!({
             "type": "directory_listing",
             "root": root,
             "count": entries.len(),
+            "summary": {
+                "total_entries": summary.total_entries,
+                "file_count": summary.file_count,
+                "dir_count": summary.dir_count,
+                "hidden_count": summary.hidden_count,
+                "sample_names": summary.sample_names,
+            },
             "entries": entries
                 .iter()
                 .take(12)
@@ -346,6 +365,10 @@ pub(crate) fn compact_action_result_for_context(
             "parent_task_id": result.parent_task_id,
             "status": result.status,
             "summary": preview_text(&result.summary, 200),
+            "transcript_excerpt": result
+                .transcript_excerpt
+                .as_ref()
+                .map(|value| preview_text(value, 800)),
             "output_path": result.output_path,
         }),
         ActionResult::NoteRecorded { note } => serde_json::json!({
@@ -849,12 +872,12 @@ pub(crate) fn working_sources_for_result(
             .collect(),
         ActionResult::McpResourceRead(result) => vec![WorkingSource {
             kind: "mcp_resource".to_string(),
-            locator: format!("{}/{}", result.server, result.uri),
+            locator: format!("mcp-resource://{}/{}", result.server, result.uri),
             role: "authoritative".to_string(),
             status: "read".to_string(),
             why_it_matters: "MCP resource content is informing the current task".to_string(),
             last_used_step: step_index,
-            evidence_refs: vec![format!("{}/{}", result.server, result.uri)],
+            evidence_refs: vec![format!("mcp-resource://{}/{}", result.server, result.uri)],
             page_reference: None,
             extraction_method: Some("mcp_read_resource".to_string()),
             structured_summary: None,
@@ -866,7 +889,7 @@ pub(crate) fn working_sources_for_result(
         }],
         ActionResult::McpToolCall(result) => vec![WorkingSource {
             kind: "mcp_tool".to_string(),
-            locator: format!("{}/{}", result.server, result.tool),
+            locator: format!("mcp-tool://{}/{}", result.server, result.tool),
             role: if result.is_error {
                 "supporting".to_string()
             } else {
@@ -879,11 +902,11 @@ pub(crate) fn working_sources_for_result(
             },
             why_it_matters: "MCP tool output contributed external task evidence".to_string(),
             last_used_step: step_index,
-            evidence_refs: vec![format!("{}/{}", result.server, result.tool)],
+            evidence_refs: vec![format!("mcp-tool://{}/{}", result.server, result.tool)],
             page_reference: None,
             extraction_method: Some("mcp_call".to_string()),
             structured_summary: None,
-            preview_excerpt: Some(preview_text(&result.content_preview, 100)),
+            preview_excerpt: Some(mcp_tool_preview_excerpt(result)),
         }],
         ActionResult::FileWrite {
             path,
@@ -962,7 +985,13 @@ pub(crate) fn working_sources_for_result(
             page_reference: None,
             extraction_method: Some("agent_spawn".to_string()),
             structured_summary: None,
-            preview_excerpt: Some(preview_text(&result.summary, 100)),
+            preview_excerpt: Some(preview_text(
+                result
+                    .transcript_excerpt
+                    .as_deref()
+                    .unwrap_or(&result.summary),
+                160,
+            )),
         }],
         ActionResult::NoteRecorded { note } => vec![WorkingSource {
             kind: "note".to_string(),
@@ -1140,6 +1169,105 @@ fn preview_structured_rows(rows: &[StructuredDataRow], limit: usize) -> String {
         return "no sample rows".to_string();
     }
     preview.join("; ")
+}
+
+fn summarize_mcp_tool_signal(result: &McpToolCallResult) -> String {
+    if result.is_error {
+        return format!(": {}", preview_text(&result.content_preview, 120));
+    }
+
+    let highlights = mcp_result_highlights(result);
+    if highlights.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", highlights.join(" | "))
+    }
+}
+
+fn mcp_tool_preview_excerpt(result: &McpToolCallResult) -> String {
+    let highlights = mcp_result_highlights(result);
+    if highlights.is_empty() {
+        preview_text(&result.content_preview, 100)
+    } else {
+        preview_text(&highlights.join(" | "), 160)
+    }
+}
+
+fn mcp_result_highlights(result: &McpToolCallResult) -> Vec<String> {
+    let Some(structured) = &result.structured_content else {
+        return Vec::new();
+    };
+    collect_json_highlights(structured, 3)
+}
+
+fn collect_json_highlights(value: &serde_json::Value, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_json_highlights_into(value, limit, &mut out);
+    out
+}
+
+fn collect_json_highlights_into(
+    value: &serde_json::Value,
+    limit: usize,
+    out: &mut Vec<String>,
+) {
+    if out.len() >= limit {
+        return;
+    }
+
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if out.len() >= limit {
+                    break;
+                }
+                collect_json_highlights_into(item, limit, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(summary) = summarize_json_object_hit(map) {
+                out.push(summary);
+                if out.len() >= limit {
+                    return;
+                }
+            }
+            for child in map.values() {
+                if out.len() >= limit {
+                    break;
+                }
+                collect_json_highlights_into(child, limit, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn summarize_json_object_hit(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    let title = first_string(map, &["title", "name", "headline"])?;
+    let mut summary = preview_text(&title, 80);
+    if let Some(url) = first_string(map, &["url", "link"]) {
+        summary.push_str(" -> ");
+        summary.push_str(&preview_text(&url, 100));
+    } else if let Some(description) = first_string(map, &["description", "snippet", "summary"]) {
+        summary.push_str(": ");
+        summary.push_str(&preview_text(&description, 80));
+    }
+    Some(summary)
+}
+
+fn first_string(
+    map: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<String> {
+    keys.iter().find_map(|key| {
+        map.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
 
 fn document_locator_with_page_range(path: &Path, page_range: Option<&DocumentPageRange>) -> String {

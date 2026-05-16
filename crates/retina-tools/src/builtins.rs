@@ -1,6 +1,6 @@
 use retina_types::{
     McpRegistrySnapshot, ShellCapabilities, ToolApprovalPolicy, ToolConcurrencyClass,
-    ToolDescriptor, ToolSourceKind,
+    ToolDescriptor, ToolSourceKind, build_mcp_tool_name,
 };
 
 pub fn shell_builtin_tools(
@@ -167,55 +167,87 @@ pub fn mcp_client_tools(snapshot: &McpRegistrySnapshot) -> Vec<ToolDescriptor> {
         .take(8)
         .collect::<Vec<_>>()
         .join("; ");
+    let has_resources = connected_servers
+        .iter()
+        .any(|server| !server.resources.is_empty());
+    let has_concrete_tools = connected_servers
+        .iter()
+        .any(|server| !server.tools.is_empty());
 
-    tools.push(ToolDescriptor {
-        name: "list_mcp_resources".to_string(),
-        description: format!(
-            "List readable resources exposed by configured MCP servers. Connected servers: {}.",
-            connected_servers
-                .iter()
-                .map(|server| server.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        source: ToolSourceKind::McpServer,
-        concurrency: ToolConcurrencyClass::ReadOnly,
-        approval: ToolApprovalPolicy::None,
-        required_authority: vec!["mcp".to_string()],
-        streaming: false,
-    });
-    tools.push(ToolDescriptor {
-        name: "read_mcp_resource".to_string(),
-        description: format!(
-            "Read a specific resource from a configured MCP server. Recent resources: {}.",
-            if resource_preview.is_empty() {
-                "none discovered".to_string()
-            } else {
-                resource_preview
-            }
-        ),
-        source: ToolSourceKind::McpServer,
-        concurrency: ToolConcurrencyClass::ReadOnly,
-        approval: ToolApprovalPolicy::None,
-        required_authority: vec!["mcp".to_string()],
-        streaming: false,
-    });
-    tools.push(ToolDescriptor {
-        name: "mcp_call".to_string(),
-        description: format!(
-            "Call a configured MCP tool by server and tool name. Available tools: {}.",
-            if tool_preview.is_empty() {
-                "none discovered".to_string()
-            } else {
-                tool_preview
-            }
-        ),
-        source: ToolSourceKind::McpServer,
-        concurrency: ToolConcurrencyClass::Streaming,
-        approval: ToolApprovalPolicy::None,
-        required_authority: vec!["mcp".to_string()],
-        streaming: true,
-    });
+    for server in &connected_servers {
+        for tool in &server.tools {
+            tools.push(ToolDescriptor {
+                name: build_mcp_tool_name(&server.name, &tool.name),
+                description: format!(
+                    "{}{} Use `input_json` for arguments.",
+                    tool.description
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("Call this MCP tool."),
+                    render_input_schema_hint(&tool.input_schema)
+                ),
+                source: ToolSourceKind::McpServer,
+                concurrency: ToolConcurrencyClass::Streaming,
+                approval: ToolApprovalPolicy::None,
+                required_authority: vec!["mcp".to_string()],
+                streaming: true,
+            });
+        }
+    }
+
+    if has_resources {
+        tools.push(ToolDescriptor {
+            name: "list_mcp_resources".to_string(),
+            description: format!(
+                "List readable resources exposed by configured MCP servers. Connected servers: {}.",
+                connected_servers
+                    .iter()
+                    .map(|server| server.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            source: ToolSourceKind::McpServer,
+            concurrency: ToolConcurrencyClass::ReadOnly,
+            approval: ToolApprovalPolicy::None,
+            required_authority: vec!["mcp".to_string()],
+            streaming: false,
+        });
+        tools.push(ToolDescriptor {
+            name: "read_mcp_resource".to_string(),
+            description: format!(
+                "Read a specific resource from a configured MCP server. Recent resources: {}.",
+                if resource_preview.is_empty() {
+                    "none discovered".to_string()
+                } else {
+                    resource_preview
+                }
+            ),
+            source: ToolSourceKind::McpServer,
+            concurrency: ToolConcurrencyClass::ReadOnly,
+            approval: ToolApprovalPolicy::None,
+            required_authority: vec!["mcp".to_string()],
+            streaming: false,
+        });
+    }
+    if !has_concrete_tools {
+        tools.push(ToolDescriptor {
+            name: "mcp_call".to_string(),
+            description: format!(
+                "Call a configured MCP tool by server and tool name. Available tools: {}.",
+                if tool_preview.is_empty() {
+                    "none discovered".to_string()
+                } else {
+                    tool_preview
+                }
+            ),
+            source: ToolSourceKind::McpServer,
+            concurrency: ToolConcurrencyClass::Streaming,
+            approval: ToolApprovalPolicy::None,
+            required_authority: vec!["mcp".to_string()],
+            streaming: true,
+        });
+    }
 
     tools
 }
@@ -250,9 +282,51 @@ fn trim_description(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn render_input_schema_hint(schema: &serde_json::Value) -> String {
+    let Some(properties) = schema.get("properties").and_then(serde_json::Value::as_object) else {
+        return String::new();
+    };
+    if properties.is_empty() {
+        return String::new();
+    }
+
+    let required = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let fields = properties
+        .iter()
+        .take(6)
+        .map(|(name, value)| {
+            let field_type = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("value");
+            if required.contains(name.as_str()) {
+                format!("{name} ({field_type}, required)")
+            } else {
+                format!("{name} ({field_type})")
+            }
+        })
+        .collect::<Vec<_>>();
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" Arguments: {}.", fields.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn shell_builtins_follow_capabilities_and_include_mutation_tools() {
@@ -292,6 +366,13 @@ mod tests {
                     read_only: true,
                     destructive: false,
                     open_world: false,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        },
+                        "required": ["query"]
+                    }),
                 }],
                 resources: vec![retina_types::McpResourceSummary {
                     server: "docs".to_string(),
@@ -309,6 +390,41 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"list_mcp_resources"));
         assert!(names.contains(&"read_mcp_resource"));
-        assert!(names.contains(&"mcp_call"));
+        assert!(names.contains(&"mcp__docs__search"));
+        assert!(!names.contains(&"mcp_call"));
+    }
+
+    #[test]
+    fn mcp_client_tools_hide_resource_actions_when_no_resources_exist() {
+        let tools = mcp_client_tools(&McpRegistrySnapshot {
+            servers: vec![retina_types::McpServerSnapshot {
+                name: "brave".to_string(),
+                tools: vec![retina_types::McpToolSummary {
+                    server: "brave".to_string(),
+                    name: "brave_web_search".to_string(),
+                    description: Some("Search the web".to_string()),
+                    read_only: true,
+                    destructive: false,
+                    open_world: true,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string" }
+                        },
+                        "required": ["query"]
+                    }),
+                }],
+                resources: Vec::new(),
+                error: None,
+            }],
+        });
+        let names = tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"list_mcp_resources"));
+        assert!(!names.contains(&"read_mcp_resource"));
+        assert!(names.contains(&"mcp__brave__brave_web_search"));
+        assert!(!names.contains(&"mcp_call"));
     }
 }

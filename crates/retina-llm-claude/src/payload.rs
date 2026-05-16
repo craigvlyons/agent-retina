@@ -1,6 +1,7 @@
 use crate::config::{
     ClaudeContextManagement, ClaudePromptCaching, model_supports_server_compaction,
 };
+use chrono::Local;
 use retina_types::ReasonRequest;
 use serde_json::json;
 
@@ -74,6 +75,29 @@ pub(crate) fn build_stable_instructions(
     tools: &[retina_types::ToolDescriptor],
 ) -> String {
     let supported_action_types = supported_action_types_block(tools);
+    let has_list_mcp_resources = tools.iter().any(|tool| tool.name == "list_mcp_resources");
+    let has_read_mcp_resource = tools.iter().any(|tool| tool.name == "read_mcp_resource");
+    let has_generic_mcp_call = tools.iter().any(|tool| tool.name == "mcp_call");
+    let has_concrete_mcp_tools = tools
+        .iter()
+        .any(|tool| retina_types::parse_mcp_tool_name(&tool.name).is_some());
+    let has_mcp_search_tools = tools.iter().any(|tool| {
+        retina_types::parse_mcp_tool_name(&tool.name)
+            .map(|(_, tool_name)| {
+                tool_name.contains("web_search")
+                    || tool_name.contains("local_search")
+                    || tool_name.contains("news_search")
+                    || tool_name.ends_with("search")
+            })
+            .unwrap_or(false)
+    });
+    let mcp_instruction_block = build_mcp_instruction_block(
+        has_list_mcp_resources,
+        has_read_mcp_resource,
+        has_generic_mcp_call,
+        has_concrete_mcp_tools,
+        has_mcp_search_tools,
+    );
     format!(
         "You are the Retina agent reasoner.\n\
 Reflection mode: {reflection}.\n\
@@ -129,16 +153,23 @@ Planning rules:\n\
 - If you use run_command to create or modify a specific artifact, set path to the target file so the harness can verify the change.\n\
 - Use ingest_structured_data for CSV/TSV-style local data when headers, rows, or sample records matter more than plain prose.\n\
 - Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
-- Use list_mcp_resources to see current MCP resources when configured servers may contain the needed context.\n\
-- Use read_mcp_resource with `server` and `uri` to read a specific MCP resource.\n\
-- Use mcp_call with `server`, `tool`, and `input_json` to call a configured MCP tool.\n\
+- {mcp_instruction_block}\n\
+- When the task needs current web information, local recommendations, or internet research and MCP search tools are available, prefer MCP tools over ad-hoc shell web scraping.\n\
+- If a successful MCP search already returned concrete titles, links, or snippets that answer a recommendation or summary request, respond from that grounded result instead of repeating the same search.\n\
+- For time-sensitive web tasks such as today, tonight, tomorrow, this weekend, current, or latest, use the current local date/time from context, prefer event-specific/date-specific search results over evergreen attraction pages, and do one more targeted search before answering if the first result is too generic.\n\
+- For time-sensitive event searches, do not answer with generic city attractions, venue lists, or “types of things to do” unless the search results actually contain concrete event names or date-specific details. If the first result is only an events portal or broad listing page, do one more targeted search for specific events before responding. If you still cannot verify concrete events, say that clearly instead of inventing a lineup.\n\
+- For time-sensitive event searches, do not fill gaps with general knowledge about the city. Do not mention attractions, neighborhoods, sports teams, venues, or activity categories unless they appear in the observed search results or snippets. If the results only prove that an events portal exists, say that and ask whether the user wants a narrower follow-up search.\n\
+- MCP tool identifiers and MCP locators are not files. Do not use read_file on values like `server/tool`, `mcp__server__tool`, or `mcp-tool://...`; continue with another MCP tool step or respond from the MCP result instead.\n\
+- If an MCP tool call fails with an input validation error, retry at most once using only the required schema fields and a simpler argument payload before switching tools or responding with the grounded limitation.\n\
 - Prefer edit_file for modifying existing text files when you know the exact old_string to replace.\n\
 - Use write_file mainly for new files or complete rewrites. If the file already exists, read it first.\n\
 - Use append_file only when adding content to the end is truly the intended edit.\n\
 - Use edit_notebook for `.ipynb` files; do not use text mutation tools for notebooks.\n\
+- Do not create or modify files unless the user asked for a saved artifact or a file change is actually required to complete the task. For answer-only tasks, prefer respond.\n\
+- For respond, put the operator-facing answer in the `message` field.\n\
 - When a file mutation succeeds, treat the saved artifact path and artifact result in task_state as the grounded source of truth for what was actually written.\n\
 - If the task asks for specific PDF pages, set page_start and page_end so the shell extracts only that page range.\n\
-- For find_files, keep root as a real directory path and keep pattern limited to a filename or glob; do not pack path fragments into pattern.\n\
+- For find_files, keep root as a real directory path and keep pattern limited to a filename or glob; do not pack path fragments into pattern. Use recursive=false for top-level file requests on or in a folder unless the user asked for nested contents.\n\
 - For search_text, keep root as the directory scope and keep query limited to search terms; do not combine them into one field.\n\
 - Use spawn_agent only for a bounded delegated subtask whose result you will integrate back into the current task.\n\
 - For spawn_agent, set prompt to the delegated objective. Use allowed_tools or denied_tools only when narrowing the child worker's tool pool is clearly helpful.\n\
@@ -146,6 +177,9 @@ Planning rules:\n\
 - Discovery-only steps such as inspect_path, list_directory, find_files, and search_text are intermediate progress when the request still asks you to read, answer, summarize, extract, or create output.\n\
 - In general, intermediate shell steps should not be marked task_complete=true. Use task_complete=true when you are returning a grounded final response or when a verified output/state change satisfies the task.\n\
 - If a directory listing already gives the evidence needed to answer an inventory or summary question, respond from that grounded listing instead of repeating the same listing.\n\
+- Directory listings include compact summary facts such as counts and sample names. For simple inventory tasks, prefer answering from that grounded listing instead of reopening files or re-listing the same path.\n\
+- Treat requests for files on or in a folder as top-level scope by default. Use recursive listing or nested search only when the user says under, recursively, across subfolders, or otherwise clearly asks for nested contents.\n\
+- For simple inventory or file-summary tasks, keep the response short and factual. Counts, notable items, and brief content summaries are usually enough unless the user asked for detailed writeups.\n\
 - If task_state shows an explicit output artifact that still needs verification, do not mark task_complete=true until that artifact is verified, unless you are surfacing a grounded blocker.\n\
 - For output-file tasks, keep the final response narrow and artifact-driven: report the saved path and summarize only what is supported by the saved artifact result or exact evidence.\n\
 - For summaries or reports derived from local evidence, prefer extractive facts over interpretation. Do not invent action items, causes, themes, or explanations unless the user asked for analysis or the source states them directly.\n\
@@ -159,7 +193,7 @@ Planning rules:\n\
 \n\
 Set require_approval=true only for delete-like or kill-like commands that need explicit operator approval.\n\
 You are allowed to explore the workspace in bounded steps.\n\
-Path hints like Desktop, Documents, Downloads, and ~/ are user-facing aliases; rely on shell verification rather than assuming a fixed underlying path."
+Path hints like Desktop, Documents, Downloads, and ~/ are user-facing aliases that the file and directory tools can resolve directly. Prefer those tools first; do not spend a shell step on commands like `echo $HOME` unless direct path use actually failed."
     )
 }
 
@@ -185,7 +219,49 @@ fn supported_action_types_block(tools: &[retina_types::ToolDescriptor]) -> Strin
     }
 }
 
-fn build_dynamic_context_block(request: &ReasonRequest) -> String {
+fn build_mcp_instruction_block(
+    has_list_mcp_resources: bool,
+    has_read_mcp_resource: bool,
+    has_generic_mcp_call: bool,
+    has_concrete_mcp_tools: bool,
+    has_mcp_search_tools: bool,
+) -> String {
+    let mut lines = Vec::new();
+
+    if has_concrete_mcp_tools {
+        lines.push("Use the concrete MCP tool action types that appear in the supported action list when those tools match the task.");
+        lines.push("To call a concrete MCP tool, set `type` to the concrete tool name and put that tool's arguments in `input_json`. Example: `{ \"type\": \"mcp__brave__brave_web_search\", \"input_json\": { \"query\": \"colorado springs events this weekend\" } }`.");
+        lines.push("Treat a successful concrete MCP tool result as usable evidence for the next step.");
+    }
+    if has_list_mcp_resources {
+        lines.push(
+            "Use list_mcp_resources to see current MCP resources when configured servers may contain the needed context.",
+        );
+    }
+    if has_read_mcp_resource {
+        lines.push("Use read_mcp_resource with `server` and `uri` to read a specific MCP resource.");
+    }
+    if has_generic_mcp_call {
+        lines.push("Use mcp_call with `server`, `tool`, and `input_json` to call a configured MCP tool when no concrete MCP tool action type is available.");
+    }
+    if has_read_mcp_resource && (has_generic_mcp_call || has_concrete_mcp_tools) {
+        lines.push("Do not follow a successful MCP tool call with read_mcp_resource unless you actually discovered a matching MCP resource URI.");
+    }
+    if has_mcp_search_tools {
+        lines.push("When the user explicitly asks for web search, current information, local happenings, things to do this weekend, news, recommendations, or internet research, use the available MCP search tools first. Do not start with run_command, curl, or ad-hoc web scraping unless MCP search is unavailable or has already failed.");
+    }
+
+    if lines.is_empty() {
+        "No MCP tools or MCP resources are available for this step.".to_string()
+    } else {
+        lines.join("\n- ")
+    }
+}
+
+pub(crate) fn build_dynamic_context_block(request: &ReasonRequest) -> String {
+    let current_local_time = Local::now()
+        .format("%A, %Y-%m-%d %H:%M %:z")
+        .to_string();
     let constraints = if request.constraints.is_empty() {
         "none".to_string()
     } else {
@@ -197,8 +273,9 @@ fn build_dynamic_context_block(request: &ReasonRequest) -> String {
             .join("\n")
     };
     format!(
-        "Constraints:\n{}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n\nDynamic task context follows in the next block. Treat task_state as the canonical live thread. Observations and verified tool results are the source of truth for this step.",
+        "Constraints:\n{}\n\nCurrent local date/time:\n- {}\n\nObserved state snapshot:\n- output_written: {}\n- output_verified: {}\n\nDynamic task context follows in the next block. Treat task_state as the canonical live thread. Observations and verified tool results are the source of truth for this step.",
         constraints,
+        current_local_time,
         request.context.task_state.progress.output_written,
         request.context.task_state.progress.output_verified
     )

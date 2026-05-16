@@ -3,6 +3,32 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub fn normalize_name_for_mcp(name: &str) -> String {
+    name.replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-', "_")
+}
+
+pub fn build_mcp_tool_name(server: &str, tool: &str) -> String {
+    format!(
+        "mcp__{}__{}",
+        normalize_name_for_mcp(server),
+        normalize_name_for_mcp(tool)
+    )
+}
+
+pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
+    let mut parts = name.split("__");
+    let prefix = parts.next()?;
+    let server = parts.next()?;
+    if prefix != "mcp" || server.is_empty() {
+        return None;
+    }
+    let tool = parts.collect::<Vec<_>>().join("__");
+    if tool.is_empty() {
+        return None;
+    }
+    Some((server.to_string(), tool))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Action {
     RunCommand {
@@ -31,6 +57,7 @@ pub enum Action {
         id: ActionId,
         root: PathBuf,
         pattern: String,
+        recursive: bool,
         max_results: usize,
     },
     SearchText {
@@ -70,6 +97,7 @@ pub enum Action {
         server: String,
         tool: String,
         input_json: serde_json::Value,
+        resolved_tool_name: Option<String>,
     },
     WriteFile {
         id: ActionId,
@@ -317,6 +345,15 @@ pub struct DirectoryEntry {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirectoryListingSummary {
+    pub total_entries: usize,
+    pub file_count: usize,
+    pub dir_count: usize,
+    pub hidden_count: usize,
+    pub sample_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SearchMatch {
     pub path: PathBuf,
     pub line_number: usize,
@@ -352,6 +389,7 @@ pub struct DelegatedTaskResult {
     pub parent_task_id: Option<TaskId>,
     pub status: DelegatedTaskStatus,
     pub summary: String,
+    pub transcript_excerpt: Option<String>,
     pub output_path: Option<PathBuf>,
 }
 
@@ -379,6 +417,7 @@ pub struct McpToolSummary {
     pub server: String,
     pub name: String,
     pub description: Option<String>,
+    pub input_schema: serde_json::Value,
     pub read_only: bool,
     pub destructive: bool,
     pub open_world: bool,
@@ -462,6 +501,7 @@ pub enum ActionResult {
     DirectoryListing {
         root: PathBuf,
         entries: Vec<DirectoryEntry>,
+        summary: DirectoryListingSummary,
     },
     FileMatches {
         root: PathBuf,

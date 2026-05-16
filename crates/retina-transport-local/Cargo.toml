@@ -16,5 +16,6 @@ retina-tools = { path = "../retina-tools" }
 retina-traits = { path = "../retina-traits" }
 retina-types = { path = "../retina-types" }
 serde.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 toml.workspace = true
