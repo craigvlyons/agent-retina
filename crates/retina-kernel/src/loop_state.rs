@@ -469,11 +469,28 @@ pub(crate) fn action_label(action: &Action) -> String {
         Action::CallMcpTool {
             server,
             tool,
+            input_json,
             resolved_tool_name,
             ..
-        } => resolved_tool_name
-            .clone()
-            .unwrap_or_else(|| format!("mcp_call:{server}:{tool}")),
+        } => {
+            let base = resolved_tool_name
+                .clone()
+                .unwrap_or_else(|| format!("mcp_call:{server}:{tool}"));
+            let query_suffix = input_json
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|query| {
+                    let mut preview = query.chars().take(80).collect::<String>();
+                    if query.chars().count() > 80 {
+                        preview.push_str("...");
+                    }
+                    format!(":query={preview}")
+                })
+                .unwrap_or_default();
+            format!("{base}{query_suffix}")
+        }
         Action::WriteFile { path, .. } => format!("write_file:{}", path.display()),
         Action::EditFile { path, .. } => format!("edit_file:{}", path.display()),
         Action::AppendFile { path, .. } => format!("append_file:{}", path.display()),

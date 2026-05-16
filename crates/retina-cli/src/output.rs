@@ -520,17 +520,16 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .get("task_state")
             .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
             .and_then(|task_state| {
-                task_state.recent_actions.last().and_then(|summary| {
-                    match summary.status {
-                        RecentActionStatus::Failed => {
-                            Some(format!("failed: {}", summary.outcome))
-                        }
+                task_state
+                    .recent_actions
+                    .last()
+                    .and_then(|summary| match summary.status {
+                        RecentActionStatus::Failed => Some(format!("failed: {}", summary.outcome)),
                         RecentActionStatus::Blocked => {
                             Some(format!("blocked: {}", summary.outcome))
                         }
                         RecentActionStatus::Succeeded | RecentActionStatus::Responded => None,
-                    }
-                })
+                    })
             }),
         TimelineEventType::ReflectionRequested => event
             .payload_json
@@ -729,6 +728,16 @@ fn compact_preview(content: &str) -> Option<String> {
 }
 
 fn humanize_action_label(label: &str) -> String {
+    if let Some((tool_label, query)) = label.split_once(":query=") {
+        if let Some((server, tool)) = parse_mcp_tool_name(tool_label) {
+            return format!(
+                "mcp tool {}:{} for `{}`",
+                server.replace('_', "-"),
+                tool.replace('_', " "),
+                query
+            );
+        }
+    }
     if let Some((server, tool)) = parse_mcp_tool_name(label) {
         return format!(
             "mcp tool {}:{}",
@@ -1245,7 +1254,8 @@ mod tests {
             step: 2,
             action: "read_file:mcp-tool://brave/brave_web_search".to_string(),
             status: RecentActionStatus::Failed,
-            outcome: "mcp-tool://brave/brave_web_search is MCP output, not a filesystem path".to_string(),
+            outcome: "mcp-tool://brave/brave_web_search is MCP output, not a filesystem path"
+                .to_string(),
             artifact_refs: Vec::new(),
         });
         let event = TimelineEvent {

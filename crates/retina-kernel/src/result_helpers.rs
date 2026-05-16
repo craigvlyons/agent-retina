@@ -1206,11 +1206,7 @@ fn collect_json_highlights(value: &serde_json::Value, limit: usize) -> Vec<Strin
     out
 }
 
-fn collect_json_highlights_into(
-    value: &serde_json::Value,
-    limit: usize,
-    out: &mut Vec<String>,
-) {
+fn collect_json_highlights_into(value: &serde_json::Value, limit: usize, out: &mut Vec<String>) {
     if out.len() >= limit {
         return;
     }
@@ -1242,9 +1238,7 @@ fn collect_json_highlights_into(
     }
 }
 
-fn summarize_json_object_hit(
-    map: &serde_json::Map<String, serde_json::Value>,
-) -> Option<String> {
+fn summarize_json_object_hit(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
     let title = first_string(map, &["title", "name", "headline"])?;
     let mut summary = preview_text(&title, 80);
     if let Some(url) = first_string(map, &["url", "link"]) {
@@ -1257,10 +1251,7 @@ fn summarize_json_object_hit(
     Some(summary)
 }
 
-fn first_string(
-    map: &serde_json::Map<String, serde_json::Value>,
-    keys: &[&str],
-) -> Option<String> {
+fn first_string(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         map.get(*key)
             .and_then(serde_json::Value::as_str)

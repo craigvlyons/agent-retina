@@ -40,7 +40,7 @@ fn build_system_blocks(
     reflection: bool,
     prompt_caching: &ClaudePromptCaching,
 ) -> Vec<serde_json::Value> {
-    let stable_instructions = build_stable_instructions(reflection, &request.context.tools);
+    let stable_instructions = build_stable_instructions(reflection, &request.tools);
     let mut blocks = vec![json!({
         "type": "text",
         "text": "Return JSON only. Do not wrap the response in markdown fences."
@@ -74,7 +74,7 @@ pub(crate) fn build_stable_instructions(
     reflection: bool,
     tools: &[retina_types::ToolDescriptor],
 ) -> String {
-    let supported_action_types = supported_action_types_block(tools);
+    let tool_catalog = tool_catalog_block(tools);
     let has_list_mcp_resources = tools.iter().any(|tool| tool.name == "list_mcp_resources");
     let has_read_mcp_resource = tools.iter().any(|tool| tool.name == "read_mcp_resource");
     let has_generic_mcp_call = tools.iter().any(|tool| tool.name == "mcp_call");
@@ -101,56 +101,28 @@ pub(crate) fn build_stable_instructions(
     format!(
         "You are the Retina agent reasoner.\n\
 Reflection mode: {reflection}.\n\
-Choose exactly one action and return strict JSON with these fields:\n\
-- type\n\
-- command\n\
-- path\n\
-- root\n\
-- pattern\n\
-- query\n\
-- content\n\
-- old_string\n\
-- new_string\n\
-- replace_all\n\
-- server\n\
-- tool\n\
-- uri\n\
-- input_json\n\
-- cell_id\n\
-- new_source\n\
-- cell_type\n\
-- edit_mode\n\
-- include_content\n\
-- recursive\n\
-- max_entries\n\
-- max_results\n\
-- max_bytes\n\
-- max_rows\n\
-- max_chars\n\
-- page_start\n\
-- page_end\n\
-- overwrite\n\
-- prompt\n\
-- allowed_tools\n\
-- denied_tools\n\
-- require_approval\n\
-- expect_change\n\
-- note\n\
-- message\n\
-- task_complete\n\
-- intent_kind\n\
-- deliverable\n\
-- completion_basis\n\
-- reasoning\n\
+Choose exactly one tool from the catalog and return strict JSON with this top-level shape:\n\
+{{\n\
+  \"type\": \"<exact tool name from the catalog>\",\n\
+  \"input\": {{ ... arguments for that tool ... }},\n\
+  \"task_complete\": false,\n\
+  \"intent_kind\": \"answer\" | \"output\" | \"unknown\",\n\
+  \"deliverable\": \"optional short noun phrase\",\n\
+  \"completion_basis\": \"optional short grounded basis\",\n\
+  \"reasoning\": \"optional brief rationale\"\n\
+}}\n\
 \n\
-Supported action types:\n\
-{supported_action_types}\n\
+Top-level fields are limited to: type, input, task_complete, intent_kind, deliverable, completion_basis, reasoning.\n\
+Always put tool arguments inside `input`. Use an empty object only when the chosen tool truly takes no arguments.\n\
+\n\
+Available tools:\n\
+{tool_catalog}\n\
 \n\
 Planning rules:\n\
 - The harness is your body. Explore through shell actions instead of guessing.\n\
 - Choose one concrete next step that advances the task or reduces uncertainty.\n\
-- You may choose only from the supported action types listed above. Do not request unavailable actions.\n\
-- If you use run_command to create or modify a specific artifact, set path to the target file so the harness can verify the change.\n\
+- You may choose only from the exact tool names listed above. Do not invent tool names or request unavailable tools.\n\
+- If you use run_command to create or modify a specific artifact, set `input.path` to the target file so the harness can verify the change.\n\
 - Use ingest_structured_data for CSV/TSV-style local data when headers, rows, or sample records matter more than plain prose.\n\
 - Use extract_document_text for PDFs and other document formats when reading raw bytes would be unhelpful.\n\
 - {mcp_instruction_block}\n\
@@ -159,6 +131,7 @@ Planning rules:\n\
 - For time-sensitive web tasks such as today, tonight, tomorrow, this weekend, current, or latest, use the current local date/time from context, prefer event-specific/date-specific search results over evergreen attraction pages, and do one more targeted search before answering if the first result is too generic.\n\
 - For time-sensitive event searches, do not answer with generic city attractions, venue lists, or “types of things to do” unless the search results actually contain concrete event names or date-specific details. If the first result is only an events portal or broad listing page, do one more targeted search for specific events before responding. If you still cannot verify concrete events, say that clearly instead of inventing a lineup.\n\
 - For time-sensitive event searches, do not fill gaps with general knowledge about the city. Do not mention attractions, neighborhoods, sports teams, venues, or activity categories unless they appear in the observed search results or snippets. If the results only prove that an events portal exists, say that and ask whether the user wants a narrower follow-up search.\n\
+- If repeated MCP searches return the same top hit or the same generic portal page, do not run the same search again. Either materially reformulate the query to target specific event details or respond with the grounded limitation.\n\
 - MCP tool identifiers and MCP locators are not files. Do not use read_file on values like `server/tool`, `mcp__server__tool`, or `mcp-tool://...`; continue with another MCP tool step or respond from the MCP result instead.\n\
 - If an MCP tool call fails with an input validation error, retry at most once using only the required schema fields and a simpler argument payload before switching tools or responding with the grounded limitation.\n\
 - Prefer edit_file for modifying existing text files when you know the exact old_string to replace.\n\
@@ -166,13 +139,13 @@ Planning rules:\n\
 - Use append_file only when adding content to the end is truly the intended edit.\n\
 - Use edit_notebook for `.ipynb` files; do not use text mutation tools for notebooks.\n\
 - Do not create or modify files unless the user asked for a saved artifact or a file change is actually required to complete the task. For answer-only tasks, prefer respond.\n\
-- For respond, put the operator-facing answer in the `message` field.\n\
+- For respond, put the operator-facing answer in `input.message`.\n\
 - When a file mutation succeeds, treat the saved artifact path and artifact result in task_state as the grounded source of truth for what was actually written.\n\
-- If the task asks for specific PDF pages, set page_start and page_end so the shell extracts only that page range.\n\
-- For find_files, keep root as a real directory path and keep pattern limited to a filename or glob; do not pack path fragments into pattern. Use recursive=false for top-level file requests on or in a folder unless the user asked for nested contents.\n\
-- For search_text, keep root as the directory scope and keep query limited to search terms; do not combine them into one field.\n\
-- Use spawn_agent only for a bounded delegated subtask whose result you will integrate back into the current task.\n\
-- For spawn_agent, set prompt to the delegated objective. Use allowed_tools or denied_tools only when narrowing the child worker's tool pool is clearly helpful.\n\
+- If the task asks for specific PDF pages, set `input.page_start` and `input.page_end` so the shell extracts only that page range.\n\
+- For find_files, keep `input.root` as a real directory path and keep `input.pattern` limited to a filename or glob; do not pack path fragments into pattern. Use `input.recursive=false` for top-level file requests on or in a folder unless the user asked for nested contents.\n\
+- For search_text, keep `input.root` as the directory scope and keep `input.query` limited to search terms; do not combine them into one field.\n\
+- Use agent_spawn only for a bounded delegated subtask whose result you will integrate back into the current task.\n\
+- For agent_spawn, set `input.prompt` to the delegated objective. Use `input.allowed_tools` or `input.denied_tools` only when narrowing the child worker's tool pool is clearly helpful.\n\
 - Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
 - Discovery-only steps such as inspect_path, list_directory, find_files, and search_text are intermediate progress when the request still asks you to read, answer, summarize, extract, or create output.\n\
 - In general, intermediate shell steps should not be marked task_complete=true. Use task_complete=true when you are returning a grounded final response or when a verified output/state change satisfies the task.\n\
@@ -191,32 +164,89 @@ Planning rules:\n\
 - When repeated command checks no longer change the picture, stop varying the same check and either take a materially different action or respond with the current grounded status.\n\
 - `intent_kind`, `deliverable`, and `completion_basis` are optional continuity metadata. When useful, keep `intent_kind` to: answer, output, or unknown.\n\
 \n\
-Set require_approval=true only for delete-like or kill-like commands that need explicit operator approval.\n\
+Set `input.require_approval=true` only for delete-like or kill-like run_command steps that need explicit operator approval.\n\
 You are allowed to explore the workspace in bounded steps.\n\
 Path hints like Desktop, Documents, Downloads, and ~/ are user-facing aliases that the file and directory tools can resolve directly. Prefer those tools first; do not spend a shell step on commands like `echo $HOME` unless direct path use actually failed."
     )
 }
 
-fn supported_action_types_block(tools: &[retina_types::ToolDescriptor]) -> String {
-    let mut action_types = Vec::new();
-    for tool in tools {
-        let action_type = match tool.name.as_str() {
-            "agent_spawn" => "spawn_agent",
-            other => other,
-        };
-        if !action_types.iter().any(|existing| existing == &action_type) {
-            action_types.push(action_type.to_string());
-        }
+fn tool_catalog_block(tools: &[retina_types::ToolDescriptor]) -> String {
+    if tools.is_empty() {
+        return "- respond: Answer operator questions directly. Input: { message: string* }"
+            .to_string();
     }
-    if action_types.is_empty() {
-        "- respond".to_string()
-    } else {
-        action_types
-            .into_iter()
-            .map(|name| format!("- {name}"))
-            .collect::<Vec<_>>()
-            .join("\n")
+
+    tools
+        .iter()
+        .map(render_tool_catalog_entry)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_tool_catalog_entry(tool: &retina_types::ToolDescriptor) -> String {
+    let approval = match tool.approval {
+        retina_types::ToolApprovalPolicy::None => None,
+        retina_types::ToolApprovalPolicy::ExplicitOperatorApproval => Some("approval"),
+        retina_types::ToolApprovalPolicy::ToolDefined => Some("conditional_approval"),
+    };
+    let mut traits = vec![tool.concurrency.label().to_string()];
+    if tool.streaming {
+        traits.push("streaming".to_string());
     }
+    if let Some(flag) = approval {
+        traits.push(flag.to_string());
+    }
+    if !tool.required_authority.is_empty() {
+        traits.push(format!("requires {}", tool.required_authority.join(",")));
+    }
+
+    format!(
+        "- {} [{}]: {} Input: {}",
+        tool.name,
+        traits.join(", "),
+        tool.description.trim(),
+        render_input_schema_for_prompt(&tool.input_schema)
+    )
+}
+
+fn render_input_schema_for_prompt(schema: &serde_json::Value) -> String {
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return "{}".to_string();
+    };
+    if properties.is_empty() {
+        return "{}".to_string();
+    }
+
+    let required = schema
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let fields = properties
+        .iter()
+        .map(|(name, value)| {
+            let field_type = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("value");
+            if required.contains(name.as_str()) {
+                format!("{name}: {field_type}*")
+            } else {
+                format!("{name}: {field_type}")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    format!("{{ {} }}", fields.join(", "))
 }
 
 fn build_mcp_instruction_block(
@@ -229,9 +259,11 @@ fn build_mcp_instruction_block(
     let mut lines = Vec::new();
 
     if has_concrete_mcp_tools {
-        lines.push("Use the concrete MCP tool action types that appear in the supported action list when those tools match the task.");
-        lines.push("To call a concrete MCP tool, set `type` to the concrete tool name and put that tool's arguments in `input_json`. Example: `{ \"type\": \"mcp__brave__brave_web_search\", \"input_json\": { \"query\": \"colorado springs events this weekend\" } }`.");
-        lines.push("Treat a successful concrete MCP tool result as usable evidence for the next step.");
+        lines.push("Use the concrete MCP tool names from the tool catalog when those tools match the task.");
+        lines.push("To call a concrete MCP tool, set `type` to the concrete tool name and put that tool's arguments in `input`. Example: `{ \"type\": \"mcp__brave__brave_web_search\", \"input\": { \"query\": \"colorado springs events this weekend\" } }`.");
+        lines.push(
+            "Treat a successful concrete MCP tool result as usable evidence for the next step.",
+        );
     }
     if has_list_mcp_resources {
         lines.push(
@@ -239,10 +271,11 @@ fn build_mcp_instruction_block(
         );
     }
     if has_read_mcp_resource {
-        lines.push("Use read_mcp_resource with `server` and `uri` to read a specific MCP resource.");
+        lines
+            .push("Use read_mcp_resource with `server` and `uri` to read a specific MCP resource.");
     }
     if has_generic_mcp_call {
-        lines.push("Use mcp_call with `server`, `tool`, and `input_json` to call a configured MCP tool when no concrete MCP tool action type is available.");
+        lines.push("Use mcp_call with `input.server`, `input.tool`, and `input.input_json` only when no concrete MCP tool name is available.");
     }
     if has_read_mcp_resource && (has_generic_mcp_call || has_concrete_mcp_tools) {
         lines.push("Do not follow a successful MCP tool call with read_mcp_resource unless you actually discovered a matching MCP resource URI.");
@@ -259,9 +292,7 @@ fn build_mcp_instruction_block(
 }
 
 pub(crate) fn build_dynamic_context_block(request: &ReasonRequest) -> String {
-    let current_local_time = Local::now()
-        .format("%A, %Y-%m-%d %H:%M %:z")
-        .to_string();
+    let current_local_time = Local::now().format("%A, %Y-%m-%d %H:%M %:z").to_string();
     let constraints = if request.constraints.is_empty() {
         "none".to_string()
     } else {
@@ -422,6 +453,11 @@ mod tests {
                     approval: ToolApprovalPolicy::None,
                     required_authority: Vec::new(),
                     streaming: false,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "message": { "type": "string" } },
+                        "required": ["message"]
+                    }),
                 },
                 ToolDescriptor {
                     name: "list_directory".to_string(),
@@ -431,11 +467,19 @@ mod tests {
                     approval: ToolApprovalPolicy::None,
                     required_authority: Vec::new(),
                     streaming: false,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }),
                 },
             ],
         );
-        assert!(instructions.contains("Supported action types:\n- respond\n- list_directory"));
+        assert!(instructions.contains("Available tools:"));
+        assert!(instructions.contains("- respond [read_only]"));
+        assert!(instructions.contains("Input: { message: string* }"));
+        assert!(instructions.contains("- list_directory [read_only]"));
         assert!(!instructions.contains("- run_command"));
-        assert!(instructions.contains("Do not request unavailable actions."));
+        assert!(instructions.contains("Do not invent tool names"));
     }
 }

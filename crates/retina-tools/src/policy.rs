@@ -117,6 +117,23 @@ mod tests {
     use super::*;
     use retina_types::{ToolApprovalPolicy, ToolConcurrencyClass, ToolDescriptor, ToolSourceKind};
 
+    fn tool_descriptor(name: &str, source: ToolSourceKind) -> ToolDescriptor {
+        ToolDescriptor {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            source,
+            concurrency: ToolConcurrencyClass::ReadOnly,
+            approval: ToolApprovalPolicy::None,
+            required_authority: vec![],
+            streaming: false,
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
     #[test]
     fn task_metadata_can_allow_and_deny_tool_names() {
         let mut metadata = BTreeMap::new();
@@ -127,15 +144,7 @@ mod tests {
         metadata.insert("denied_tools".to_string(), "run_command".to_string());
         let policy = ToolPolicy::from_task_metadata(&metadata);
 
-        let allowed = ToolDescriptor {
-            name: "read_file".to_string(),
-            description: "read".to_string(),
-            source: ToolSourceKind::BuiltinShell,
-            concurrency: ToolConcurrencyClass::ReadOnly,
-            approval: ToolApprovalPolicy::None,
-            required_authority: vec![],
-            streaming: false,
-        };
+        let allowed = tool_descriptor("read_file", ToolSourceKind::BuiltinShell);
         let denied = ToolDescriptor {
             name: "run_command".to_string(),
             ..allowed.clone()
@@ -159,15 +168,7 @@ mod tests {
             accessible_roots: vec![],
         });
 
-        let allowed = ToolDescriptor {
-            name: "read_file".to_string(),
-            description: "read".to_string(),
-            source: ToolSourceKind::BuiltinShell,
-            concurrency: ToolConcurrencyClass::ReadOnly,
-            approval: ToolApprovalPolicy::None,
-            required_authority: vec![],
-            streaming: false,
-        };
+        let allowed = tool_descriptor("read_file", ToolSourceKind::BuiltinShell);
         let denied = ToolDescriptor {
             name: "run_command".to_string(),
             ..allowed.clone()
@@ -177,13 +178,10 @@ mod tests {
         assert!(!policy.permits(&denied));
 
         let mcp_tool = ToolDescriptor {
-            name: "mcp__brave__brave_web_search".to_string(),
-            description: "search".to_string(),
-            source: ToolSourceKind::McpServer,
             concurrency: ToolConcurrencyClass::Streaming,
-            approval: ToolApprovalPolicy::None,
             required_authority: vec!["mcp".to_string()],
             streaming: true,
+            ..tool_descriptor("mcp__brave__brave_web_search", ToolSourceKind::McpServer)
         };
         assert!(!policy.permits(&mcp_tool));
     }
@@ -208,15 +206,7 @@ mod tests {
         })
         .with_task_metadata(&metadata);
 
-        let allowed = ToolDescriptor {
-            name: "read_file".to_string(),
-            description: "read".to_string(),
-            source: ToolSourceKind::BuiltinShell,
-            concurrency: ToolConcurrencyClass::ReadOnly,
-            approval: ToolApprovalPolicy::None,
-            required_authority: vec![],
-            streaming: false,
-        };
+        let allowed = tool_descriptor("read_file", ToolSourceKind::BuiltinShell);
         let denied = ToolDescriptor {
             name: "run_command".to_string(),
             ..allowed.clone()
@@ -241,13 +231,10 @@ mod tests {
         });
 
         let mcp_tool = ToolDescriptor {
-            name: "mcp__brave__brave_web_search".to_string(),
-            description: "search".to_string(),
-            source: ToolSourceKind::McpServer,
             concurrency: ToolConcurrencyClass::Streaming,
-            approval: ToolApprovalPolicy::None,
             required_authority: vec!["mcp".to_string()],
             streaming: true,
+            ..tool_descriptor("mcp__brave__brave_web_search", ToolSourceKind::McpServer)
         };
 
         assert!(policy.permits(&mcp_tool));
@@ -271,15 +258,7 @@ mod tests {
         })
         .with_task_metadata(&metadata);
 
-        let read_file = ToolDescriptor {
-            name: "read_file".to_string(),
-            description: "read".to_string(),
-            source: ToolSourceKind::BuiltinShell,
-            concurrency: ToolConcurrencyClass::ReadOnly,
-            approval: ToolApprovalPolicy::None,
-            required_authority: vec![],
-            streaming: false,
-        };
+        let read_file = tool_descriptor("read_file", ToolSourceKind::BuiltinShell);
         let list_directory = ToolDescriptor {
             name: "list_directory".to_string(),
             ..read_file.clone()

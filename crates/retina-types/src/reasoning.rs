@@ -1,6 +1,7 @@
 use crate::{Action, AgentId, ArtifactReference, TaskKind, TaskState, WorkingSource};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -97,6 +98,8 @@ pub struct ToolDescriptor {
     pub required_authority: Vec<String>,
     #[serde(default)]
     pub streaming: bool,
+    #[serde(default = "default_tool_input_schema")]
+    pub input_schema: Value,
 }
 
 impl ToolDescriptor {
@@ -117,12 +120,61 @@ impl ToolDescriptor {
         if !self.required_authority.is_empty() {
             traits.push(format!("requires {}", self.required_authority.join(",")));
         }
+        let input_summary = render_input_schema_summary(&self.input_schema);
         format!(
-            "- {} [{}]: {}",
+            "- {} [{}]: {}{}",
             self.name,
             traits.join(", "),
-            self.description
+            self.description,
+            input_summary
         )
+    }
+}
+
+fn default_tool_input_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "required": []
+    })
+}
+
+fn render_input_schema_summary(schema: &Value) -> String {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return String::new();
+    };
+    if properties.is_empty() {
+        return String::new();
+    }
+
+    let required = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+
+    let fields = properties
+        .iter()
+        .take(6)
+        .map(|(name, value)| {
+            let field_type = value.get("type").and_then(Value::as_str).unwrap_or("value");
+            if required.contains(name.as_str()) {
+                format!("{name}:{field_type}*")
+            } else {
+                format!("{name}:{field_type}")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(" Input: {}.", fields.join(", "))
     }
 }
 

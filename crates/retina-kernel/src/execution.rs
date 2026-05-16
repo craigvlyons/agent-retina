@@ -629,7 +629,11 @@ fn resolve_mcp_locator_reference(snapshot: &McpRegistrySnapshot, target: &str) -
     let (server, remainder) = target.split_once('/')?;
     let server_snapshot = snapshot.servers.iter().find(|entry| entry.name == server)?;
 
-    if server_snapshot.tools.iter().any(|tool| tool.name == remainder) {
+    if server_snapshot
+        .tools
+        .iter()
+        .any(|tool| tool.name == remainder)
+    {
         return Some(format!("mcp-tool://{server}/{remainder}"));
     }
 

@@ -2,6 +2,7 @@ use retina_types::{
     McpRegistrySnapshot, ShellCapabilities, ToolApprovalPolicy, ToolConcurrencyClass,
     ToolDescriptor, ToolSourceKind, build_mcp_tool_name,
 };
+use serde_json::json;
 
 pub fn shell_builtin_tools(
     capabilities: ShellCapabilities,
@@ -15,6 +16,13 @@ pub fn shell_builtin_tools(
             "Answer operator questions directly when no shell action is needed.",
             ToolConcurrencyClass::ReadOnly,
             vec!["text_response"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string" }
+                },
+                "required": ["message"]
+            }),
         ));
     }
     if capabilities.can_read_files {
@@ -23,6 +31,14 @@ pub fn shell_builtin_tools(
             "Inspect one path for existence, metadata, and optional content hash.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_read"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "include_content": { "type": "boolean" }
+                },
+                "required": ["path"]
+            }),
         ));
     }
     if capabilities.can_search_files {
@@ -31,18 +47,46 @@ pub fn shell_builtin_tools(
             "List files and directories in a target directory.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_search"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "recursive": { "type": "boolean" },
+                    "max_entries": { "type": "integer" }
+                },
+                "required": ["path"]
+            }),
         ));
         tools.push(builtin_tool(
             "find_files",
             "Find files by filename or path fragment.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_search"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string" },
+                    "pattern": { "type": "string" },
+                    "recursive": { "type": "boolean" },
+                    "max_results": { "type": "integer" }
+                },
+                "required": ["root", "pattern"]
+            }),
         ));
         tools.push(builtin_tool(
             "search_text",
             "Search text content across files in the current workspace.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_search"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "root": { "type": "string" },
+                    "query": { "type": "string" },
+                    "max_results": { "type": "integer" }
+                },
+                "required": ["root", "query"]
+            }),
         ));
     }
 
@@ -52,12 +96,28 @@ pub fn shell_builtin_tools(
             "Read text-like files such as markdown, code, config, and plaintext with truncation protection.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_read"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "max_bytes": { "type": "integer" }
+                },
+                "required": ["path"]
+            }),
         ));
         tools.push(builtin_tool(
             "ingest_structured_data",
             "Inspect structured local data such as CSV or TSV files by headers and sample rows.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_read"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "max_rows": { "type": "integer" }
+                },
+                "required": ["path"]
+            }),
         ));
     }
     if capabilities.can_extract_documents {
@@ -66,6 +126,16 @@ pub fn shell_builtin_tools(
             "Extract readable text from documents such as PDFs when raw file reads would be binary or unhelpful.",
             ToolConcurrencyClass::ReadOnly,
             vec!["document_extract"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "max_chars": { "type": "integer" },
+                    "page_start": { "type": "integer" },
+                    "page_end": { "type": "integer" }
+                },
+                "required": ["path"]
+            }),
         ));
     }
     if capabilities.can_write_files {
@@ -74,24 +144,62 @@ pub fn shell_builtin_tools(
             "Prefer this for modifying existing text files. Edit by exact old-string replacement after reading the file first; ambiguous matches are rejected unless replace_all=true.",
             ToolConcurrencyClass::Mutation,
             vec!["file_write"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old_string": { "type": "string" },
+                    "new_string": { "type": "string" },
+                    "replace_all": { "type": "boolean" }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
         ));
         tools.push(builtin_tool(
             "write_file",
             "Use this for creating new text files or complete rewrites. If the file already exists, read it first.",
             ToolConcurrencyClass::Mutation,
             vec!["file_write"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" },
+                    "overwrite": { "type": "boolean" }
+                },
+                "required": ["path", "content"]
+            }),
         ));
         tools.push(builtin_tool(
             "append_file",
             "Append content to a text file. Existing files should be read first.",
             ToolConcurrencyClass::Mutation,
             vec!["file_write"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            }),
         ));
         tools.push(builtin_tool(
             "edit_notebook",
             "Modify a .ipynb notebook by replacing, inserting, or deleting a specific cell after reading the notebook first.",
             ToolConcurrencyClass::Mutation,
             vec!["file_write"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "cell_id": { "type": "string" },
+                    "new_source": { "type": "string" },
+                    "cell_type": { "type": "string" },
+                    "edit_mode": { "type": "string" }
+                },
+                "required": ["path", "new_source"]
+            }),
         ));
     }
     if capabilities.can_write_notes {
@@ -100,6 +208,13 @@ pub fn shell_builtin_tools(
             "Store a compact note in local memory when it helps preserve useful context.",
             ToolConcurrencyClass::Mutation,
             vec!["note_write"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string" }
+                },
+                "required": ["note"]
+            }),
         ));
     }
     if supports_local_agents {
@@ -108,6 +223,21 @@ pub fn shell_builtin_tools(
             "Delegate a bounded local subtask to a child Retina worker and integrate its result.",
             ToolConcurrencyClass::LongRunning,
             vec!["agent_delegation"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string" },
+                    "allowed_tools": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    },
+                    "denied_tools": {
+                        "type": "array",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["prompt"]
+            }),
         ));
     }
     if capabilities.can_execute_commands {
@@ -116,6 +246,16 @@ pub fn shell_builtin_tools(
             "Run shell commands, pipelines, or local scripts when they best advance the task.",
             ToolConcurrencyClass::LongRunning,
             vec!["command_execution"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "path": { "type": "string" },
+                    "require_approval": { "type": "boolean" },
+                    "expect_change": { "type": "boolean" }
+                },
+                "required": ["command"]
+            }),
         );
         command.approval = ToolApprovalPolicy::ExplicitOperatorApproval;
         command.streaming = true;
@@ -192,6 +332,9 @@ pub fn mcp_client_tools(snapshot: &McpRegistrySnapshot) -> Vec<ToolDescriptor> {
                 approval: ToolApprovalPolicy::None,
                 required_authority: vec!["mcp".to_string()],
                 streaming: true,
+                input_schema: serde_json::Value::Object(
+                    tool.input_schema.as_object().cloned().unwrap_or_default(),
+                ),
             });
         }
     }
@@ -212,6 +355,13 @@ pub fn mcp_client_tools(snapshot: &McpRegistrySnapshot) -> Vec<ToolDescriptor> {
             approval: ToolApprovalPolicy::None,
             required_authority: vec!["mcp".to_string()],
             streaming: false,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" }
+                },
+                "required": []
+            }),
         });
         tools.push(ToolDescriptor {
             name: "read_mcp_resource".to_string(),
@@ -228,6 +378,14 @@ pub fn mcp_client_tools(snapshot: &McpRegistrySnapshot) -> Vec<ToolDescriptor> {
             approval: ToolApprovalPolicy::None,
             required_authority: vec!["mcp".to_string()],
             streaming: false,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "uri": { "type": "string" }
+                },
+                "required": ["server", "uri"]
+            }),
         });
     }
     if !has_concrete_tools {
@@ -246,6 +404,15 @@ pub fn mcp_client_tools(snapshot: &McpRegistrySnapshot) -> Vec<ToolDescriptor> {
             approval: ToolApprovalPolicy::None,
             required_authority: vec!["mcp".to_string()],
             streaming: true,
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "input_json": { "type": "object" }
+                },
+                "required": ["server", "tool", "input_json"]
+            }),
         });
     }
 
@@ -257,6 +424,7 @@ fn builtin_tool(
     description: &str,
     concurrency: ToolConcurrencyClass,
     required_authority: Vec<&str>,
+    input_schema: serde_json::Value,
 ) -> ToolDescriptor {
     ToolDescriptor {
         name: name.to_string(),
@@ -269,6 +437,7 @@ fn builtin_tool(
             .map(ToString::to_string)
             .collect(),
         streaming: false,
+        input_schema,
     }
 }
 
@@ -283,7 +452,10 @@ fn trim_description(value: &str, max_chars: usize) -> String {
 }
 
 fn render_input_schema_hint(schema: &serde_json::Value) -> String {
-    let Some(properties) = schema.get("properties").and_then(serde_json::Value::as_object) else {
+    let Some(properties) = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+    else {
         return String::new();
     };
     if properties.is_empty() {

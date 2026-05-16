@@ -330,7 +330,10 @@ fn invalid_mcp_fileish_read_is_recorded_as_failed_step() {
     ));
 
     let outcome = must(kernel.execute_task_with_config(
-        Task::new(AgentId::new(), "search the web for what is happening this weekend"),
+        Task::new(
+            AgentId::new(),
+            "search the web for what is happening this weekend",
+        ),
         ExecutionConfig {
             max_steps: 2,
             control: None,

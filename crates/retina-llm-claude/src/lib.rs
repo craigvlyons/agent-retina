@@ -167,6 +167,7 @@ mod tests {
     use super::*;
     use crate::payload::build_stable_instructions;
     use crate::response::ClaudeUsage;
+    use serde_json::json;
 
     fn must<T, E: std::fmt::Display>(value: std::result::Result<T, E>) -> T {
         value.unwrap_or_else(|error| panic!("test operation failed: {error}"))
@@ -178,6 +179,39 @@ mod tests {
 
     fn must_json(body: &str) -> String {
         extract_json_blob(body).unwrap_or_else(|_| panic!("expected JSON blob in test body"))
+    }
+
+    fn sample_tool_descriptor(name: &str, description: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            name: name.to_string(),
+            description: description.to_string(),
+            source: if name.starts_with("mcp__") {
+                ToolSourceKind::McpServer
+            } else {
+                ToolSourceKind::BuiltinShell
+            },
+            concurrency: ToolConcurrencyClass::ReadOnly,
+            approval: ToolApprovalPolicy::None,
+            required_authority: Vec::new(),
+            streaming: false,
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }
+    }
+
+    fn claude_action(action_type: &str, input: serde_json::Value) -> ClaudeAction {
+        ClaudeAction {
+            action_type: action_type.to_string(),
+            input,
+            task_complete: None,
+            intent_kind: None,
+            deliverable: None,
+            completion_basis: None,
+            reasoning: None,
+        }
     }
 
     #[test]
@@ -273,9 +307,8 @@ mod tests {
 
     #[test]
     fn json_blob_is_extracted_without_trailing_prose() {
-        let body = must_json(
-            "Let me do that.\n{\"type\":\"respond\",\"message\":\"hi\"}\nI am done now.",
-        );
+        let body =
+            must_json("Let me do that.\n{\"type\":\"respond\",\"message\":\"hi\"}\nI am done now.");
         assert_eq!(body, "{\"type\":\"respond\",\"message\":\"hi\"}");
     }
 
@@ -368,7 +401,7 @@ mod tests {
         ));
         assert!(instructions.contains("the harness can verify the change"));
         assert!(instructions.contains("In reflection mode, do something materially different or report the grounded blocker/current status."));
-        assert!(instructions.contains("keep root as a real directory path"));
+        assert!(instructions.contains("keep `input.root` as a real directory path"));
         assert!(
             instructions
                 .contains("For terminal or system-control tasks, use command output as evidence")
@@ -381,11 +414,14 @@ mod tests {
         assert!(instructions.contains("time-sensitive web tasks"));
         assert!(instructions.contains("generic city attractions"));
         assert!(instructions.contains("Do not mention attractions, neighborhoods, sports teams, venues, or activity categories"));
+        assert!(instructions.contains("same top hit or the same generic portal page"));
         assert!(instructions.contains("MCP tool identifiers and MCP locators are not files"));
         assert!(instructions.contains("input validation error"));
-        assert!(instructions.contains(
-            "Do not create or modify files unless the user asked for a saved artifact"
-        ));
+        assert!(
+            instructions.contains(
+                "Do not create or modify files unless the user asked for a saved artifact"
+            )
+        );
         assert!(!instructions.contains("best next verifiable step"));
         assert!(!instructions.contains(
             "Prefer direct interaction with the named path, file, command, or system target"
@@ -400,25 +436,26 @@ mod tests {
         let instructions = build_stable_instructions(
             false,
             &[ToolDescriptor {
-                name: "mcp__brave__brave_web_search".to_string(),
-                description: "Search the web".to_string(),
-                source: ToolSourceKind::McpServer,
                 concurrency: ToolConcurrencyClass::Streaming,
-                approval: ToolApprovalPolicy::None,
-                required_authority: vec!["mcp".to_string()],
                 streaming: true,
+                required_authority: vec!["mcp".to_string()],
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"]
+                }),
+                ..sample_tool_descriptor("mcp__brave__brave_web_search", "Search the web")
             }],
         );
-        assert!(instructions.contains("Use the concrete MCP tool action types"));
-        assert!(instructions.contains(
-            "\"type\": \"mcp__brave__brave_web_search\""
-        ));
-        assert!(instructions.contains(
-            "Do not start with run_command, curl, or ad-hoc web scraping"
-        ));
-        assert!(!instructions.contains(
-            "Use mcp_call with `server`, `tool`, and `input_json`"
-        ));
+        assert!(instructions.contains("Use the concrete MCP tool names"));
+        assert!(instructions.contains("\"type\": \"mcp__brave__brave_web_search\""));
+        assert!(
+            instructions.contains("Do not start with run_command, curl, or ad-hoc web scraping")
+        );
+        assert!(
+            !instructions
+                .contains("Use mcp_call with `input.server`, `input.tool`, and `input.input_json`")
+        );
     }
 
     #[test]
@@ -426,7 +463,7 @@ mod tests {
         let action: ClaudeAction = serde_json::from_str(
             r#"{
                 "type": "mcp__brave__brave_web_search",
-                "input_json": {"query":"date ideas in colorado springs"}
+                "input": {"query":"date ideas in colorado springs"}
             }"#,
         )
         .unwrap_or_else(|error| panic!("failed to parse ClaudeAction: {error}"));
@@ -550,93 +587,17 @@ mod tests {
     #[test]
     fn write_and_append_actions_have_no_approval_field() {
         let write = must(
-            ClaudeAction {
-                action_type: "write_file".to_string(),
-                command: None,
-                path: Some("note.txt".to_string()),
-                root: None,
-                pattern: None,
-                query: None,
-                content: Some("hello".to_string()),
-                old_string: None,
-                new_string: None,
-                replace_all: None,
-                include_content: None,
-                cell_id: None,
-                new_source: None,
-                cell_type: None,
-                edit_mode: None,
-                recursive: None,
-                max_entries: None,
-                max_results: None,
-                max_bytes: None,
-                max_rows: None,
-                max_chars: None,
-                page_start: None,
-                page_end: None,
-                overwrite: Some(true),
-                prompt: None,
-                allowed_tools: None,
-                denied_tools: None,
-                require_approval: None,
-                expect_change: None,
-                note: None,
-                message: None,
-                task_complete: Some(false),
-                intent_kind: None,
-                deliverable: None,
-                completion_basis: None,
-                reasoning: None,
-                server: None,
-                tool: None,
-                uri: None,
-                input_json: None,
-            }
+            claude_action(
+                "write_file",
+                json!({ "path": "note.txt", "content": "hello", "overwrite": true }),
+            )
             .into_reason_response(),
         );
         let append = must(
-            ClaudeAction {
-                action_type: "append_file".to_string(),
-                command: None,
-                path: Some("note.txt".to_string()),
-                root: None,
-                pattern: None,
-                query: None,
-                content: Some("more".to_string()),
-                old_string: None,
-                new_string: None,
-                replace_all: None,
-                include_content: None,
-                cell_id: None,
-                new_source: None,
-                cell_type: None,
-                edit_mode: None,
-                recursive: None,
-                max_entries: None,
-                max_results: None,
-                max_bytes: None,
-                max_rows: None,
-                max_chars: None,
-                page_start: None,
-                page_end: None,
-                overwrite: None,
-                prompt: None,
-                allowed_tools: None,
-                denied_tools: None,
-                require_approval: None,
-                expect_change: None,
-                note: None,
-                message: None,
-                task_complete: Some(false),
-                intent_kind: None,
-                deliverable: None,
-                completion_basis: None,
-                reasoning: None,
-                server: None,
-                tool: None,
-                uri: None,
-                input_json: None,
-            }
+            claude_action(
+                "append_file",
+                json!({ "path": "note.txt", "content": "more" }),
+            )
             .into_reason_response(),
         );
 
@@ -653,48 +614,10 @@ mod tests {
     #[test]
     fn run_command_with_target_path_tracks_that_artifact_for_verification() {
         let response = must(
-            ClaudeAction {
-                action_type: "run_command".to_string(),
-                command: Some("python script.py > out.txt".to_string()),
-                path: Some("out.txt".to_string()),
-                root: None,
-                pattern: None,
-                query: None,
-                content: None,
-                old_string: None,
-                new_string: None,
-                replace_all: None,
-                include_content: None,
-                cell_id: None,
-                new_source: None,
-                cell_type: None,
-                edit_mode: None,
-                recursive: None,
-                max_entries: None,
-                max_results: None,
-                max_bytes: None,
-                max_rows: None,
-                max_chars: None,
-                page_start: None,
-                page_end: None,
-                overwrite: None,
-                prompt: None,
-                allowed_tools: None,
-                denied_tools: None,
-                require_approval: None,
-                expect_change: None,
-                note: None,
-                message: None,
-                task_complete: Some(false),
-                intent_kind: None,
-                deliverable: None,
-                completion_basis: None,
-                reasoning: None,
-                server: None,
-                tool: None,
-                uri: None,
-                input_json: None,
-            }
+            claude_action(
+                "run_command",
+                json!({ "command": "python script.py > out.txt", "path": "out.txt" }),
+            )
             .into_reason_response(),
         );
 
@@ -718,51 +641,13 @@ mod tests {
 
     #[test]
     fn claude_action_can_map_reasoner_framing_fields() {
-        let response = must(
-            ClaudeAction {
-                action_type: "respond".to_string(),
-                command: None,
-                path: None,
-                root: None,
-                pattern: None,
-                query: None,
-                content: None,
-                old_string: None,
-                new_string: None,
-                replace_all: None,
-                include_content: None,
-                cell_id: None,
-                new_source: None,
-                cell_type: None,
-                edit_mode: None,
-                recursive: None,
-                max_entries: None,
-                max_results: None,
-                max_bytes: None,
-                max_rows: None,
-                max_chars: None,
-                page_start: None,
-                page_end: None,
-                overwrite: None,
-                prompt: None,
-                allowed_tools: None,
-                denied_tools: None,
-                require_approval: None,
-                expect_change: None,
-                note: None,
-                message: Some("done".to_string()),
-                task_complete: Some(true),
-                intent_kind: Some("answer".to_string()),
-                deliverable: Some("summary of startup.md".to_string()),
-                completion_basis: Some("read startup.md and extracted relevant lines".to_string()),
-                reasoning: Some("responding from gathered evidence".to_string()),
-                server: None,
-                tool: None,
-                uri: None,
-                input_json: None,
-            }
-            .into_reason_response(),
-        );
+        let mut action = claude_action("respond", json!({ "message": "done" }));
+        action.task_complete = Some(true);
+        action.intent_kind = Some("answer".to_string());
+        action.deliverable = Some("summary of startup.md".to_string());
+        action.completion_basis = Some("read startup.md and extracted relevant lines".to_string());
+        action.reasoning = Some("responding from gathered evidence".to_string());
+        let response = must(action.into_reason_response());
 
         let framing = response.framing.expect("expected framing");
         assert_eq!(framing.intent_kind, Some(TaskKind::Answer));
@@ -778,48 +663,10 @@ mod tests {
 
     #[test]
     fn malformed_edit_file_action_returns_reasoning_error() {
-        let error = ClaudeAction {
-            action_type: "edit_file".to_string(),
-            command: None,
-            path: None,
-            root: None,
-            pattern: None,
-            query: None,
-            content: None,
-            old_string: Some("before".to_string()),
-            new_string: Some("after".to_string()),
-            replace_all: Some(false),
-            server: None,
-            tool: None,
-            uri: None,
-            input_json: None,
-            cell_id: None,
-            new_source: None,
-            cell_type: None,
-            edit_mode: None,
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            prompt: None,
-            allowed_tools: None,
-            denied_tools: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(false),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
+        let error = claude_action(
+            "edit_file",
+            json!({ "old_string": "before", "new_string": "after", "replace_all": false }),
+        )
         .into_reason_response()
         .unwrap_err();
 
@@ -832,50 +679,9 @@ mod tests {
 
     #[test]
     fn unknown_action_type_returns_reasoning_error() {
-        let error = ClaudeAction {
-            action_type: "summarize_pdf".to_string(),
-            command: None,
-            path: None,
-            root: None,
-            pattern: None,
-            query: None,
-            content: None,
-            old_string: None,
-            new_string: None,
-            replace_all: None,
-            server: None,
-            tool: None,
-            uri: None,
-            input_json: None,
-            cell_id: None,
-            new_source: None,
-            cell_type: None,
-            edit_mode: None,
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            prompt: None,
-            allowed_tools: None,
-            denied_tools: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(true),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
-        .into_reason_response()
-        .unwrap_err();
+        let mut action = claude_action("summarize_pdf", json!({}));
+        action.task_complete = Some(true);
+        let error = action.into_reason_response().unwrap_err();
 
         let KernelError::Reasoning(message) = error else {
             panic!("expected reasoning error");
@@ -886,50 +692,9 @@ mod tests {
 
     #[test]
     fn respond_without_message_returns_reasoning_error() {
-        let error = ClaudeAction {
-            action_type: "respond".to_string(),
-            command: None,
-            path: None,
-            root: None,
-            pattern: None,
-            query: None,
-            content: None,
-            old_string: None,
-            new_string: None,
-            replace_all: None,
-            server: None,
-            tool: None,
-            uri: None,
-            input_json: None,
-            cell_id: None,
-            new_source: None,
-            cell_type: None,
-            edit_mode: None,
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            prompt: None,
-            allowed_tools: None,
-            denied_tools: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(true),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
-        .into_reason_response()
-        .unwrap_err();
+        let mut action = claude_action("respond", json!({}));
+        action.task_complete = Some(true);
+        let error = action.into_reason_response().unwrap_err();
 
         let KernelError::Reasoning(message) = error else {
             panic!("expected reasoning error");
@@ -939,104 +704,10 @@ mod tests {
     }
 
     #[test]
-    fn respond_accepts_content_as_message_alias() {
-        let response = ClaudeAction {
-            action_type: "respond".to_string(),
-            command: None,
-            path: None,
-            root: None,
-            pattern: None,
-            query: None,
-            content: Some("hello from content".to_string()),
-            old_string: None,
-            new_string: None,
-            replace_all: None,
-            server: None,
-            tool: None,
-            uri: None,
-            input_json: None,
-            cell_id: None,
-            new_source: None,
-            cell_type: None,
-            edit_mode: None,
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            prompt: None,
-            allowed_tools: None,
-            denied_tools: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(true),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
-        .into_reason_response()
-        .unwrap_or_else(|error| panic!("respond alias should parse: {error}"));
-
-        match response.action {
-            Action::Respond { message, .. } => assert_eq!(message, "hello from content"),
-            other => panic!("expected respond action, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn run_command_without_command_returns_reasoning_error() {
-        let error = ClaudeAction {
-            action_type: "run_command".to_string(),
-            command: None,
-            path: None,
-            root: None,
-            pattern: None,
-            query: None,
-            content: None,
-            old_string: None,
-            new_string: None,
-            replace_all: None,
-            server: None,
-            tool: None,
-            uri: None,
-            input_json: None,
-            cell_id: None,
-            new_source: None,
-            cell_type: None,
-            edit_mode: None,
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            prompt: None,
-            allowed_tools: None,
-            denied_tools: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(false),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
-        .into_reason_response()
-        .unwrap_err();
+        let error = claude_action("run_command", json!({}))
+            .into_reason_response()
+            .unwrap_err();
 
         let KernelError::Reasoning(message) = error else {
             panic!("expected reasoning error");
@@ -1047,50 +718,9 @@ mod tests {
 
     #[test]
     fn inspect_path_without_path_returns_reasoning_error() {
-        let error = ClaudeAction {
-            action_type: "inspect_path".to_string(),
-            command: None,
-            path: None,
-            root: None,
-            pattern: None,
-            query: None,
-            content: None,
-            old_string: None,
-            new_string: None,
-            replace_all: None,
-            server: None,
-            tool: None,
-            uri: None,
-            input_json: None,
-            cell_id: None,
-            new_source: None,
-            cell_type: None,
-            edit_mode: None,
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            prompt: None,
-            allowed_tools: None,
-            denied_tools: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(false),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
-        .into_reason_response()
-        .unwrap_err();
+        let error = claude_action("inspect_path", json!({}))
+            .into_reason_response()
+            .unwrap_err();
 
         let KernelError::Reasoning(message) = error else {
             panic!("expected reasoning error");
@@ -1100,106 +730,22 @@ mod tests {
     }
 
     #[test]
-    fn spawn_agent_without_prompt_returns_reasoning_error() {
-        let error = ClaudeAction {
-            action_type: "spawn_agent".to_string(),
-            command: None,
-            path: None,
-            root: None,
-            pattern: None,
-            query: None,
-            content: None,
-            old_string: None,
-            new_string: None,
-            replace_all: None,
-            server: None,
-            tool: None,
-            uri: None,
-            input_json: None,
-            cell_id: None,
-            new_source: None,
-            cell_type: None,
-            edit_mode: None,
-            include_content: None,
-            recursive: None,
-            max_entries: None,
-            max_results: None,
-            max_bytes: None,
-            max_rows: None,
-            max_chars: None,
-            page_start: None,
-            page_end: None,
-            overwrite: None,
-            prompt: None,
-            allowed_tools: None,
-            denied_tools: None,
-            require_approval: None,
-            expect_change: None,
-            note: None,
-            message: None,
-            task_complete: Some(false),
-            intent_kind: None,
-            deliverable: None,
-            completion_basis: None,
-            reasoning: None,
-        }
-        .into_reason_response()
-        .unwrap_err();
+    fn agent_spawn_without_prompt_returns_reasoning_error() {
+        let error = claude_action("agent_spawn", json!({}))
+            .into_reason_response()
+            .unwrap_err();
 
         let KernelError::Reasoning(message) = error else {
             panic!("expected reasoning error");
         };
-        assert!(message.contains("spawn_agent"));
+        assert!(message.contains("agent_spawn"));
         assert!(message.contains("prompt"));
     }
 
     #[test]
     fn omitted_task_complete_defaults_false() {
-        let response = must(
-            ClaudeAction {
-                action_type: "respond".to_string(),
-                command: None,
-                path: None,
-                root: None,
-                pattern: None,
-                query: None,
-                content: None,
-                old_string: None,
-                new_string: None,
-                replace_all: None,
-                server: None,
-                tool: None,
-                uri: None,
-                input_json: None,
-                cell_id: None,
-                new_source: None,
-                cell_type: None,
-                edit_mode: None,
-                include_content: None,
-                recursive: None,
-                max_entries: None,
-                max_results: None,
-                max_bytes: None,
-                max_rows: None,
-                max_chars: None,
-                page_start: None,
-                page_end: None,
-                overwrite: None,
-                prompt: None,
-                allowed_tools: None,
-                denied_tools: None,
-                require_approval: None,
-                expect_change: None,
-                note: None,
-                message: Some("done".to_string()),
-                task_complete: None,
-                intent_kind: None,
-                deliverable: None,
-                completion_basis: None,
-                reasoning: None,
-            }
-            .into_reason_response(),
-        );
+        let response =
+            must(claude_action("respond", json!({ "message": "done" })).into_reason_response());
 
         assert!(!response.task_complete);
     }

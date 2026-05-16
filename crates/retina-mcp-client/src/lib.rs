@@ -58,9 +58,8 @@ impl ConfiguredMcpRuntime {
             for (key, value) in &config.env {
                 command.env(key, value);
             }
-            let transport = TokioChildProcess::new(command).map_err(|error| {
-                KernelError::Execution(format!("spawn MCP server: {error}"))
-            })?;
+            let transport = TokioChildProcess::new(command)
+                .map_err(|error| KernelError::Execution(format!("spawn MCP server: {error}")))?;
             ().serve(transport)
                 .await
                 .map_err(|error| KernelError::Execution(format!("connect MCP server: {error}")))
@@ -90,17 +89,16 @@ impl McpRuntime for ConfiguredMcpRuntime {
                     .map_err(|error| {
                         KernelError::Execution(format!("list MCP tools for {name}: {error}"))
                     })?;
-                let resources = match runtime
-                    .block_on(async { client.peer().list_all_resources().await })
-                {
-                    Ok(resources) => resources,
-                    Err(error) if is_method_not_found_error(&error.to_string()) => Vec::new(),
-                    Err(error) => {
-                        return Err(KernelError::Execution(format!(
-                            "list MCP resources for {name}: {error}"
-                        )));
-                    }
-                };
+                let resources =
+                    match runtime.block_on(async { client.peer().list_all_resources().await }) {
+                        Ok(resources) => resources,
+                        Err(error) if is_method_not_found_error(&error.to_string()) => Vec::new(),
+                        Err(error) => {
+                            return Err(KernelError::Execution(format!(
+                                "list MCP resources for {name}: {error}"
+                            )));
+                        }
+                    };
                 Ok(McpServerSnapshot {
                     name: name.clone(),
                     tools: tools

@@ -3,9 +3,9 @@ use crate::cli::{Cli, Commands, InspectCommands};
 use crate::controller::{AgentController, InspectController};
 use crate::maintenance::run_cleanup;
 use crate::output::{
-    render_action_result, render_agent_registry, render_cleanup_report, render_memory_inspection,
-    render_mcp_snapshot, render_runtime_tasks, render_stats, render_task_state, render_timeline,
-    render_worker_overview,
+    render_action_result, render_agent_registry, render_cleanup_report, render_mcp_snapshot,
+    render_memory_inspection, render_runtime_tasks, render_stats, render_task_state,
+    render_timeline, render_worker_overview,
 };
 use crate::runtime::init_runtime;
 use clap::Parser;

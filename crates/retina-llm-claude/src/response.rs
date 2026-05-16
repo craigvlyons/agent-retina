@@ -143,40 +143,8 @@ impl From<ClaudeUsage> for TokenUsage {
 pub(crate) struct ClaudeAction {
     #[serde(rename = "type")]
     pub(crate) action_type: String,
-    pub(crate) command: Option<String>,
-    pub(crate) path: Option<String>,
-    pub(crate) root: Option<String>,
-    pub(crate) pattern: Option<String>,
-    pub(crate) query: Option<String>,
-    pub(crate) content: Option<String>,
-    pub(crate) old_string: Option<String>,
-    pub(crate) new_string: Option<String>,
-    pub(crate) replace_all: Option<bool>,
-    pub(crate) server: Option<String>,
-    pub(crate) tool: Option<String>,
-    pub(crate) uri: Option<String>,
-    pub(crate) input_json: Option<serde_json::Value>,
-    pub(crate) cell_id: Option<String>,
-    pub(crate) new_source: Option<String>,
-    pub(crate) cell_type: Option<String>,
-    pub(crate) edit_mode: Option<String>,
-    pub(crate) include_content: Option<bool>,
-    pub(crate) recursive: Option<bool>,
-    pub(crate) max_entries: Option<usize>,
-    pub(crate) max_results: Option<usize>,
-    pub(crate) max_bytes: Option<usize>,
-    pub(crate) max_rows: Option<usize>,
-    pub(crate) max_chars: Option<usize>,
-    pub(crate) page_start: Option<usize>,
-    pub(crate) page_end: Option<usize>,
-    pub(crate) overwrite: Option<bool>,
-    pub(crate) prompt: Option<String>,
-    pub(crate) allowed_tools: Option<Vec<String>>,
-    pub(crate) denied_tools: Option<Vec<String>>,
-    pub(crate) require_approval: Option<bool>,
-    pub(crate) expect_change: Option<bool>,
-    pub(crate) note: Option<String>,
-    pub(crate) message: Option<String>,
+    #[serde(default)]
+    pub(crate) input: serde_json::Value,
     pub(crate) task_complete: Option<bool>,
     pub(crate) intent_kind: Option<String>,
     pub(crate) deliverable: Option<String>,
@@ -187,30 +155,33 @@ pub(crate) struct ClaudeAction {
 impl ClaudeAction {
     pub(crate) fn into_reason_response(self) -> Result<ReasonResponse> {
         let task_complete = self.task_complete.unwrap_or(false);
-        let framing = if self.intent_kind.is_some()
-            || self.deliverable.is_some()
-            || self.completion_basis.is_some()
-        {
-            Some(ReasonerTaskFraming {
-                intent_kind: self.intent_kind.as_deref().and_then(parse_task_kind_hint),
-                deliverable: self.deliverable,
-                completion_basis: self.completion_basis,
-            })
-        } else {
-            None
-        };
+        let intent_kind = self.intent_kind.clone();
+        let deliverable = self.deliverable.clone();
+        let completion_basis = self.completion_basis.clone();
+        let reasoning = self.reasoning.clone();
+        let framing =
+            if intent_kind.is_some() || deliverable.is_some() || completion_basis.is_some() {
+                Some(ReasonerTaskFraming {
+                    intent_kind: intent_kind.as_deref().and_then(parse_task_kind_hint),
+                    deliverable,
+                    completion_basis,
+                })
+            } else {
+                None
+            };
 
         let action = match self.action_type.as_str() {
             "run_command" => Action::RunCommand {
                 id: ActionId::new(),
-                command: required_string(self.command, "run_command", "command")?,
+                command: self.required_string("command")?,
                 cwd: None,
-                require_approval: self.require_approval.unwrap_or(false),
-                expect_change: self.expect_change.unwrap_or(self.path.is_some()),
+                require_approval: self.optional_bool("require_approval")?.unwrap_or(false),
+                expect_change: self
+                    .optional_bool("expect_change")?
+                    .unwrap_or(self.optional_string("path")?.is_some()),
                 state_scope: HashScope {
                     tracked_paths: self
-                        .path
-                        .clone()
+                        .optional_string("path")?
                         .map(|path| {
                             vec![TrackedPath {
                                 path: path.into(),
@@ -224,94 +195,89 @@ impl ClaudeAction {
             },
             "inspect_path" => Action::InspectPath {
                 id: ActionId::new(),
-                path: required_string(self.path, "inspect_path", "path")?.into(),
-                include_content: self.include_content.unwrap_or(true),
+                path: self.required_string("path")?.into(),
+                include_content: self.optional_bool("include_content")?.unwrap_or(true),
             },
             "list_directory" => Action::ListDirectory {
                 id: ActionId::new(),
-                path: required_string(self.path, "list_directory", "path")?.into(),
-                recursive: self.recursive.unwrap_or(false),
-                max_entries: self.max_entries.unwrap_or(100),
+                path: self.required_string("path")?.into(),
+                recursive: self.optional_bool("recursive")?.unwrap_or(false),
+                max_entries: self.optional_usize("max_entries")?.unwrap_or(100),
             },
             "find_files" => Action::FindFiles {
                 id: ActionId::new(),
-                root: required_string(self.root, "find_files", "root")?.into(),
-                pattern: required_string(self.pattern, "find_files", "pattern")?,
-                recursive: self.recursive.unwrap_or(true),
-                max_results: self.max_results.unwrap_or(50),
+                root: self.required_string("root")?.into(),
+                pattern: self.required_string("pattern")?,
+                recursive: self.optional_bool("recursive")?.unwrap_or(true),
+                max_results: self.optional_usize("max_results")?.unwrap_or(50),
             },
             "search_text" => Action::SearchText {
                 id: ActionId::new(),
-                root: required_string(self.root, "search_text", "root")?.into(),
-                query: required_string(self.query, "search_text", "query")?,
-                max_results: self.max_results.unwrap_or(25),
+                root: self.required_string("root")?.into(),
+                query: self.required_string("query")?,
+                max_results: self.optional_usize("max_results")?.unwrap_or(25),
             },
             "read_file" => Action::ReadFile {
                 id: ActionId::new(),
-                path: required_string(self.path, "read_file", "path")?.into(),
-                max_bytes: self.max_bytes,
+                path: self.required_string("path")?.into(),
+                max_bytes: self.optional_usize("max_bytes")?,
             },
             "ingest_structured_data" => Action::IngestStructuredData {
                 id: ActionId::new(),
-                path: required_string(self.path, "ingest_structured_data", "path")?.into(),
-                max_rows: self.max_rows,
+                path: self.required_string("path")?.into(),
+                max_rows: self.optional_usize("max_rows")?,
             },
             "extract_document_text" => Action::ExtractDocumentText {
                 id: ActionId::new(),
-                path: required_string(self.path, "extract_document_text", "path")?.into(),
-                max_chars: self.max_chars,
-                page_start: self.page_start,
-                page_end: self.page_end,
+                path: self.required_string("path")?.into(),
+                max_chars: self.optional_usize("max_chars")?,
+                page_start: self.optional_usize("page_start")?,
+                page_end: self.optional_usize("page_end")?,
             },
             "list_mcp_resources" => Action::ListMcpResources {
                 id: ActionId::new(),
-                server: self.server,
+                server: self.optional_string("server")?,
             },
             "read_mcp_resource" => Action::ReadMcpResource {
                 id: ActionId::new(),
-                server: required_string(self.server, "read_mcp_resource", "server")?,
-                uri: required_string(self.uri, "read_mcp_resource", "uri")?,
+                server: self.required_string("server")?,
+                uri: self.required_string("uri")?,
             },
             "mcp_call" => Action::CallMcpTool {
                 id: ActionId::new(),
-                server: required_string(self.server, "mcp_call", "server")?,
-                tool: required_string(self.tool, "mcp_call", "tool")?,
-                input_json: self.input_json.ok_or_else(|| {
-                    KernelError::Reasoning(
-                        "invalid Claude action 'mcp_call': missing required field 'input_json'"
-                            .to_string(),
-                    )
-                })?,
+                server: self.required_string("server")?,
+                tool: self.required_string("tool")?,
+                input_json: self.required_value("input_json")?,
                 resolved_tool_name: None,
             },
             "write_file" => Action::WriteFile {
                 id: ActionId::new(),
-                path: required_string(self.path, "write_file", "path")?.into(),
-                content: required_string(self.content, "write_file", "content")?,
-                overwrite: self.overwrite.unwrap_or(false),
+                path: self.required_string("path")?.into(),
+                content: self.required_string("content")?,
+                overwrite: self.optional_bool("overwrite")?.unwrap_or(false),
             },
             "edit_file" => Action::EditFile {
                 id: ActionId::new(),
-                path: required_string(self.path, "edit_file", "path")?.into(),
-                old_string: required_string(self.old_string, "edit_file", "old_string")?,
-                new_string: required_string(self.new_string, "edit_file", "new_string")?,
-                replace_all: self.replace_all.unwrap_or(false),
+                path: self.required_string("path")?.into(),
+                old_string: self.required_string("old_string")?,
+                new_string: self.required_string("new_string")?,
+                replace_all: self.optional_bool("replace_all")?.unwrap_or(false),
             },
             "append_file" => Action::AppendFile {
                 id: ActionId::new(),
-                path: required_string(self.path, "append_file", "path")?.into(),
-                content: required_string(self.content, "append_file", "content")?,
+                path: self.required_string("path")?.into(),
+                content: self.required_string("content")?,
             },
             "edit_notebook" => Action::EditNotebook {
                 id: ActionId::new(),
-                path: required_string(self.path, "edit_notebook", "path")?.into(),
-                cell_id: self.cell_id,
+                path: self.required_string("path")?.into(),
+                cell_id: self.optional_string("cell_id")?,
                 new_source: notebook_source_for_mode(
                     &self.action_type,
-                    self.edit_mode.as_deref(),
-                    self.new_source,
+                    self.optional_string("edit_mode")?.as_deref(),
+                    self.optional_string("new_source")?,
                 )?,
-                cell_type: match self.cell_type.as_deref() {
+                cell_type: match self.optional_string("cell_type")?.as_deref() {
                     Some("code") => Some(NotebookCellType::Code),
                     Some("markdown") => Some(NotebookCellType::Markdown),
                     Some(other) => {
@@ -322,46 +288,38 @@ impl ClaudeAction {
                     }
                     None => None,
                 },
-                edit_mode: match self.edit_mode.as_deref() {
+                edit_mode: match self.optional_string("edit_mode")?.as_deref() {
                     Some("insert") => NotebookEditMode::Insert,
                     Some("delete") => NotebookEditMode::Delete,
                     _ => NotebookEditMode::Replace,
                 },
             },
-            "spawn_agent" => Action::SpawnAgent {
+            "agent_spawn" => Action::SpawnAgent {
                 id: ActionId::new(),
-                prompt: required_string(
-                    self.prompt.or(self.message.clone()),
-                    "spawn_agent",
-                    "prompt",
-                )?,
-                allowed_tools: self.allowed_tools.unwrap_or_default(),
-                denied_tools: self.denied_tools.unwrap_or_default(),
+                prompt: self.required_string("prompt")?,
+                allowed_tools: self
+                    .optional_string_vec("allowed_tools")?
+                    .unwrap_or_default(),
+                denied_tools: self
+                    .optional_string_vec("denied_tools")?
+                    .unwrap_or_default(),
             },
             "record_note" => Action::RecordNote {
                 id: ActionId::new(),
-                note: required_string(self.note, "record_note", "note")?,
+                note: self.required_string("note")?,
             },
             "respond" => Action::Respond {
                 id: ActionId::new(),
-                message: required_string(
-                    self.message.or(self.content),
-                    "respond",
-                    "message",
-                )?,
+                message: self.required_string("message")?,
             },
             other => {
                 if let Some((server, tool)) = parse_mcp_tool_name(other) {
+                    let _ = self.input_object()?;
                     Action::CallMcpTool {
                         id: ActionId::new(),
                         server,
                         tool,
-                        input_json: self.input_json.ok_or_else(|| {
-                            KernelError::Reasoning(format!(
-                                "invalid Claude action '{}': missing required field 'input_json'",
-                                other
-                            ))
-                        })?,
+                        input_json: self.input.clone(),
                         resolved_tool_name: Some(other.to_string()),
                     }
                 } else {
@@ -377,19 +335,98 @@ impl ClaudeAction {
             action,
             task_complete,
             framing,
-            reasoning: self.reasoning,
+            reasoning,
             tokens_used: TokenUsage::default(),
         })
     }
-}
 
-fn required_string(value: Option<String>, action_type: &str, field: &str) -> Result<String> {
-    value.filter(|text| !text.trim().is_empty()).ok_or_else(|| {
+    fn input_object(&self) -> Result<&serde_json::Map<String, serde_json::Value>> {
+        self.input.as_object().ok_or_else(|| {
+            KernelError::Reasoning(format!(
+                "invalid Claude action '{}': missing required object field 'input'",
+                self.action_type
+            ))
+        })
+    }
+
+    fn optional_string(&self, field: &str) -> Result<Option<String>> {
+        let input = self.input_object()?;
+        match input.get(field) {
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                Ok(Some(value.clone()))
+            }
+            Some(serde_json::Value::String(_)) => Ok(None),
+            Some(_) => Err(self.invalid_input_field(field, "string")),
+            None => Ok(None),
+        }
+    }
+
+    fn required_string(&self, field: &str) -> Result<String> {
+        self.optional_string(field)?.ok_or_else(|| {
+            KernelError::Reasoning(format!(
+                "invalid Claude action '{}': missing required input field '{}'",
+                self.action_type, field
+            ))
+        })
+    }
+
+    fn optional_bool(&self, field: &str) -> Result<Option<bool>> {
+        let input = self.input_object()?;
+        match input.get(field) {
+            Some(serde_json::Value::Bool(value)) => Ok(Some(*value)),
+            Some(_) => Err(self.invalid_input_field(field, "boolean")),
+            None => Ok(None),
+        }
+    }
+
+    fn optional_usize(&self, field: &str) -> Result<Option<usize>> {
+        let input = self.input_object()?;
+        match input.get(field) {
+            Some(serde_json::Value::Number(value)) => value
+                .as_u64()
+                .map(|n| n as usize)
+                .map(Some)
+                .ok_or_else(|| self.invalid_input_field(field, "integer")),
+            Some(_) => Err(self.invalid_input_field(field, "integer")),
+            None => Ok(None),
+        }
+    }
+
+    fn optional_string_vec(&self, field: &str) -> Result<Option<Vec<String>>> {
+        let input = self.input_object()?;
+        match input.get(field) {
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .map(|item| match item {
+                    serde_json::Value::String(text) if !text.trim().is_empty() => Ok(text.clone()),
+                    serde_json::Value::String(_) => {
+                        Err(self.invalid_input_field(field, "non-empty string array"))
+                    }
+                    _ => Err(self.invalid_input_field(field, "string array")),
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Some),
+            Some(_) => Err(self.invalid_input_field(field, "string array")),
+            None => Ok(None),
+        }
+    }
+
+    fn required_value(&self, field: &str) -> Result<serde_json::Value> {
+        let input = self.input_object()?;
+        input.get(field).cloned().ok_or_else(|| {
+            KernelError::Reasoning(format!(
+                "invalid Claude action '{}': missing required input field '{}'",
+                self.action_type, field
+            ))
+        })
+    }
+
+    fn invalid_input_field(&self, field: &str, expected: &str) -> KernelError {
         KernelError::Reasoning(format!(
-            "invalid Claude action '{}': missing required field '{}'",
-            action_type, field
+            "invalid Claude action '{}': input field '{}' must be a {}",
+            self.action_type, field, expected
         ))
-    })
+    }
 }
 
 fn notebook_source_for_mode(
@@ -399,7 +436,14 @@ fn notebook_source_for_mode(
 ) -> Result<String> {
     match edit_mode {
         Some("delete") => Ok(new_source.unwrap_or_default()),
-        _ => required_string(new_source, action_type, "new_source"),
+        _ => new_source
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| {
+                KernelError::Reasoning(format!(
+                    "invalid Claude action '{}': missing required input field 'new_source'",
+                    action_type
+                ))
+            }),
     }
 }
 

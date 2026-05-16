@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub fn normalize_name_for_mcp(name: &str) -> String {
-    name.replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-', "_")
+    name.replace(
+        |ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-',
+        "_",
+    )
 }
 
 pub fn build_mcp_tool_name(server: &str, tool: &str) -> String {
