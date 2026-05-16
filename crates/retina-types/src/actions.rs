@@ -450,6 +450,26 @@ pub struct McpResourceReadResult {
     pub contents: Vec<McpResourceContentItem>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSearchOutcomeKind {
+    GenericPortal,
+    SpecificListing,
+    NewsRoundup,
+    SingleEvent,
+    NoLocalSignal,
+    ValidationError,
+    ToolError,
+    NonSearchResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpSearchHitSummary {
+    pub url: String,
+    pub title: Option<String>,
+    pub snippet: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct McpToolCallResult {
     pub server: String,
@@ -457,6 +477,13 @@ pub struct McpToolCallResult {
     pub content_preview: String,
     pub structured_content: Option<serde_json::Value>,
     pub is_error: bool,
+    pub search_outcome_kind: Option<McpSearchOutcomeKind>,
+    #[serde(default)]
+    pub evidence_identities: Vec<String>,
+    #[serde(default)]
+    pub search_hits: Vec<McpSearchHitSummary>,
+    pub primary_locator: Option<String>,
+    pub evidence_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

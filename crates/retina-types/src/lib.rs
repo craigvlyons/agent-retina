@@ -22,7 +22,11 @@ pub use tasking::*;
 
 #[cfg(test)]
 mod tests {
-    use crate::{Action, ActionId, HashScope, PrivilegedCommandKind, classify_privileged_command};
+    use crate::{
+        Action, ActionId, ActiveContinuationWindow, AgentId, HashScope, PrivilegedCommandKind,
+        Task, TaskRecoverySnapshot, TranscriptLedger, TranscriptUnit, TranscriptUnitKind,
+        WorkingSource, classify_privileged_command,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -66,9 +70,70 @@ mod tests {
     }
 
     #[test]
-    fn task_state_defaults_cleanly() {
+    fn task_state_projection_defaults_cleanly() {
         let state = crate::TaskState::default();
         assert!(state.goal.objective.is_empty());
         assert_eq!(state.progress.current_step, 0);
+    }
+
+    #[test]
+    fn resumed_task_keeps_source_session_and_seeds_resume_context() {
+        let source_task = Task::new(AgentId::new(), "finish bulk report");
+        let source_task_id = source_task.id.clone();
+        let source_session_id = source_task.session_id.clone();
+        let snapshot = TaskRecoverySnapshot {
+            source_task_id: source_task.id.clone(),
+            source_session_id: source_task.session_id.clone(),
+            source_agent_id: source_task.agent_id.clone(),
+            objective: source_task.description.clone(),
+            continuation_window: ActiveContinuationWindow {
+                objective: source_task.description.clone(),
+                current_step: 4,
+                max_steps: 50,
+                transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                    ordinal: 1,
+                    step: 4,
+                    kind: TranscriptUnitKind::ToolResult,
+                    summary: "read the first PDF".to_string(),
+                    result_ref_id: None,
+                    primary_locator: Some("/tmp/example.pdf".to_string()),
+                    evidence_refs: vec!["/tmp/example.pdf".to_string()],
+                    working_sources: Vec::new(),
+                    artifact_references: Vec::new(),
+                    next_step_guidance: None,
+                    repetition_signature: None,
+                    avoid_label: None,
+                    compaction_snapshot: None,
+                }]),
+                reannounced_sources: vec![WorkingSource {
+                    kind: "document".to_string(),
+                    locator: "/tmp/example.pdf".to_string(),
+                    role: "primary".to_string(),
+                    status: "active".to_string(),
+                    why_it_matters: "contains the original PDF evidence".to_string(),
+                    last_used_step: 4,
+                    evidence_refs: vec!["/tmp/example.pdf".to_string()],
+                    page_reference: None,
+                    extraction_method: None,
+                    structured_summary: None,
+                    preview_excerpt: Some("example".to_string()),
+                }],
+                ..ActiveContinuationWindow::default()
+            },
+            recent_context: None,
+            resume_reason: "reasoning transport failed".to_string(),
+        };
+
+        let resumed = Task::resume_from_snapshot(AgentId::new(), snapshot, None);
+        assert_eq!(resumed.parent_task_id, Some(source_task_id.clone()));
+        assert_eq!(resumed.session_id, source_session_id);
+        assert!(resumed.resume_context.is_some());
+        assert_eq!(
+            resumed
+                .metadata
+                .get("resumed_from_task_id")
+                .map(String::as_str),
+            Some(source_task_id.0.as_str())
+        );
     }
 }

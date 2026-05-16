@@ -1,7 +1,6 @@
 use retina_types::*;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::path::Path;
 
 #[derive(Clone)]
 pub(crate) struct StepDecision {
@@ -17,7 +16,7 @@ pub(crate) enum ActionExecution {
 pub(crate) struct StepSelectionContext<'a> {
     pub(crate) task: &'a Task,
     pub(crate) intent: &'a Intent,
-    pub(crate) state: &'a crate::TaskLoopState,
+    pub(crate) state: &'a mut crate::TaskLoopState,
     pub(crate) control: Option<&'a ExecutionControlHandle>,
     pub(crate) current_step: usize,
     pub(crate) max_steps: usize,
@@ -26,7 +25,6 @@ pub(crate) struct StepSelectionContext<'a> {
 pub(crate) struct ContextAssemblyInput<'a> {
     pub(crate) task: &'a Task,
     pub(crate) state: &'a crate::TaskLoopState,
-    pub(crate) last_result: Option<String>,
     pub(crate) operator_guidance: Option<String>,
     pub(crate) current_step: usize,
     pub(crate) max_steps: usize,
@@ -85,71 +83,26 @@ impl<'a> EventSpec<'a> {
     }
 }
 
-pub struct ReflexEngine {
-    rules: Mutex<Vec<ReflexiveRule>>,
-}
-
-impl ReflexEngine {
-    pub fn new(rules: Vec<ReflexiveRule>) -> Self {
-        Self {
-            rules: Mutex::new(rules),
+pub(crate) fn select_reflex_action(task: &Task, rules: &[ReflexiveRule]) -> Option<Action> {
+    for rule in rules {
+        if !rule.active {
+            continue;
+        }
+        match &rule.condition {
+            RuleCondition::Always => return rule_action(rule),
+            RuleCondition::TaskContains(text) if task.description.contains(text) => {
+                return rule_action(rule);
+            }
+            _ => {}
         }
     }
-
-    pub fn check(&self, task: &Task, _intent: &Intent) -> Option<Action> {
-        for rule in &*recover_mutex(&self.rules) {
-            if !rule.active {
-                continue;
-            }
-            match &rule.condition {
-                RuleCondition::Always => return rule_action(rule),
-                RuleCondition::TaskContains(text) if task.description.contains(text) => {
-                    return rule_action(rule);
-                }
-                _ => {}
-            }
-        }
-        None
-    }
-
-    pub fn sync(&self, rules: Vec<ReflexiveRule>) {
-        *recover_mutex(&self.rules) = rules;
-    }
+    None
 }
 
 fn rule_action(rule: &ReflexiveRule) -> Option<Action> {
     match &rule.action {
         RuleAction::UseAction(action) => Some(action.clone()),
         _ => None,
-    }
-}
-
-#[derive(Default)]
-pub struct CircuitBreaker {
-    failure_counts: Mutex<HashMap<String, usize>>,
-}
-
-impl CircuitBreaker {
-    pub fn is_tripped(&self, intent: &Intent) -> bool {
-        let key = intent.objective.clone();
-        recover_mutex(&self.failure_counts)
-            .get(&key)
-            .copied()
-            .unwrap_or_default()
-            >= 3
-    }
-
-    pub fn record_failure(&self, intent: &Intent) {
-        let key = intent.objective.clone();
-        let mut counts = recover_mutex(&self.failure_counts);
-        *counts.entry(key).or_insert(0) += 1;
-    }
-}
-
-pub(crate) fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    match mutex.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -302,10 +255,20 @@ pub(crate) fn action_utility(action: &Action, result: &ActionResult, delta: &Sta
                 -0.75
             } else if result.content_preview.trim().is_empty()
                 && result.structured_content.is_none()
+                && result.search_hits.is_empty()
             {
                 0.15
             } else {
-                0.7
+                match result.search_outcome_kind.as_ref() {
+                    Some(McpSearchOutcomeKind::SingleEvent) => 0.9,
+                    Some(McpSearchOutcomeKind::SpecificListing) => 0.8,
+                    Some(McpSearchOutcomeKind::NewsRoundup) => 0.55,
+                    Some(McpSearchOutcomeKind::GenericPortal) => 0.45,
+                    Some(McpSearchOutcomeKind::NoLocalSignal) => 0.25,
+                    Some(McpSearchOutcomeKind::ValidationError) => -0.4,
+                    Some(McpSearchOutcomeKind::ToolError) => -0.75,
+                    Some(McpSearchOutcomeKind::NonSearchResult) | None => 0.7,
+                }
             }
         }
         ActionResult::FileWrite { .. } => 1.0,
@@ -340,7 +303,9 @@ pub(crate) fn tool_authored_completion_message(
         return None;
     };
 
-    let _ = framing;
+    if !framing_matches_written_artifact(path, framing) {
+        return None;
+    }
 
     let base = match mutation_kind {
         FileMutationKind::Create => {
@@ -366,4 +331,132 @@ pub(crate) fn tool_authored_completion_message(
         .unwrap_or_default();
 
     Some(format!("{base}{preview}"))
+}
+
+pub(crate) fn completion_blocker_reason(
+    task: &Task,
+    working_sources: &[WorkingSource],
+) -> Option<String> {
+    if !task_requests_full_batch_coverage(&task.description) {
+        return None;
+    }
+
+    let discovered_inputs = discovered_batch_input_paths(working_sources);
+    if discovered_inputs.is_empty() {
+        return None;
+    }
+    let covered_inputs = covered_batch_input_paths(working_sources);
+    let missing = discovered_inputs
+        .into_iter()
+        .filter(|path| !covered_inputs.contains(path))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let preview = missing
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "the task asked for complete batch coverage, but {} discovered input(s) are still not covered: {}",
+        missing.len(),
+        preview
+    ))
+}
+
+fn framing_matches_written_artifact(path: &Path, framing: Option<&ReasonerTaskFraming>) -> bool {
+    let Some(framing) = framing else {
+        return false;
+    };
+    if !matches!(framing.intent_kind, Some(TaskKind::Output)) {
+        return false;
+    }
+    let Some(deliverable) = framing
+        .deliverable
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let deliverable_lower = deliverable.to_ascii_lowercase();
+    let path_display = path.display().to_string().to_ascii_lowercase();
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    let deliverable_file_name = Path::new(deliverable)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+
+    deliverable_lower == path_display
+        || path_display.ends_with(&format!("/{}", deliverable_lower))
+        || matches!(
+            (file_name.as_deref(), deliverable_file_name.as_deref()),
+            (Some(path_name), Some(deliverable_name)) if path_name == deliverable_name
+        )
+        || matches!(
+            file_name.as_deref(),
+            Some(path_name) if path_name == deliverable_lower
+        )
+}
+
+fn task_requests_full_batch_coverage(description: &str) -> bool {
+    let normalized = description.to_ascii_lowercase();
+    let mentions_all = normalized.contains("all pdf")
+        || normalized.contains("all the pdf")
+        || normalized.contains("all files")
+        || normalized.contains("all the files")
+        || normalized.contains("review all")
+        || normalized.contains("read all")
+        || normalized.contains("go through all");
+    let mentions_container = normalized.contains("folder")
+        || normalized.contains("directory")
+        || normalized.contains("bulk-pdf");
+    mentions_all && mentions_container
+}
+
+fn discovered_batch_input_paths(
+    working_sources: &[WorkingSource],
+) -> std::collections::BTreeSet<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for source in working_sources {
+        if source.kind == "file"
+            && source.role == "candidate"
+            && looks_like_batch_input(&source.locator)
+        {
+            paths.insert(source.locator.clone());
+        }
+        if source.kind == "directory" && source.status == "listed" {
+            for locator in &source.evidence_refs {
+                if looks_like_batch_input(locator) {
+                    paths.insert(locator.clone());
+                }
+            }
+        }
+    }
+    paths
+}
+
+fn covered_batch_input_paths(
+    working_sources: &[WorkingSource],
+) -> std::collections::BTreeSet<String> {
+    working_sources
+        .iter()
+        .filter(|source| source.role == "authoritative" && looks_like_batch_input(&source.locator))
+        .map(|source| source.locator.clone())
+        .collect()
+}
+
+fn looks_like_batch_input(locator: &str) -> bool {
+    let lower = locator.to_ascii_lowercase();
+    lower.ends_with(".pdf")
+        || lower.ends_with(".md")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".csv")
 }

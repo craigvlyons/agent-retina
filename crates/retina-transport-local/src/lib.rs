@@ -539,7 +539,7 @@ fn delegated_task_transcript(db_path: &std::path::Path, task_id: &TaskId) -> Opt
                     lines.push(line);
                 }
             }
-            TimelineEventType::TaskFailed => {
+            TimelineEventType::TaskFailed | TimelineEventType::TaskBlocked => {
                 if let Some(reason) = event
                     .payload_json
                     .get("reason")

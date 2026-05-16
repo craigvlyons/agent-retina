@@ -32,7 +32,6 @@ impl ToolPolicy {
             allowed.insert("mcp:*".to_string());
             allowed.insert("list_mcp_resources".to_string());
             allowed.insert("read_mcp_resource".to_string());
-            allowed.insert("mcp_call".to_string());
         }
         if authority.allow_file_writes {
             allowed.insert("edit_file".to_string());

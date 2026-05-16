@@ -277,25 +277,6 @@ pub fn mcp_client_tools(snapshot: &McpRegistrySnapshot) -> Vec<ToolDescriptor> {
         return tools;
     }
 
-    let tool_preview = connected_servers
-        .iter()
-        .flat_map(|server| {
-            server.tools.iter().map(|tool| {
-                format!(
-                    "{}/{}{}",
-                    server.name,
-                    tool.name,
-                    tool.description
-                        .as_deref()
-                        .map(|desc| format!(" - {}", trim_description(desc, 90)))
-                        .unwrap_or_default()
-                )
-            })
-        })
-        .take(10)
-        .collect::<Vec<_>>()
-        .join("; ");
-
     let resource_preview = connected_servers
         .iter()
         .flat_map(|server| {
@@ -310,16 +291,14 @@ pub fn mcp_client_tools(snapshot: &McpRegistrySnapshot) -> Vec<ToolDescriptor> {
     let has_resources = connected_servers
         .iter()
         .any(|server| !server.resources.is_empty());
-    let has_concrete_tools = connected_servers
-        .iter()
-        .any(|server| !server.tools.is_empty());
 
     for server in &connected_servers {
         for tool in &server.tools {
             tools.push(ToolDescriptor {
                 name: build_mcp_tool_name(&server.name, &tool.name),
                 description: format!(
-                    "{}{} Use `input_json` for arguments.",
+                    "{}{}{}",
+                    search_tool_prefix(&tool.name),
                     tool.description
                         .as_deref()
                         .map(str::trim)
@@ -388,35 +367,19 @@ pub fn mcp_client_tools(snapshot: &McpRegistrySnapshot) -> Vec<ToolDescriptor> {
             }),
         });
     }
-    if !has_concrete_tools {
-        tools.push(ToolDescriptor {
-            name: "mcp_call".to_string(),
-            description: format!(
-                "Call a configured MCP tool by server and tool name. Available tools: {}.",
-                if tool_preview.is_empty() {
-                    "none discovered".to_string()
-                } else {
-                    tool_preview
-                }
-            ),
-            source: ToolSourceKind::McpServer,
-            concurrency: ToolConcurrencyClass::Streaming,
-            approval: ToolApprovalPolicy::None,
-            required_authority: vec!["mcp".to_string()],
-            streaming: true,
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "server": { "type": "string" },
-                    "tool": { "type": "string" },
-                    "input_json": { "type": "object" }
-                },
-                "required": ["server", "tool", "input_json"]
-            }),
-        });
-    }
-
     tools
+}
+
+fn search_tool_prefix(tool_name: &str) -> &'static str {
+    if tool_name.contains("local_search") {
+        "Use this for place-aware local venue, business, or nearby lookup tasks. "
+    } else if tool_name.contains("news_search") {
+        "Use this for recent news, current-events coverage, and roundup-style reporting. "
+    } else if tool_name.contains("web_search") || tool_name.ends_with("search") {
+        "Use this for broad web discovery, official pages, and general internet research. "
+    } else {
+        ""
+    }
 }
 
 fn builtin_tool(
@@ -438,16 +401,6 @@ fn builtin_tool(
             .collect(),
         streaming: false,
         input_schema,
-    }
-}
-
-fn trim_description(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let trimmed = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{trimmed}...")
-    } else {
-        trimmed
     }
 }
 
@@ -598,5 +551,56 @@ mod tests {
         assert!(!names.contains(&"read_mcp_resource"));
         assert!(names.contains(&"mcp__brave__brave_web_search"));
         assert!(!names.contains(&"mcp_call"));
+    }
+
+    #[test]
+    fn mcp_search_tools_surface_family_specific_descriptions() {
+        let tools = mcp_client_tools(&McpRegistrySnapshot {
+            servers: vec![retina_types::McpServerSnapshot {
+                name: "brave".to_string(),
+                tools: vec![
+                    retina_types::McpToolSummary {
+                        server: "brave".to_string(),
+                        name: "brave_web_search".to_string(),
+                        description: Some("Search the web".to_string()),
+                        read_only: true,
+                        destructive: false,
+                        open_world: true,
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": { "query": { "type": "string" } },
+                            "required": ["query"]
+                        }),
+                    },
+                    retina_types::McpToolSummary {
+                        server: "brave".to_string(),
+                        name: "brave_news_search".to_string(),
+                        description: Some("Search recent news".to_string()),
+                        read_only: true,
+                        destructive: false,
+                        open_world: true,
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": { "query": { "type": "string" } },
+                            "required": ["query"]
+                        }),
+                    },
+                ],
+                resources: Vec::new(),
+                error: None,
+            }],
+        });
+
+        let web = tools
+            .iter()
+            .find(|tool| tool.name == "mcp__brave__brave_web_search")
+            .expect("expected web search tool");
+        let news = tools
+            .iter()
+            .find(|tool| tool.name == "mcp__brave__brave_news_search")
+            .expect("expected news search tool");
+
+        assert!(web.description.contains("broad web discovery"));
+        assert!(news.description.contains("recent news"));
     }
 }

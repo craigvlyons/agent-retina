@@ -22,14 +22,14 @@ It is part of the architecture from the start because every future worker and sp
 
 ## Research Basis
 
-This direction comes directly from the canonical research stack:
+This direction comes directly from the active architecture stack:
 
-1. [docs/v1_plan.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/v1_plan.md)
-2. [docs/research_overview.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/research_overview.md)
-3. [docs/trait_contracts.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/trait_contracts.md)
-4. [docs/research_memory.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/research_memory.md)
-5. [docs/architecture.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/architecture.md)
-6. [docs/roadmap.md](/Users/macc/Projects/gabanode_lab/agent-retina/docs/roadmap.md)
+1. [architecture.md](/Users/macc/projects/personal/agent-retina/docs/architecture.md)
+2. [roadmap.md](/Users/macc/projects/personal/agent-retina/docs/roadmap.md)
+3. [trait_contracts.md](/Users/macc/projects/personal/agent-retina/docs/trait_contracts.md)
+4. [research_overview.md](/Users/macc/projects/personal/agent-retina/docs/research_overview.md)
+5. [research_memory_v2.md](/Users/macc/projects/personal/agent-retina/docs/research_memory_v2.md)
+6. [plans/multi_device_specialist_runtime_plan.md](/Users/macc/projects/personal/agent-retina/docs/plans/multi_device_specialist_runtime_plan.md)
 
 If a future refactor or feature idea conflicts with this memory model, use those docs to resolve it before changing behavior.
 

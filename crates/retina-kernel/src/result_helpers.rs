@@ -2,6 +2,66 @@ use super::action_label;
 use retina_types::*;
 use std::path::{Path, PathBuf};
 
+pub(crate) fn derive_next_step_guidance(
+    action: &Action,
+    result: &ActionResult,
+    repetition_count: usize,
+) -> Option<NextStepGuidance> {
+    let based_on_action = Some(action_label(action));
+    match result {
+        ActionResult::DirectoryListing { root, summary, .. } if summary.total_entries > 0 => {
+            Some(NextStepGuidance {
+                directive: NextStepDirective::AnswerFromEvidence,
+                reason: "a grounded directory listing already exists; answer inventory questions from this listing or choose one child path instead of re-listing the same folder".to_string(),
+                based_on_action,
+                evidence_locator: Some(root.display().to_string()),
+                preferred_search_family: None,
+                suggested_query: None,
+            })
+        }
+        ActionResult::FileMatches { root, matches, .. } if !matches.is_empty() => {
+            Some(NextStepGuidance {
+                directive: NextStepDirective::GatherMissingFact,
+                reason: format!(
+                    "{} candidate file match(es) already exist; choose a matched path or report from the match set instead of repeating the same file search",
+                    matches.len()
+                ),
+                based_on_action,
+                evidence_locator: Some(root.display().to_string()),
+                preferred_search_family: None,
+                suggested_query: None,
+            })
+        }
+        ActionResult::TextSearch { root, matches, .. } if !matches.is_empty() => {
+            Some(NextStepGuidance {
+                directive: NextStepDirective::GatherMissingFact,
+                reason: format!(
+                    "{} text match(es) already exist; read one matched file or answer from the observed lines instead of rerunning the same text search",
+                    matches.len()
+                ),
+                based_on_action,
+                evidence_locator: Some(root.display().to_string()),
+                preferred_search_family: None,
+                suggested_query: None,
+            })
+        }
+        ActionResult::FileRead { path, .. }
+        | ActionResult::StructuredData { path, .. }
+        | ActionResult::DocumentText { path, .. } => Some(NextStepGuidance {
+            directive: NextStepDirective::AnswerFromEvidence,
+            reason: "grounded content has already been read or extracted; answer from this evidence unless one specific missing detail still requires another step".to_string(),
+            based_on_action,
+            evidence_locator: Some(path.display().to_string()),
+            preferred_search_family: None,
+            suggested_query: None,
+        }),
+        ActionResult::McpToolCall(result) => {
+            derive_mcp_next_step_guidance(action, result, based_on_action, repetition_count)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
     match result {
         ActionResult::Command(command) => format!(
@@ -121,11 +181,12 @@ pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
             if result.contents.len() == 1 { "" } else { "s" }
         ),
         ActionResult::McpToolCall(result) => format!(
-            "called MCP tool {}/{}{}{}",
+            "called MCP tool {}/{}{}{}{}",
             result.server,
             result.tool,
             if result.is_error { " with error" } else { "" },
-            summarize_mcp_tool_signal(result)
+            summarize_mcp_tool_signal(result),
+            search_outcome_suffix(result)
         ),
         ActionResult::FileWrite {
             path,
@@ -324,6 +385,11 @@ pub(crate) fn compact_action_result_for_context(
             "server": result.server,
             "tool": result.tool,
             "is_error": result.is_error,
+            "search_outcome_kind": mcp_search_outcome_label(result.search_outcome_kind.as_ref()),
+            "evidence_identities": result.evidence_identities,
+            "search_hits": result.search_hits,
+            "primary_locator": result.primary_locator,
+            "evidence_summary": result.evidence_summary,
             "content_preview": preview_text(&result.content_preview, 4000),
             "structured_content": result.structured_content,
         }),
@@ -398,6 +464,56 @@ pub(crate) fn repeated_step_signature(action: &Action, result: &ActionResult) ->
         ));
     }
 
+    if let ActionResult::McpToolCall(result) = result {
+        let identities = if result.evidence_identities.is_empty() {
+            vec![preview_text(&result.content_preview, 160)]
+        } else {
+            result.evidence_identities.clone()
+        };
+        return Some(format!(
+            "mcp:{}:{}::outcome={}::error={}::identities={}",
+            result.server,
+            result.tool,
+            mcp_search_outcome_label(result.search_outcome_kind.as_ref()),
+            result.is_error,
+            identities.join("|")
+        ));
+    }
+
+    if let ActionResult::FileMatches {
+        root,
+        pattern,
+        matches,
+    } = result
+    {
+        return Some(format!(
+            "file_matches:{}:{}::{}",
+            root.display(),
+            pattern,
+            preview_paths(matches.iter().take(6).cloned().collect())
+        ));
+    }
+
+    if let ActionResult::TextSearch {
+        root,
+        query,
+        matches,
+    } = result
+    {
+        let top_matches = matches
+            .iter()
+            .take(4)
+            .map(|item| format!("{}#L{}", item.path.display(), item.line_number))
+            .collect::<Vec<_>>()
+            .join("|");
+        return Some(format!(
+            "text_search:{}:{}::{}",
+            root.display(),
+            query,
+            top_matches
+        ));
+    }
+
     Some(format!(
         "{}::{}",
         action_label(action),
@@ -405,11 +521,251 @@ pub(crate) fn repeated_step_signature(action: &Action, result: &ActionResult) ->
     ))
 }
 
+fn derive_mcp_next_step_guidance(
+    action: &Action,
+    result: &McpToolCallResult,
+    based_on_action: Option<String>,
+    repetition_count: usize,
+) -> Option<NextStepGuidance> {
+    let search_context = search_action_context(action);
+    let evidence_locator = result
+        .primary_locator
+        .clone()
+        .or_else(|| result.evidence_identities.first().cloned());
+    let directive = match result.search_outcome_kind.as_ref() {
+        Some(McpSearchOutcomeKind::ValidationError) => NextStepDirective::ReformulateSearch,
+        Some(McpSearchOutcomeKind::ToolError) => NextStepDirective::ReportLimitation,
+        Some(McpSearchOutcomeKind::NoLocalSignal) => {
+            if repetition_count >= 2 {
+                NextStepDirective::ReportLimitation
+            } else {
+                NextStepDirective::ReformulateSearch
+            }
+        }
+        Some(McpSearchOutcomeKind::GenericPortal | McpSearchOutcomeKind::NewsRoundup) => {
+            if repetition_count >= 2 {
+                NextStepDirective::ReportLimitation
+            } else {
+                NextStepDirective::ReformulateSearch
+            }
+        }
+        Some(McpSearchOutcomeKind::SpecificListing | McpSearchOutcomeKind::SingleEvent)
+        | Some(McpSearchOutcomeKind::NonSearchResult)
+        | None => NextStepDirective::AnswerFromEvidence,
+    };
+    let preferred_search_family = if directive == NextStepDirective::ReformulateSearch {
+        suggested_search_family(result.search_outcome_kind.as_ref(), search_context.as_ref())
+    } else {
+        None
+    };
+    let suggested_query = if directive == NextStepDirective::ReformulateSearch {
+        build_search_reformulation_query(
+            result.search_outcome_kind.as_ref(),
+            search_context.as_ref(),
+        )
+    } else {
+        None
+    };
+    let reason = match result.search_outcome_kind.as_ref() {
+        Some(McpSearchOutcomeKind::ValidationError) => {
+            "the MCP tool rejected the previous arguments; simplify the next tool call to required fields only or switch to a narrower search".to_string()
+        }
+        Some(McpSearchOutcomeKind::ToolError) => {
+            "the MCP tool returned an error; report the grounded limitation or choose a materially different tool step".to_string()
+        }
+        Some(McpSearchOutcomeKind::NoLocalSignal) => {
+            if repetition_count >= 2 {
+                "local search still returned no location signal after retry; report the limitation or switch to grounded web results already observed".to_string()
+            } else {
+                "local search returned no location signal; try one narrower web or news search instead of repeating the same local query".to_string()
+            }
+        }
+        Some(McpSearchOutcomeKind::GenericPortal) => {
+            if repetition_count >= 2 {
+                "search results are still broad portal-style listings without concrete event evidence; report that limitation instead of searching the same broad space again".to_string()
+            } else {
+                "the current search result looks like a generic portal or broad listing; do one narrower search for concrete details before answering".to_string()
+            }
+        }
+        Some(McpSearchOutcomeKind::NewsRoundup) => {
+            if repetition_count >= 2 {
+                "the observed search results are still news roundups without enough concrete event detail; state that limitation instead of repeating the same search".to_string()
+            } else {
+                "the current search result looks like a roundup; do one targeted follow-up for concrete event names, dates, or venues before answering".to_string()
+            }
+        }
+        Some(McpSearchOutcomeKind::SpecificListing) => {
+            "grounded search evidence already exists; answer from the observed titles, snippets, and links unless one specific missing fact still needs one narrower follow-up".to_string()
+        }
+        Some(McpSearchOutcomeKind::SingleEvent) => {
+            "the observed search result already looks like a concrete event; answer from the grounded details instead of broadening the search again".to_string()
+        }
+        Some(McpSearchOutcomeKind::NonSearchResult) | None => {
+            "a grounded MCP result already exists; continue from the observed MCP evidence instead of converting it into a file step".to_string()
+        }
+    };
+    Some(NextStepGuidance {
+        directive,
+        reason,
+        based_on_action,
+        evidence_locator,
+        preferred_search_family,
+        suggested_query,
+    })
+}
+
+#[derive(Clone)]
+struct SearchActionContext {
+    family: Option<SearchToolFamily>,
+    query: Option<String>,
+}
+
+fn search_action_context(action: &Action) -> Option<SearchActionContext> {
+    let Action::CallMcpTool {
+        tool,
+        input_json,
+        resolved_tool_name,
+        ..
+    } = action
+    else {
+        return None;
+    };
+    let query = input_json
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| input_json.get("q").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let family = detect_search_tool_family(resolved_tool_name.as_deref().unwrap_or(tool));
+    Some(SearchActionContext { family, query })
+}
+
+fn detect_search_tool_family(tool_name: &str) -> Option<SearchToolFamily> {
+    if tool_name.contains("local_search") {
+        Some(SearchToolFamily::Local)
+    } else if tool_name.contains("news_search") {
+        Some(SearchToolFamily::News)
+    } else if tool_name.contains("web_search") || tool_name.ends_with("search") {
+        Some(SearchToolFamily::Web)
+    } else {
+        None
+    }
+}
+
+fn suggested_search_family(
+    outcome: Option<&McpSearchOutcomeKind>,
+    context: Option<&SearchActionContext>,
+) -> Option<SearchToolFamily> {
+    match outcome {
+        Some(McpSearchOutcomeKind::NoLocalSignal) => Some(SearchToolFamily::Web),
+        Some(McpSearchOutcomeKind::GenericPortal) => {
+            match context.and_then(|ctx| ctx.family.clone()) {
+                Some(SearchToolFamily::Web) => Some(SearchToolFamily::News),
+                Some(SearchToolFamily::News) => Some(SearchToolFamily::Web),
+                Some(SearchToolFamily::Local) | None => Some(SearchToolFamily::Web),
+            }
+        }
+        Some(McpSearchOutcomeKind::NewsRoundup) => Some(SearchToolFamily::Web),
+        Some(McpSearchOutcomeKind::ValidationError) => context.and_then(|ctx| ctx.family.clone()),
+        _ => None,
+    }
+}
+
+fn build_search_reformulation_query(
+    outcome: Option<&McpSearchOutcomeKind>,
+    context: Option<&SearchActionContext>,
+) -> Option<String> {
+    let base_query = context
+        .and_then(|ctx| ctx.query.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    let suffix = match outcome {
+        Some(McpSearchOutcomeKind::GenericPortal) => "specific events dates venues tickets",
+        Some(McpSearchOutcomeKind::NewsRoundup) => "official event schedule dates venues tickets",
+        Some(McpSearchOutcomeKind::NoLocalSignal) => return Some(base_query.to_string()),
+        Some(McpSearchOutcomeKind::ValidationError) => return Some(base_query.to_string()),
+        _ => return None,
+    };
+
+    Some(append_unique_query_suffix(base_query, suffix))
+}
+
+fn append_unique_query_suffix(base_query: &str, suffix: &str) -> String {
+    let base_lower = base_query.to_ascii_lowercase();
+    let missing_tokens = suffix
+        .split_whitespace()
+        .filter(|token| !base_lower.contains(&token.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    if missing_tokens.is_empty() {
+        base_query.to_string()
+    } else {
+        format!("{base_query} {}", missing_tokens.join(" "))
+    }
+}
+
+fn search_outcome_suffix(result: &McpToolCallResult) -> String {
+    let kind = mcp_search_outcome_label(result.search_outcome_kind.as_ref());
+    if kind == "non_search_result" {
+        String::new()
+    } else {
+        format!(" [{kind}]")
+    }
+}
+
+fn mcp_search_outcome_label(kind: Option<&McpSearchOutcomeKind>) -> &'static str {
+    match kind {
+        Some(McpSearchOutcomeKind::GenericPortal) => "generic_portal",
+        Some(McpSearchOutcomeKind::SpecificListing) => "specific_listing",
+        Some(McpSearchOutcomeKind::NewsRoundup) => "news_roundup",
+        Some(McpSearchOutcomeKind::SingleEvent) => "single_event",
+        Some(McpSearchOutcomeKind::NoLocalSignal) => "no_local_signal",
+        Some(McpSearchOutcomeKind::ValidationError) => "validation_error",
+        Some(McpSearchOutcomeKind::ToolError) => "tool_error",
+        Some(McpSearchOutcomeKind::NonSearchResult) | None => "non_search_result",
+    }
+}
+
+pub(crate) fn repeated_step_limit(action: &Action, result: &ActionResult) -> usize {
+    match (action, result) {
+        (_, ActionResult::McpToolCall(result)) => match result.search_outcome_kind.as_ref() {
+            Some(
+                McpSearchOutcomeKind::GenericPortal
+                | McpSearchOutcomeKind::NewsRoundup
+                | McpSearchOutcomeKind::NoLocalSignal
+                | McpSearchOutcomeKind::ValidationError,
+            ) => 1,
+            Some(McpSearchOutcomeKind::SpecificListing | McpSearchOutcomeKind::SingleEvent) => 2,
+            Some(McpSearchOutcomeKind::ToolError | McpSearchOutcomeKind::NonSearchResult)
+            | None => 2,
+        },
+        (Action::RunCommand { .. }, _) => 3,
+        _ => 3,
+    }
+}
+
 pub(crate) fn compact_last_result_for_compacted_context(
     last_result: &str,
 ) -> serde_json::Result<String> {
     let value: serde_json::Value = serde_json::from_str(last_result)?;
     let compact = match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("command") => serde_json::json!({
+            "type": "command",
+            "command": value.get("command"),
+            "success": value.get("success"),
+            "exit_code": value.get("exit_code"),
+            "stdout_preview": value
+                .get("stdout")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| preview_text(text, 240)),
+            "stderr_preview": value
+                .get("stderr")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| preview_text(text, 180)),
+            "observed_paths": value.get("observed_paths"),
+            "continuation": "reuse the exact command outcome already observed unless a materially different command is needed"
+        }),
         Some("file_read") => serde_json::json!({
             "type": "file_read",
             "path": value.get("path"),
@@ -418,7 +774,7 @@ pub(crate) fn compact_last_result_for_compacted_context(
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .map(|text| preview_text(text, 240)),
-            "continuation": "reopen file by path from task_state artifact refs if more detail is needed"
+            "continuation": "reopen file by path from continuation artifact refs if more detail is needed"
         }),
         Some("document_text") => serde_json::json!({
             "type": "document_text",
@@ -432,7 +788,7 @@ pub(crate) fn compact_last_result_for_compacted_context(
                 .get("content")
                 .and_then(serde_json::Value::as_str)
                 .map(|text| preview_text(text, 240)),
-            "continuation": "reopen extracted document by path from task_state artifact refs if more detail is needed"
+            "continuation": "reopen extracted document by path from continuation artifact refs if more detail is needed"
         }),
         Some("structured_data") => serde_json::json!({
             "type": "structured_data",
@@ -443,7 +799,7 @@ pub(crate) fn compact_last_result_for_compacted_context(
             "total_rows": value.get("total_rows"),
             "truncated": value.get("truncated"),
             "extraction_method": value.get("extraction_method"),
-            "continuation": "reopen structured data by path from task_state artifact refs if more rows are needed"
+            "continuation": "reopen structured data by path from continuation artifact refs if more rows are needed"
         }),
         Some("text_search") => serde_json::json!({
             "type": "text_search",
@@ -451,7 +807,7 @@ pub(crate) fn compact_last_result_for_compacted_context(
             "query": value.get("query"),
             "count": value.get("count"),
             "matches": value.get("matches"),
-            "continuation": "use task_state working sources and artifact refs for exact evidence"
+            "continuation": "use continuation working sources and artifact refs for exact evidence"
         }),
         Some("file_matches") => serde_json::json!({
             "type": "file_matches",
@@ -459,20 +815,32 @@ pub(crate) fn compact_last_result_for_compacted_context(
             "pattern": value.get("pattern"),
             "count": value.get("count"),
             "matches": value.get("matches"),
-            "continuation": "choose from task_state candidate sources instead of re-searching"
+            "continuation": "choose from continuation candidate sources instead of re-searching"
         }),
         Some("directory_listing") => serde_json::json!({
             "type": "directory_listing",
             "root": value.get("root"),
             "count": value.get("count"),
             "entries": value.get("entries"),
-            "continuation": "use task_state candidate sources instead of replaying the full listing"
+            "continuation": "use continuation candidate sources instead of replaying the full listing"
+        }),
+        Some("mcp_tool_call") => serde_json::json!({
+            "type": "mcp_tool_call",
+            "server": value.get("server"),
+            "tool": value.get("tool"),
+            "search_outcome_kind": value.get("search_outcome_kind"),
+            "primary_locator": value.get("primary_locator"),
+            "evidence_summary": value.get("evidence_summary"),
+            "search_hits": value.get("search_hits"),
+            "is_error": value.get("is_error"),
+            "continuation": "reuse continuation compacted result refs, working sources, and evidence locators before searching again"
         }),
         _ => value,
     };
     serde_json::to_string(&compact)
 }
 
+#[cfg(test)]
 pub(crate) fn summarize_verified_facts(
     working_sources: &[WorkingSource],
     references: &[ArtifactReference],
@@ -498,9 +866,24 @@ pub(crate) fn summarize_verified_facts(
                 )
             }
             ("generated", status) => format!("produced artifact {} ({status})", source.locator),
-            (_, "matched") => format!("candidate source identified at {}", source.locator),
+            (_, "matched") => {
+                if let Some(preview) = source.preview_excerpt.as_deref() {
+                    format!(
+                        "candidate source identified at {} ({preview})",
+                        source.locator
+                    )
+                } else {
+                    format!("candidate source identified at {}", source.locator)
+                }
+            }
             (_, "matched_text") => format!("text evidence identified in {}", source.locator),
-            (_, "listed") => format!("directory explored at {}", source.locator),
+            (_, "listed") => {
+                if let Some(preview) = source.preview_excerpt.as_deref() {
+                    format!("directory explored at {} ({preview})", source.locator)
+                } else {
+                    format!("directory explored at {}", source.locator)
+                }
+            }
             (_, "inspected") => format!("path inspected at {}", source.locator),
             _ => format!("{} {} [{}]", source.status, source.locator, source.role),
         };
@@ -559,6 +942,65 @@ pub(crate) fn prioritized_artifact_references(
     references
 }
 
+pub(crate) fn reannounced_working_sources(
+    sources: &[WorkingSource],
+    preserved_locators: &[String],
+    transcript_locators: &[String],
+    limit: usize,
+) -> Vec<WorkingSource> {
+    select_reannounced_items(
+        &prioritized_working_sources(sources),
+        preserved_locators,
+        transcript_locators,
+        limit,
+        |source| source.locator.clone(),
+        |source| matches!(source.role.as_str(), "authoritative" | "generated"),
+    )
+}
+
+pub(crate) fn reannounced_artifact_references(
+    references: &[ArtifactReference],
+    preserved_locators: &[String],
+    transcript_locators: &[String],
+    limit: usize,
+) -> Vec<ArtifactReference> {
+    select_reannounced_items(
+        &prioritized_artifact_references(references),
+        preserved_locators,
+        transcript_locators,
+        limit,
+        |reference| reference.locator.clone(),
+        |reference| {
+            matches!(
+                reference.status.as_str(),
+                "read"
+                    | "structured_read"
+                    | "extracted"
+                    | "created"
+                    | "written"
+                    | "overwritten"
+                    | "appended"
+                    | "command_changed"
+            )
+        },
+    )
+}
+
+pub(crate) fn reannounced_compacted_results(
+    references: &[CompactedResultReference],
+    limit: usize,
+) -> Vec<CompactedResultReference> {
+    let mut selected = references
+        .iter()
+        .rev()
+        .filter(|reference| reference.locator.is_some() || reference.persisted_path.is_some())
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.reverse();
+    selected
+}
+
 fn working_source_rank(source: &WorkingSource) -> u8 {
     let role_rank = match source.role.as_str() {
         "authoritative" => 4,
@@ -578,6 +1020,101 @@ fn working_source_rank(source: &WorkingSource) -> u8 {
     role_rank * 10 + status_rank
 }
 
+fn select_reannounced_items<T: Clone, F, P>(
+    prioritized: &[T],
+    preserved_locators: &[String],
+    transcript_locators: &[String],
+    limit: usize,
+    locator: F,
+    preferred: P,
+) -> Vec<T>
+where
+    F: Fn(&T) -> String,
+    P: Fn(&T) -> bool,
+{
+    let mut selected = Vec::new();
+
+    for preserved in preserved_locators {
+        if let Some(item) = prioritized.iter().find(|item| locator(item) == *preserved) {
+            if !selected
+                .iter()
+                .any(|existing| locator(existing) == *preserved)
+            {
+                selected.push(item.clone());
+            }
+        }
+        if selected.len() >= limit {
+            return selected;
+        }
+    }
+
+    for transcript_locator in transcript_locators {
+        if let Some(item) = prioritized
+            .iter()
+            .find(|item| locator(item) == *transcript_locator)
+        {
+            if !selected
+                .iter()
+                .any(|existing| locator(existing) == *transcript_locator)
+            {
+                selected.push(item.clone());
+            }
+        }
+        if selected.len() >= limit {
+            return selected;
+        }
+    }
+
+    for item in prioritized.iter().filter(|item| preferred(item)) {
+        if selected.len() >= limit {
+            break;
+        }
+        let item_locator = locator(item);
+        if selected
+            .iter()
+            .any(|existing| locator(existing) == item_locator)
+        {
+            continue;
+        }
+        selected.push(item.clone());
+    }
+
+    for item in prioritized {
+        if selected.len() >= limit {
+            break;
+        }
+        let item_locator = locator(item);
+        if selected
+            .iter()
+            .any(|existing| locator(existing) == item_locator)
+        {
+            continue;
+        }
+        selected.push(item.clone());
+    }
+
+    selected
+}
+
+pub(crate) fn transcript_referenced_locators(transcript: &TranscriptLedger) -> Vec<String> {
+    let mut locators = Vec::new();
+
+    for item in transcript.entries() {
+        if let Some(locator) = &item.primary_locator {
+            if !locators.contains(locator) {
+                locators.push(locator.clone());
+            }
+        }
+        for evidence_ref in &item.evidence_refs {
+            if !locators.contains(evidence_ref) {
+                locators.push(evidence_ref.clone());
+            }
+        }
+    }
+
+    locators
+}
+
 fn artifact_reference_rank(reference: &ArtifactReference) -> u8 {
     match reference.status.as_str() {
         "read" | "structured_read" | "extracted" => 5,
@@ -589,6 +1126,7 @@ fn artifact_reference_rank(reference: &ArtifactReference) -> u8 {
     }
 }
 
+#[cfg(test)]
 fn push_unique(items: &mut Vec<String>, value: String) {
     if !items.contains(&value) {
         items.push(value);
@@ -679,15 +1217,30 @@ pub(crate) fn artifact_references_for_result(result: &ActionResult) -> Vec<Artif
             locator: format!("{}/{}", result.server, result.uri),
             status: "read".to_string(),
         }],
-        ActionResult::McpToolCall(result) => vec![ArtifactReference {
-            kind: "mcp_tool".to_string(),
-            locator: format!("{}/{}", result.server, result.tool),
-            status: if result.is_error {
-                "failed".to_string()
-            } else {
-                "executed".to_string()
-            },
-        }],
+        ActionResult::McpToolCall(result) => {
+            let primary_locator = result
+                .primary_locator
+                .clone()
+                .unwrap_or_else(|| format!("mcp-tool://{}/{}", result.server, result.tool));
+            let tool_locator = format!("mcp-tool://{}/{}", result.server, result.tool);
+            let mut refs = vec![ArtifactReference {
+                kind: "mcp_tool".to_string(),
+                locator: primary_locator.clone(),
+                status: if result.is_error {
+                    "failed".to_string()
+                } else {
+                    "executed".to_string()
+                },
+            }];
+            if primary_locator != tool_locator {
+                refs.push(ArtifactReference {
+                    kind: "mcp_tool".to_string(),
+                    locator: tool_locator,
+                    status: "tool_identity".to_string(),
+                });
+            }
+            refs
+        }
         ActionResult::FileWrite {
             path,
             created,
@@ -750,20 +1303,52 @@ pub(crate) fn working_sources_for_result(
                 preview_excerpt: None,
             })
             .collect(),
-        ActionResult::DirectoryListing { root, .. } => vec![WorkingSource {
+        ActionResult::DirectoryListing {
+            root,
+            entries,
+            summary,
+        } => vec![WorkingSource {
             kind: "directory".to_string(),
             locator: root.display().to_string(),
             role: "supporting".to_string(),
             status: "listed".to_string(),
             why_it_matters: "directory explored for task-relevant candidates".to_string(),
             last_used_step: step_index,
-            evidence_refs: vec![root.display().to_string()],
+            evidence_refs: std::iter::once(root.display().to_string())
+                .chain(
+                    entries
+                        .iter()
+                        .filter(|entry| !entry.is_dir)
+                        .take(12)
+                        .map(|entry| entry.path.display().to_string()),
+                )
+                .collect(),
             page_reference: None,
             extraction_method: None,
             structured_summary: None,
-            preview_excerpt: None,
+            preview_excerpt: Some(format!(
+                "{} entries (files={}, dirs={}); sample: {}",
+                summary.total_entries,
+                summary.file_count,
+                summary.dir_count,
+                if summary.sample_names.is_empty() {
+                    "none".to_string()
+                } else {
+                    summary
+                        .sample_names
+                        .iter()
+                        .take(4)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            )),
         }],
-        ActionResult::FileMatches { matches, .. } => matches
+        ActionResult::FileMatches {
+            root,
+            pattern,
+            matches,
+        } => matches
             .iter()
             .take(6)
             .map(|path| WorkingSource {
@@ -771,13 +1356,17 @@ pub(crate) fn working_sources_for_result(
                 locator: path.display().to_string(),
                 role: "candidate".to_string(),
                 status: "matched".to_string(),
-                why_it_matters: "candidate source discovered for the task".to_string(),
+                why_it_matters: format!(
+                    "candidate source discovered for the task from pattern {} under {}",
+                    pattern,
+                    root.display()
+                ),
                 last_used_step: step_index,
                 evidence_refs: vec![path.display().to_string()],
                 page_reference: None,
                 extraction_method: None,
                 structured_summary: None,
-                preview_excerpt: None,
+                preview_excerpt: Some(format!("{} total match(es) for {}", matches.len(), pattern)),
             })
             .collect(),
         ActionResult::FileRead { path, content, .. } => vec![WorkingSource {
@@ -888,8 +1477,15 @@ pub(crate) fn working_sources_for_result(
                 .map(|text| preview_text(&text, 100)),
         }],
         ActionResult::McpToolCall(result) => vec![WorkingSource {
-            kind: "mcp_tool".to_string(),
-            locator: format!("mcp-tool://{}/{}", result.server, result.tool),
+            kind: if result.tool.contains("search") {
+                "web_result".to_string()
+            } else {
+                "mcp_tool".to_string()
+            },
+            locator: result
+                .primary_locator
+                .clone()
+                .unwrap_or_else(|| format!("mcp-tool://{}/{}", result.server, result.tool)),
             role: if result.is_error {
                 "supporting".to_string()
             } else {
@@ -902,11 +1498,16 @@ pub(crate) fn working_sources_for_result(
             },
             why_it_matters: "MCP tool output contributed external task evidence".to_string(),
             last_used_step: step_index,
-            evidence_refs: vec![format!("mcp-tool://{}/{}", result.server, result.tool)],
+            evidence_refs: std::iter::once(format!("mcp-tool://{}/{}", result.server, result.tool))
+                .chain(result.evidence_identities.iter().take(4).cloned())
+                .collect(),
             page_reference: None,
-            extraction_method: Some("mcp_call".to_string()),
+            extraction_method: Some("mcp_tool".to_string()),
             structured_summary: None,
-            preview_excerpt: Some(mcp_tool_preview_excerpt(result)),
+            preview_excerpt: result
+                .evidence_summary
+                .clone()
+                .or_else(|| Some(mcp_tool_preview_excerpt(result))),
         }],
         ActionResult::FileWrite {
             path,
@@ -1194,6 +1795,25 @@ fn mcp_tool_preview_excerpt(result: &McpToolCallResult) -> String {
 }
 
 fn mcp_result_highlights(result: &McpToolCallResult) -> Vec<String> {
+    if !result.search_hits.is_empty() {
+        return result
+            .search_hits
+            .iter()
+            .take(3)
+            .map(|hit| {
+                let mut line = hit
+                    .title
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| hit.url.clone());
+                if let Some(snippet) = &hit.snippet {
+                    line.push_str(": ");
+                    line.push_str(&preview_text(snippet, 80));
+                }
+                line
+            })
+            .collect();
+    }
     let Some(structured) = &result.structured_content else {
         return Vec::new();
     };

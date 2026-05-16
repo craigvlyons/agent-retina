@@ -1,4 +1,7 @@
-use crate::result_helpers::summarize_verified_facts;
+use crate::result_helpers::{
+    reannounced_artifact_references, reannounced_compacted_results, reannounced_working_sources,
+    transcript_referenced_locators,
+};
 use crate::support::{
     ActionExecution, ContextAssemblyInput, EventSpec, StepDecision, StepSelectionContext,
     action_failure_reason, action_requires_approval, action_utility, approval_reason,
@@ -41,11 +44,13 @@ impl Kernel {
         let context = self.assemble_context(ContextAssemblyInput {
             task,
             state,
-            last_result: state.last_result_json.clone(),
             operator_guidance: control.and_then(ExecutionControlHandle::take_guidance),
             current_step,
             max_steps,
         })?;
+        if let Some(guidance) = context.operator_guidance.as_deref() {
+            state.record_operator_guidance(current_step, guidance);
+        }
         let response = self.reasoner.reason(&ReasonRequest {
             tools: context.tools.clone(),
             context,
@@ -55,7 +60,7 @@ impl Kernel {
                 .iter()
                 .map(|constraint| format!("{constraint:?}"))
                 .collect(),
-            max_tokens: Some(1536),
+            max_tokens: Some(reasoner_max_tokens(task)),
         })?;
         self.emit_event(EventSpec::new(
             task,
@@ -70,6 +75,12 @@ impl Kernel {
                 "task_complete": response.task_complete
             }),
         ))?;
+        state.record_model_decision(
+            current_step,
+            &response.action,
+            response.reasoning.as_deref(),
+            response.task_complete,
+        );
         Ok(StepDecision {
             action: response.action,
             task_complete: response.task_complete,
@@ -164,7 +175,6 @@ impl Kernel {
         }
 
         if let Some(reason) = self.invalid_mcp_fileish_reference_reason(&action)? {
-            self.circuit_breaker.record_failure(intent);
             return Ok(ActionExecution::Outcome(Outcome::Failure(reason)));
         }
 
@@ -225,7 +235,6 @@ impl Kernel {
             _ => match self.shell.execute_controlled(&action, control) {
                 Ok(result) => result,
                 Err(error) => {
-                    self.circuit_breaker.record_failure(intent);
                     return Ok(ActionExecution::Outcome(Outcome::Failure(
                         error.to_string(),
                     )));
@@ -326,12 +335,7 @@ impl Kernel {
                 "compacted_events": consolidation.compacted_events
             }),
         ))?;
-        if consolidation.promoted_rules > 0 {
-            self.reflex_engine.sync(self.memory.active_rules()?);
-        }
-
         if let Some(reason) = action_failure_reason(&result, &delta, &action) {
-            self.circuit_breaker.record_failure(intent);
             return Ok(ActionExecution::Outcome(Outcome::Failure(reason)));
         }
         Ok(ActionExecution::Outcome(Outcome::Success(result)))
@@ -374,17 +378,10 @@ impl Kernel {
         let ContextAssemblyInput {
             task,
             state,
-            last_result,
             operator_guidance,
             current_step,
             max_steps,
         } = input;
-        let shell_constraints = self
-            .shell
-            .constraints()
-            .iter()
-            .map(|constraint| format!("{constraint:?}"))
-            .collect::<Vec<_>>();
         let tool_policy = self.tool_policy.clone().with_task_metadata(&task.metadata);
         let mut registry = ToolRegistry::for_shell_capabilities(
             self.shell.capabilities(),
@@ -422,66 +419,97 @@ impl Kernel {
         Ok(AssembledContext {
             identity,
             task: task_text,
-            task_state: self
-                .build_task_state(task, state, current_step, max_steps)
-                .with_constraints(shell_constraints),
+            continuation_window: self.build_active_continuation_window(
+                task,
+                state,
+                current_step,
+                max_steps,
+            ),
             recent_context: task.recent_context.clone(),
             tools,
             memory_slice: Vec::new(),
-            last_result,
             operator_guidance,
             current_step,
             max_steps,
         })
     }
 
-    pub(crate) fn build_task_state(
+    pub(crate) fn build_active_continuation_window(
         &self,
         task: &Task,
         state: &TaskLoopState,
         current_step: usize,
         max_steps: usize,
-    ) -> TaskState {
-        let output_written = state.artifact_references.iter().any(|artifact| {
-            matches!(
-                artifact.status.as_str(),
-                "created" | "written" | "overwritten" | "appended" | "command_changed"
-            )
-        });
-        let output_verified = state.working_sources.iter().any(|source| {
-            source.role == "generated"
-                && matches!(
-                    source.status.as_str(),
-                    "created" | "written" | "overwritten" | "appended" | "command_changed"
-                )
-                && source.preview_excerpt.is_some()
-        }) || state.artifact_references.iter().any(|artifact| {
-            matches!(
-                artifact.status.as_str(),
-                "read" | "structured_read" | "extracted"
-            )
-        });
-        TaskState {
-            goal: TaskGoal {
-                objective: task.description.clone(),
-                constraints: Vec::new(),
-            },
-            progress: TaskProgress {
-                current_phase: describe_task_phase(state, current_step, max_steps),
-                current_step,
-                max_steps,
-                completed_checkpoints: state.recent_steps.clone(),
-                verified_facts: summarize_verified_facts(
-                    &state.working_sources,
-                    &state.artifact_references,
-                ),
-                output_written,
-                output_verified,
-            },
-            recent_actions: state.recent_action_summaries.clone(),
-            working_sources: state.working_sources.clone(),
-            artifact_references: state.artifact_references.clone(),
-            compaction: state.last_compaction_snapshot.clone(),
+    ) -> ActiveContinuationWindow {
+        const TRANSCRIPT_LIMIT: usize = 12;
+        const RESULT_REF_LIMIT: usize = 6;
+        const SOURCE_LIMIT: usize = 6;
+        const ARTIFACT_LIMIT: usize = 6;
+        const BOUNDARY_LIMIT: usize = 3;
+        const COMPACTED_RESULT_LIMIT: usize = 4;
+
+        let transcript_start = state
+            .transcript
+            .latest_boundary_start()
+            .unwrap_or_else(|| state.transcript.len().saturating_sub(TRANSCRIPT_LIMIT));
+        let window_transcript = state.transcript.tail_from(transcript_start);
+        let referenced_result_ids = window_transcript
+            .iter()
+            .filter_map(|item| item.result_ref_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut stored_result_refs = state
+            .stored_results
+            .filter_by_result_ids(&referenced_result_ids);
+        if stored_result_refs.len() < RESULT_REF_LIMIT {
+            let supplemental = state.stored_results.supplemental_recent(
+                &referenced_result_ids,
+                RESULT_REF_LIMIT - stored_result_refs.len(),
+            );
+            stored_result_refs.extend(supplemental);
+        }
+        let compaction_history = state.compaction_history();
+        let boundary_start = compaction_history.len().saturating_sub(BOUNDARY_LIMIT);
+        let compacted_result_refs = compaction_history
+            .iter()
+            .flat_map(|snapshot| snapshot.compacted_results.iter().cloned())
+            .collect::<Vec<_>>();
+        let compacted_result_start = compacted_result_refs
+            .len()
+            .saturating_sub(COMPACTED_RESULT_LIMIT);
+        let preserved_locators = state
+            .latest_compaction_snapshot()
+            .map(|snapshot| snapshot.preserved_locators.clone())
+            .unwrap_or_default();
+        let transcript_locators = transcript_referenced_locators(&TranscriptLedger::from_entries(
+            window_transcript.clone(),
+        ));
+        let working_sources = state.working_sources();
+        let artifact_references = state.artifact_references();
+
+        ActiveContinuationWindow {
+            objective: task.description.clone(),
+            current_step,
+            max_steps,
+            transcript: TranscriptLedger::from_entries(window_transcript),
+            stored_results: StoredResultLedger::from_entries(stored_result_refs),
+            reannounced_sources: reannounced_working_sources(
+                &working_sources,
+                &preserved_locators,
+                &transcript_locators,
+                SOURCE_LIMIT,
+            ),
+            reannounced_artifacts: reannounced_artifact_references(
+                &artifact_references,
+                &preserved_locators,
+                &transcript_locators,
+                ARTIFACT_LIMIT,
+            ),
+            next_step_guidance: state.next_step_guidance(),
+            compaction_boundaries: compaction_history[boundary_start..].to_vec(),
+            reannounced_compacted_results: reannounced_compacted_results(
+                &compacted_result_refs[compacted_result_start..],
+                COMPACTED_RESULT_LIMIT,
+            ),
         }
     }
 
@@ -575,13 +603,17 @@ impl Kernel {
     }
 }
 
-fn describe_task_phase(state: &TaskLoopState, current_step: usize, max_steps: usize) -> String {
-    if state.step_index == 0 {
-        "starting".to_string()
-    } else if current_step >= max_steps {
-        "final step".to_string()
+fn reasoner_max_tokens(task: &Task) -> u32 {
+    let description = task.description.to_ascii_lowercase();
+    if description.contains("save")
+        || description.contains("write")
+        || description.contains("report")
+        || description.contains("summary")
+        || description.contains("combined")
+    {
+        4096
     } else {
-        format!("working through step {} of {}", current_step, max_steps)
+        1536
     }
 }
 
@@ -591,11 +623,13 @@ fn synthesize_approval_denied_blocker(
     action: &Action,
 ) -> String {
     let attempted = state
-        .recent_action_summaries
+        .transcript
+        .entries()
         .iter()
         .rev()
+        .filter(|item| matches!(item.kind, TranscriptUnitKind::ToolInvocation))
         .take(3)
-        .map(|summary| summary.action.clone())
+        .map(|item| item.summary.clone())
         .collect::<Vec<_>>();
     let recent_attempts = if attempted.is_empty() {
         "no prior control steps were recorded".to_string()
@@ -603,7 +637,7 @@ fn synthesize_approval_denied_blocker(
         attempted.join(", ")
     };
     let latest_status = state
-        .working_sources
+        .working_sources()
         .iter()
         .rev()
         .find(|source| source.kind == "command")

@@ -157,6 +157,34 @@ impl AgentController {
                 outcome
             })
     }
+
+    pub fn spawn_resumed_task(
+        &self,
+        snapshot: TaskRecoverySnapshot,
+        mut config: ExecutionConfig,
+    ) -> retina_runtime::RuntimeTaskHandle {
+        let task = Task::resume_from_snapshot(root_agent_id(), snapshot, None);
+        let control = ExecutionControl::new();
+        let control_handle = control.handle();
+        config.control = Some(control_handle.clone());
+        let kernel = Arc::clone(&self.kernel);
+        let task_for_thread = task.clone();
+        self.supervisor
+            .spawn(task, RuntimeTaskKind::Session, control_handle, move || {
+                let _ = update_root_manifest_state(
+                    AgentStatus::Running,
+                    AgentLifecyclePhase::Busy,
+                    Some("resuming task"),
+                );
+                let outcome = run_task_catching_panics(&kernel, task_for_thread, config);
+                let _ = update_root_manifest_state(
+                    AgentStatus::Idle,
+                    AgentLifecyclePhase::CoolingDown,
+                    Some("waiting for next task"),
+                );
+                outcome
+            })
+    }
 }
 
 fn build_task_for_description(task_description: String) -> Result<Task> {
@@ -212,16 +240,41 @@ impl InspectController {
         self.memory.recent_states(limit)
     }
 
-    pub fn latest_task_state(&self) -> Result<Option<TaskState>> {
+    pub fn latest_task_projection(&self) -> Result<Option<TaskState>> {
         let events = self.memory.recent_states(200)?;
         for event in events {
-            if let Some(value) = event.payload_json.get("task_state") {
-                let task_state = serde_json::from_value::<TaskState>(value.clone())
-                    .map_err(|error| KernelError::Storage(error.to_string()))?;
-                return Ok(Some(task_state));
+            if let Some(value) = event.payload_json.get("continuation_window") {
+                let continuation_window =
+                    serde_json::from_value::<ActiveContinuationWindow>(value.clone())
+                        .map_err(|error| KernelError::Storage(error.to_string()))?;
+                return Ok(Some(continuation_window.project_task_state()));
             }
         }
         Ok(None)
+    }
+
+    pub fn latest_continuation_window(&self) -> Result<Option<ActiveContinuationWindow>> {
+        let events = self.memory.recent_states(200)?;
+        for event in events {
+            if let Some(value) = event.payload_json.get("continuation_window") {
+                let continuation_window =
+                    serde_json::from_value::<ActiveContinuationWindow>(value.clone())
+                        .map_err(|error| KernelError::Storage(error.to_string()))?;
+                return Ok(Some(continuation_window));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn latest_recoverable_task_snapshot(&self) -> Result<Option<TaskRecoverySnapshot>> {
+        self.recoverable_task_snapshot_for(None)
+    }
+
+    pub fn recoverable_task_snapshot_by_id(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskRecoverySnapshot>> {
+        self.recoverable_task_snapshot_for(Some(task_id))
     }
 
     pub fn memory_lookup(
@@ -303,6 +356,31 @@ impl InspectController {
     pub fn append_timeline_event(&self, event: &TimelineEvent) -> Result<()> {
         self.memory.append_timeline_event(event)
     }
+
+    fn recoverable_task_snapshot_for(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<Option<TaskRecoverySnapshot>> {
+        let events = self.memory.recent_states(2_000)?;
+        for event in events {
+            if !matches!(
+                event.event_type,
+                TimelineEventType::TaskBlocked | TimelineEventType::TaskFailed
+            ) {
+                continue;
+            }
+            if task_id.is_some_and(|expected| event.task_id.0 != expected) {
+                continue;
+            }
+            let Some(value) = event.payload_json.get("recovery_snapshot") else {
+                continue;
+            };
+            let snapshot = serde_json::from_value::<TaskRecoverySnapshot>(value.clone())
+                .map_err(|error| KernelError::Storage(error.to_string()))?;
+            return Ok(Some(snapshot));
+        }
+        Ok(None)
+    }
 }
 
 fn run_task_catching_panics(
@@ -359,6 +437,7 @@ fn summarize_terminal_tasks(events: &[TimelineEvent]) -> TerminalTaskStats {
             TimelineEventType::TaskCompleted => stats.completed += 1,
             TimelineEventType::TaskFailed => stats.failed += 1,
             TimelineEventType::TaskCancelled => stats.cancelled += 1,
+            TimelineEventType::TaskBlocked => stats.blocked += 1,
             _ => {
                 if event
                     .payload_json

@@ -108,6 +108,7 @@ pub enum TimelineEventType {
     ReflectionRequested,
     ReflectionCompleted,
     TaskStepCompleted,
+    TaskBlocked,
     TaskCancelled,
     TaskCompleted,
     TaskFailed,

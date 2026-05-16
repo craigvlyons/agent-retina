@@ -33,7 +33,8 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum InspectCommands {
     Timeline,
-    TaskState,
+    Projection,
+    Continuation,
     Tasks,
     Overview,
     Mcp,

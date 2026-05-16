@@ -563,6 +563,11 @@ impl Shell for MockShell {
                     content_preview: "mock MCP tool output".to_string(),
                     structured_content: None,
                     is_error: false,
+                    search_outcome_kind: None,
+                    evidence_identities: Vec::new(),
+                    search_hits: Vec::new(),
+                    primary_locator: None,
+                    evidence_summary: None,
                 }))
             }
             Action::WriteFile { path, content, .. } => {

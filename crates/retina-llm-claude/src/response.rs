@@ -22,6 +22,10 @@ pub(crate) fn map_claude_error(status: u16, body: &str, model_id: &str) -> Kerne
     ))
 }
 
+pub(crate) fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 409 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
 pub(crate) fn extract_json_blob(text: &str) -> Result<String> {
     let trimmed = text.trim();
     if trimmed.starts_with("```") {
@@ -243,13 +247,6 @@ impl ClaudeAction {
                 server: self.required_string("server")?,
                 uri: self.required_string("uri")?,
             },
-            "mcp_call" => Action::CallMcpTool {
-                id: ActionId::new(),
-                server: self.required_string("server")?,
-                tool: self.required_string("tool")?,
-                input_json: self.required_value("input_json")?,
-                resolved_tool_name: None,
-            },
             "write_file" => Action::WriteFile {
                 id: ActionId::new(),
                 path: self.required_string("path")?.into(),
@@ -409,16 +406,6 @@ impl ClaudeAction {
             Some(_) => Err(self.invalid_input_field(field, "string array")),
             None => Ok(None),
         }
-    }
-
-    fn required_value(&self, field: &str) -> Result<serde_json::Value> {
-        let input = self.input_object()?;
-        input.get(field).cloned().ok_or_else(|| {
-            KernelError::Reasoning(format!(
-                "invalid Claude action '{}': missing required input field '{}'",
-                self.action_type, field
-            ))
-        })
     }
 
     fn invalid_input_field(&self, field: &str, expected: &str) -> KernelError {

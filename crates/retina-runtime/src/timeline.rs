@@ -59,6 +59,14 @@ impl RuntimeTaskRegistry {
                     event.timestamp,
                 );
             }
+            TimelineEventType::TaskBlocked => {
+                self.mark_terminal_at(
+                    &event.task_id,
+                    RuntimeTaskStatus::Blocked,
+                    event_summary(event).unwrap_or_else(|| "blocked".to_string()),
+                    event.timestamp,
+                );
+            }
             TimelineEventType::TaskCancelled => {
                 self.mark_terminal_at(
                     &event.task_id,
@@ -119,7 +127,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn registry_rebuilds_recent_task_state_from_timeline() {
+    fn registry_rebuilds_recent_task_projection_from_timeline() {
         let task_id = TaskId::new();
         let agent_id = AgentId::new();
         let session_id = SessionId::new();
@@ -150,5 +158,41 @@ mod tests {
         assert_eq!(task.status, RuntimeTaskStatus::Completed);
         assert_eq!(task.description, "summarize file");
         assert_eq!(task.progress_summary.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn registry_marks_blocked_task_from_timeline() {
+        let task_id = TaskId::new();
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let received = TimelineEvent {
+            event_id: EventId::new(),
+            session_id,
+            task_id: task_id.clone(),
+            agent_id,
+            timestamp: Utc::now(),
+            event_type: TimelineEventType::TaskReceived,
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            delta_summary: None,
+            duration_ms: None,
+            payload_json: json!({ "task": "search current events" }),
+        };
+        let blocked = TimelineEvent {
+            timestamp: received.timestamp + chrono::Duration::seconds(1),
+            event_type: TimelineEventType::TaskBlocked,
+            payload_json: json!({ "reason": "repeated the same step without new evidence" }),
+            ..received.clone()
+        };
+
+        let registry = RuntimeTaskRegistry::from_timeline(&[blocked, received]);
+        let task = registry.snapshot(&task_id).unwrap();
+        assert_eq!(task.status, RuntimeTaskStatus::Blocked);
+        assert_eq!(
+            task.progress_summary.as_deref(),
+            Some("repeated the same step without new evidence")
+        );
     }
 }

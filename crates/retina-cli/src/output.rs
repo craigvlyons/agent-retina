@@ -21,7 +21,17 @@ pub fn render_action_result(result: &ActionResult) -> String {
             )
         }
         ActionResult::Inspection(state) => {
-            format!("Inspection complete for cwd {}", state.cwd.display())
+            let inspected = state
+                .files
+                .iter()
+                .take(3)
+                .map(|item| item.path.display().to_string())
+                .collect::<Vec<_>>();
+            if inspected.is_empty() {
+                format!("Inspection complete for cwd {}", state.cwd.display())
+            } else {
+                format!("Inspection complete for {}", inspected.join(", "))
+            }
         }
         ActionResult::DirectoryListing {
             root,
@@ -290,10 +300,12 @@ pub fn render_action_result(result: &ActionResult) -> String {
         }
         ActionResult::McpToolCall(result) => {
             let content = result
-                .structured_content
-                .as_ref()
-                .map(|value| {
-                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                .evidence_summary
+                .clone()
+                .or_else(|| {
+                    result.structured_content.as_ref().map(|value| {
+                        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                    })
                 })
                 .unwrap_or_else(|| result.content_preview.clone());
             format!(
@@ -318,8 +330,23 @@ pub fn render_timeline(events: &[TimelineEvent]) -> String {
 }
 
 pub fn render_timeline_event(event: &TimelineEvent) -> String {
+    let continuation = event
+        .payload_json
+        .get("continuation_window")
+        .and_then(|value| serde_json::from_value::<ActiveContinuationWindow>(value.clone()).ok())
+        .map(|window| {
+            format!(
+                " continuation=transcript:{} refs:{} reannounce:{}/{}/{}",
+                window.transcript.len(),
+                window.stored_results.len(),
+                window.reannounced_sources.len(),
+                window.reannounced_artifacts.len(),
+                window.reannounced_compacted_results.len()
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "[{}] {:?} task={}{}\n",
+        "[{}] {:?} task={}{}{}\n",
         event.timestamp.to_rfc3339(),
         event.event_type,
         event.task_id,
@@ -327,11 +354,12 @@ pub fn render_timeline_event(event: &TimelineEvent) -> String {
             .delta_summary
             .as_ref()
             .map(|summary| format!(" delta={summary}"))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        continuation
     )
 }
 
-pub fn render_task_state(task_state: &TaskState) -> String {
+pub fn render_task_projection(task_state: &TaskState) -> String {
     let sources = if task_state.working_sources.is_empty() {
         "(none)".to_string()
     } else {
@@ -422,6 +450,90 @@ pub fn render_task_state(task_state: &TaskState) -> String {
     )
 }
 
+pub fn render_continuation_window(window: &ActiveContinuationWindow) -> String {
+    let transcript_units = if window.transcript.is_empty() {
+        "(none)".to_string()
+    } else {
+        window
+            .transcript
+            .entries()
+            .iter()
+            .map(|item| item.render())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let stored_result_refs = if window.stored_results.is_empty() {
+        "(none)".to_string()
+    } else {
+        window
+            .stored_results
+            .entries()
+            .iter()
+            .map(|item| item.render())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let reannounced_sources = if window.reannounced_sources.is_empty() {
+        "(none)".to_string()
+    } else {
+        window
+            .reannounced_sources
+            .iter()
+            .map(WorkingSource::render)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let reannounced_artifacts = if window.reannounced_artifacts.is_empty() {
+        "(none)".to_string()
+    } else {
+        window
+            .reannounced_artifacts
+            .iter()
+            .map(ArtifactReference::render)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let reannounced_compacted_results = if window.reannounced_compacted_results.is_empty() {
+        "(none)".to_string()
+    } else {
+        window
+            .reannounced_compacted_results
+            .iter()
+            .map(CompactedResultReference::render)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let boundaries = if window.compaction_boundaries.is_empty() {
+        "(none)".to_string()
+    } else {
+        window
+            .compaction_boundaries
+            .iter()
+            .map(CompactionSnapshot::render)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let guidance = window
+        .next_step_guidance
+        .as_ref()
+        .map(NextStepGuidance::render)
+        .unwrap_or_else(|| "none".to_string());
+
+    format!(
+        "objective: {}\nstep: {} / {}\n\ntranscript_units:\n{}\n\nstored_result_refs:\n{}\n\nreannounced_sources:\n{}\n\nreannounced_artifacts:\n{}\n\nreannounced_compacted_results:\n{}\n\nnext_step_guidance:\n{}\n\ncompaction_boundaries:\n{}\n",
+        window.objective,
+        window.current_step,
+        window.max_steps,
+        transcript_units,
+        stored_result_refs,
+        reannounced_sources,
+        reannounced_artifacts,
+        reannounced_compacted_results,
+        guidance,
+        boundaries
+    )
+}
+
 pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
     if debug {
         return render_timeline_event(event);
@@ -486,18 +598,11 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             }),
         TimelineEventType::TaskCompacted => event
             .payload_json
-            .get("task_state")
-            .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
-            .and_then(|task_state| {
-                task_state.compaction.as_ref().map(|snapshot| {
-                    let kept = snapshot
-                        .score_explanations
-                        .iter()
-                        .filter(|item| item.decision == "keep" || item.decision == "keep_ref")
-                        .count();
-                    format!("compact: {} (kept {} ranked items)", snapshot.reason, kept)
-                })
+            .get("continuation_window")
+            .and_then(|value| {
+                serde_json::from_value::<ActiveContinuationWindow>(value.clone()).ok()
             })
+            .and_then(|window| render_compaction_line_from_window(&window))
             .or_else(|| {
                 event
                     .payload_json
@@ -507,9 +612,20 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             }),
         TimelineEventType::TaskContextAssembled => event
             .payload_json
-            .get("task_state")
-            .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
-            .map(|_| "context ready".to_string()),
+            .get("continuation_window")
+            .and_then(|value| {
+                serde_json::from_value::<ActiveContinuationWindow>(value.clone()).ok()
+            })
+            .map(|window| {
+                format!(
+                    "context ready (transcript {}, refs {}, reannounce {}/{}/{})",
+                    window.transcript.len(),
+                    window.stored_results.len(),
+                    window.reannounced_sources.len(),
+                    window.reannounced_artifacts.len(),
+                    window.reannounced_compacted_results.len()
+                )
+            }),
         TimelineEventType::ActionResultReceived => event
             .payload_json
             .get("result")
@@ -517,20 +633,11 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .and_then(render_observed_result),
         TimelineEventType::TaskStepCompleted => event
             .payload_json
-            .get("task_state")
-            .and_then(|value| serde_json::from_value::<TaskState>(value.clone()).ok())
-            .and_then(|task_state| {
-                task_state
-                    .recent_actions
-                    .last()
-                    .and_then(|summary| match summary.status {
-                        RecentActionStatus::Failed => Some(format!("failed: {}", summary.outcome)),
-                        RecentActionStatus::Blocked => {
-                            Some(format!("blocked: {}", summary.outcome))
-                        }
-                        RecentActionStatus::Succeeded | RecentActionStatus::Responded => None,
-                    })
-            }),
+            .get("continuation_window")
+            .and_then(|value| {
+                serde_json::from_value::<ActiveContinuationWindow>(value.clone()).ok()
+            })
+            .and_then(|window| render_step_status_from_window(&window)),
         TimelineEventType::ReflectionRequested => event
             .payload_json
             .get("reason")
@@ -547,6 +654,11 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .get("reason")
             .and_then(Value::as_str)
             .map(|reason| format!("failed: {reason}")),
+        TimelineEventType::TaskBlocked => event
+            .payload_json
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|reason| format!("blocked: {reason}")),
         TimelineEventType::TaskCancelled => event
             .payload_json
             .get("reason")
@@ -557,6 +669,36 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
     };
 
     line.map(|line| format!("{line}\n")).unwrap_or_default()
+}
+
+fn render_compaction_line_from_window(window: &ActiveContinuationWindow) -> Option<String> {
+    window.compaction_boundaries.last().map(|snapshot| {
+        let kept = snapshot
+            .score_explanations
+            .iter()
+            .filter(|item| item.decision == "keep" || item.decision == "keep_ref")
+            .count();
+        let preserved = snapshot.preserved_locators.len();
+        let compacted_refs = window.reannounced_compacted_results.len();
+        format!(
+            "compact: {} (kept {} ranked items, re-announced {} locators, {} compacted refs)",
+            snapshot.reason, kept, preserved, compacted_refs
+        )
+    })
+}
+
+fn render_step_status_from_window(window: &ActiveContinuationWindow) -> Option<String> {
+    window
+        .transcript
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry.kind {
+            TranscriptUnitKind::TerminalFailure => Some(format!("failed: {}", entry.summary)),
+            TranscriptUnitKind::TerminalBlocked => Some(format!("blocked: {}", entry.summary)),
+            TranscriptUnitKind::ToolResult | TranscriptUnitKind::FinalResponse => None,
+            _ => None,
+        })
 }
 
 fn render_observed_result(result: ActionResult) -> Option<String> {
@@ -576,7 +718,17 @@ fn render_observed_result(result: ActionResult) -> Option<String> {
             ))
         }
         ActionResult::Inspection(state) => {
-            Some(format!("observed: {} [inspected]", state.cwd.display()))
+            let inspected = state
+                .files
+                .iter()
+                .map(|item| item.path.display().to_string())
+                .collect::<Vec<_>>();
+            let target = match inspected.as_slice() {
+                [] => state.cwd.display().to_string(),
+                [single] => single.clone(),
+                many => format!("{} (+{} more)", many[0], many.len().saturating_sub(1)),
+            };
+            Some(format!("observed: {} [inspected]", target))
         }
         ActionResult::DirectoryListing { root, .. } => {
             Some(format!("observed: {} [listed]", root.display()))
@@ -689,9 +841,14 @@ fn render_observed_result(result: ActionResult) -> Option<String> {
             result.uri, result.server
         )),
         ActionResult::McpToolCall(result) => {
-            let preview = compact_preview(&result.content_preview)
-                .map(|value| format!(" | {value}"))
-                .unwrap_or_default();
+            let preview = compact_preview(
+                result
+                    .evidence_summary
+                    .as_deref()
+                    .unwrap_or(&result.content_preview),
+            )
+            .map(|value| format!(" | {value}"))
+            .unwrap_or_default();
             Some(format!(
                 "observed: MCP tool {} [{}]{}",
                 result.tool, result.server, preview
@@ -1188,6 +1345,43 @@ mod tests {
     }
 
     #[test]
+    fn action_result_received_renders_inspected_path_not_cwd() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::ActionResultReceived,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "result": ActionResult::Inspection(WorldState {
+                    cwd: "/Users/macc/projects/personal/agent-retina".into(),
+                    files: vec![PathState {
+                        path: "/Users/macc/Desktop/transcriptions".into(),
+                        exists: true,
+                        size: Some(0),
+                        modified_at: None,
+                        content_hash: None,
+                    }],
+                    last_command: None,
+                    notes: Vec::new(),
+                })
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "observed: /Users/macc/Desktop/transcriptions [inspected]\n"
+        );
+    }
+
+    #[test]
     fn action_result_received_prefers_latest_command_result_without_stale_blockers() {
         let event = TimelineEvent {
             event_id: EventId::new(),
@@ -1239,7 +1433,7 @@ mod tests {
             post_state_hash: None,
             duration_ms: None,
             payload_json: json!({
-                "task_state": TaskState::default()
+                "continuation_window": ActiveContinuationWindow::default()
             }),
             delta_summary: None,
         };
@@ -1249,15 +1443,6 @@ mod tests {
 
     #[test]
     fn task_step_completed_surfaces_failed_step_summary() {
-        let mut task_state = TaskState::default();
-        task_state.recent_actions.push(RecentActionSummary {
-            step: 2,
-            action: "read_file:mcp-tool://brave/brave_web_search".to_string(),
-            status: RecentActionStatus::Failed,
-            outcome: "mcp-tool://brave/brave_web_search is MCP output, not a filesystem path"
-                .to_string(),
-            artifact_refs: Vec::new(),
-        });
         let event = TimelineEvent {
             event_id: EventId::new(),
             session_id: SessionId::new(),
@@ -1271,7 +1456,27 @@ mod tests {
             post_state_hash: None,
             duration_ms: None,
             payload_json: json!({
-                "task_state": task_state
+                "continuation_window": ActiveContinuationWindow {
+                    objective: "search".to_string(),
+                    current_step: 2,
+                    max_steps: 4,
+                    transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                        ordinal: 2,
+                        step: 2,
+                        kind: TranscriptUnitKind::TerminalFailure,
+                        summary: "mcp-tool://brave/brave_web_search is MCP output, not a filesystem path".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    }]),
+                    ..ActiveContinuationWindow::default()
+                }
             }),
             delta_summary: None,
         };
@@ -1279,6 +1484,206 @@ mod tests {
         assert_eq!(
             render_chat_event(&event, false),
             "failed: mcp-tool://brave/brave_web_search is MCP output, not a filesystem path\n"
+        );
+    }
+
+    #[test]
+    fn task_step_completed_prefers_continuation_window_terminal_status() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskStepCompleted,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "continuation_window": ActiveContinuationWindow {
+                    objective: "search".to_string(),
+                    current_step: 2,
+                    max_steps: 4,
+                    transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                        ordinal: 2,
+                        step: 2,
+                        kind: TranscriptUnitKind::TerminalBlocked,
+                        summary: "repeated the same step without new evidence".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                    compaction_snapshot: None,
+                    }]),
+                    ..ActiveContinuationWindow::default()
+                }
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "blocked: repeated the same step without new evidence\n"
+        );
+    }
+
+    #[test]
+    fn task_blocked_renders_blocked_reason() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskBlocked,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "reason": "repeated the same step without new evidence"
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "blocked: repeated the same step without new evidence\n"
+        );
+    }
+
+    #[test]
+    fn task_context_assembled_renders_continuation_window_counts() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            timestamp: chrono::Utc::now(),
+            event_type: TimelineEventType::TaskContextAssembled,
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            delta_summary: None,
+            duration_ms: None,
+            payload_json: serde_json::json!({
+                "continuation_window": ActiveContinuationWindow {
+                    objective: "search".to_string(),
+                    current_step: 1,
+                    max_steps: 4,
+                    transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                        ordinal: 1,
+                        step: 1,
+                        kind: TranscriptUnitKind::TaskMessage,
+                        summary: "search".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                    compaction_snapshot: None,
+                    }]),
+                    stored_results: StoredResultLedger::from_entries(vec![StoredResultReference {
+                        result_id: "result-1-1".to_string(),
+                        source_transcript_ordinal: 1,
+                        step: 1,
+                        result_type: "mcp_tool_call".to_string(),
+                        primary_locator: None,
+                        preview_excerpt: "preview".to_string(),
+                        persisted_path: "/tmp/result.json".to_string(),
+                    }]),
+                    reannounced_sources: Vec::new(),
+                    reannounced_artifacts: Vec::new(),
+                    next_step_guidance: None,
+                    compaction_boundaries: Vec::new(),
+                    reannounced_compacted_results: Vec::new(),
+                }
+            }),
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "context ready (transcript 1, refs 1, reannounce 0/0/0)\n"
+        );
+    }
+
+    #[test]
+    fn task_compacted_prefers_continuation_window_summary() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            timestamp: Utc::now(),
+            event_type: TimelineEventType::TaskCompacted,
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            delta_summary: None,
+            duration_ms: None,
+            payload_json: json!({
+                "continuation_window": ActiveContinuationWindow {
+                    objective: "search".to_string(),
+                    current_step: 3,
+                    max_steps: 4,
+                    compaction_boundaries: vec![CompactionSnapshot {
+                        boundary_id: 1,
+                        compacted_at_step: 3,
+                        reason: "large tool result".to_string(),
+                        score_explanations: vec![
+                            CompactionScoreExplanation {
+                                item_kind: "source".to_string(),
+                                locator: "a.md".to_string(),
+                                decision: "keep".to_string(),
+                                rationale: "important".to_string(),
+                            },
+                            CompactionScoreExplanation {
+                                item_kind: "source".to_string(),
+                                locator: "b.md".to_string(),
+                                decision: "compact".to_string(),
+                                rationale: "less important".to_string(),
+                            },
+                        ],
+                        preserved_locators: vec!["a.md".to_string()],
+                        active_window_summary: "summary".to_string(),
+                        last_result_continuation: None,
+                        compacted_results: vec![CompactedResultReference {
+                            boundary_id: 1,
+                            result_type: "directory_listing".to_string(),
+                            locator: Some("/tmp".to_string()),
+                            preview_excerpt: "preview".to_string(),
+                            continuation: None,
+                            persisted_path: Some("/tmp/boundary-1.json".to_string()),
+                        }],
+                    }],
+                    reannounced_compacted_results: vec![CompactedResultReference {
+                        boundary_id: 1,
+                        result_type: "directory_listing".to_string(),
+                        locator: Some("/tmp".to_string()),
+                        preview_excerpt: "preview".to_string(),
+                        continuation: None,
+                        persisted_path: Some("/tmp/boundary-1.json".to_string()),
+                    }],
+                    ..ActiveContinuationWindow::default()
+                }
+            }),
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "compact: large tool result (kept 1 ranked items, re-announced 1 locators, 1 compacted refs)\n"
         );
     }
 }

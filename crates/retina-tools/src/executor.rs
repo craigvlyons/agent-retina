@@ -48,7 +48,7 @@ pub fn tool_name_for_action(action: &Action) -> String {
             resolved_tool_name, ..
         } => resolved_tool_name
             .clone()
-            .unwrap_or_else(|| "mcp_call".to_string()),
+            .unwrap_or_else(|| "mcp_tool".to_string()),
         Action::WriteFile { .. } => "write_file".to_string(),
         Action::EditFile { .. } => "edit_file".to_string(),
         Action::AppendFile { .. } => "append_file".to_string(),

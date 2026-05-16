@@ -50,7 +50,7 @@ impl ChatSession {
 
     pub fn run(&mut self) -> Result<()> {
         println!(
-            "Retina chat is live. Enter a task, or type /help, /exit, /timeline, /memory <query>, /debug. Type /s while a task is running to stop it. Use /guide <text> to steer the next step."
+            "Retina chat is live. Enter a task, or type /help, /exit, /timeline, /memory <query>, /debug, /resume-last, or /resume <task_id>. Type /s while a task is running to stop it. Use /guide <text> to steer the next step."
         );
 
         let mut active_task: Option<RuntimeTaskHandle> = None;
@@ -149,6 +149,14 @@ impl ChatSession {
                 let (knowledge, experiences) = self.inspector.memory_lookup(query, 5)?;
                 print!("{}", render_memory_inspection(&knowledge, &experiences));
                 io::stdout().flush()?;
+                return Ok(false);
+            }
+            _ if line == "/resume-last" => {
+                self.handle_resume_last(active_task)?;
+                return Ok(false);
+            }
+            _ if line.starts_with("/resume ") => {
+                self.handle_resume_by_id(line, active_task)?;
                 return Ok(false);
             }
             _ => {}
@@ -337,9 +345,62 @@ impl ChatSession {
         println!("  /timeline            Show recent timeline events");
         println!("  /memory <query>      Show recalled memory");
         println!("  /debug               Toggle verbose internal event output");
+        println!("  /resume-last         Resume the most recent blocked/failed task");
+        println!("  /resume <task_id>    Resume a specific blocked/failed task");
         println!("  /s                   Stop the current task");
         println!("  /guide <text>        Add one hint for the next planning step");
         println!("  any other text       Execute as a task");
+    }
+
+    fn handle_resume_last(&mut self, active_task: &mut Option<RuntimeTaskHandle>) -> Result<()> {
+        if active_task.is_some() {
+            println!("A task is already running. Stop it before resuming another task.");
+            return Ok(());
+        }
+        let Some(snapshot) = self.inspector.latest_recoverable_task_snapshot()? else {
+            println!("No recoverable blocked or failed task was found in recent history.");
+            return Ok(());
+        };
+        let task = self.agent.spawn_resumed_task(
+            snapshot,
+            ExecutionConfig {
+                max_steps: 50,
+                control: None,
+            },
+        );
+        println!("Resuming the most recent recoverable task.");
+        *active_task = Some(task);
+        Ok(())
+    }
+
+    fn handle_resume_by_id(
+        &mut self,
+        line: &str,
+        active_task: &mut Option<RuntimeTaskHandle>,
+    ) -> Result<()> {
+        if active_task.is_some() {
+            println!("A task is already running. Stop it before resuming another task.");
+            return Ok(());
+        }
+        let task_id = line.trim_start_matches("/resume").trim();
+        if task_id.is_empty() {
+            println!("Usage: /resume <task_id>");
+            return Ok(());
+        }
+        let Some(snapshot) = self.inspector.recoverable_task_snapshot_by_id(task_id)? else {
+            println!("No recoverable blocked or failed task was found for task id {task_id}.");
+            return Ok(());
+        };
+        let task = self.agent.spawn_resumed_task(
+            snapshot,
+            ExecutionConfig {
+                max_steps: 50,
+                control: None,
+            },
+        );
+        println!("Resuming task {task_id}.");
+        *active_task = Some(task);
+        Ok(())
     }
 
     fn log_control_event(

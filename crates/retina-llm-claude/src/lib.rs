@@ -8,11 +8,16 @@ mod response;
 use config::{ClaudeContextManagement, ClaudePromptCaching, anthropic_beta_header_value};
 use payload::build_payload;
 use planner::plan_task;
-use reqwest::blocking::Client;
-use response::{ClaudeAction, ClaudeResponse, extract_json_blob, map_claude_error};
+use reqwest::blocking::{Client, ClientBuilder, RequestBuilder};
+use response::{
+    ClaudeAction, ClaudeResponse, extract_json_blob, is_retryable_status, map_claude_error,
+};
 use retina_traits::Reasoner;
 use retina_types::*;
 use std::env;
+use std::error::Error as _;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeRuntimeConfigSnapshot {
@@ -28,6 +33,7 @@ pub struct ClaudeRuntimeConfigSnapshot {
 
 pub struct ClaudeReasoner {
     client: Client,
+    http1_retry_client: Client,
     model_id: String,
     api_key: Option<String>,
     prompt_caching: ClaudePromptCaching,
@@ -43,7 +49,8 @@ impl ClaudeReasoner {
 
     pub fn with_model(model_id: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: build_http_client(false),
+            http1_retry_client: build_http_client(true),
             model_id: model_id.into(),
             api_key: env::var("ANTHROPIC_API_KEY").ok(),
             prompt_caching: ClaudePromptCaching::from_env(),
@@ -83,8 +90,32 @@ impl ClaudeReasoner {
             &self.context_management,
         );
 
-        let mut request_builder = self
-            .client
+        let mut last_error: Option<KernelError> = None;
+        for attempt in 0..=self.max_transient_retries() {
+            let client = if attempt == 0 {
+                &self.client
+            } else {
+                &self.http1_retry_client
+            };
+            let request_builder = self.build_request_builder(client, &api_key);
+            match self.call_claude_once(request_builder, &payload) {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if attempt < self.max_transient_retries() && is_transient_error(&error) =>
+                {
+                    last_error = Some(error);
+                    thread::sleep(Duration::from_millis(transient_retry_delay_ms(attempt)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            KernelError::Reasoning("Claude request failed without a retryable error".to_string())
+        }))
+    }
+
+    fn build_request_builder(&self, client: &Client, api_key: &str) -> RequestBuilder {
+        let mut request_builder = client
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01");
@@ -93,21 +124,28 @@ impl ClaudeReasoner {
         {
             request_builder = request_builder.header("anthropic-beta", beta_header);
         }
+        request_builder
+    }
 
+    fn call_claude_once(
+        &self,
+        request_builder: RequestBuilder,
+        payload: &serde_json::Value,
+    ) -> Result<ReasonResponse> {
         let response = request_builder
-            .json(&payload)
+            .json(payload)
             .send()
-            .map_err(|error| KernelError::Reasoning(error.to_string()))?;
+            .map_err(classify_transport_error)?;
         let status = response.status();
         let body_text = response
             .text()
             .map_err(|error| KernelError::Reasoning(error.to_string()))?;
         if !status.is_success() {
-            return Err(map_claude_error(
-                status.as_u16(),
-                &body_text,
-                &self.model_id,
-            ));
+            let error = map_claude_error(status.as_u16(), &body_text, &self.model_id);
+            if is_retryable_status(status.as_u16()) {
+                return Err(mark_transient(error));
+            }
+            return Err(error);
         }
         let body: ClaudeResponse = serde_json::from_str(&body_text)
             .map_err(|error| KernelError::Reasoning(error.to_string()))?;
@@ -127,6 +165,65 @@ impl ClaudeReasoner {
         response.tokens_used = body.usage.into();
         Ok(response)
     }
+
+    fn max_transient_retries(&self) -> usize {
+        env::var("RETINA_CLAUDE_TRANSIENT_RETRIES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2)
+    }
+}
+
+fn build_http_client(http1_only: bool) -> Client {
+    let mut builder = ClientBuilder::new()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(30));
+    if http1_only {
+        builder = builder.http1_only();
+    }
+    builder
+        .build()
+        .unwrap_or_else(|error| panic!("failed to build Claude HTTP client: {error}"))
+}
+
+fn classify_transport_error(error: reqwest::Error) -> KernelError {
+    let mut message = format!("Anthropic request transport failure: {error}");
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        causes.push(cause.to_string());
+        source = cause.source();
+    }
+    if !causes.is_empty() {
+        message.push_str(&format!(" | causes: {}", causes.join(" -> ")));
+    }
+    if error.is_timeout() || error.is_connect() || error.is_request() || error.is_body() {
+        return mark_transient(KernelError::Reasoning(message));
+    }
+    KernelError::Reasoning(message)
+}
+
+fn transient_retry_delay_ms(attempt: usize) -> u64 {
+    match attempt {
+        0 => 350,
+        1 => 900,
+        _ => 1_500,
+    }
+}
+
+fn mark_transient(error: KernelError) -> KernelError {
+    match error {
+        KernelError::Reasoning(message) => {
+            KernelError::Reasoning(format!("transient provider error: {message}"))
+        }
+        other => other,
+    }
+}
+
+fn is_transient_error(error: &KernelError) -> bool {
+    matches!(error, KernelError::Reasoning(message) if message.starts_with("transient provider error:"))
 }
 
 impl Default for ClaudeReasoner {
@@ -137,10 +234,7 @@ impl Default for ClaudeReasoner {
 
 impl Reasoner for ClaudeReasoner {
     fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
-        if let Some(response) = plan_task(
-            &request.context.task,
-            request.context.last_result.as_deref(),
-        ) {
+        if let Some(response) = plan_task(&request.context.task) {
             return Ok(response);
         }
 
@@ -222,29 +316,10 @@ mod tests {
                 context: AssembledContext {
                     identity: "Retina/test".to_string(),
                     task: "read startup.md".to_string(),
-                    task_state: TaskState {
-                        goal: TaskGoal {
-                            objective: "read startup.md".to_string(),
-                            constraints: Vec::new(),
-                        },
-                        progress: TaskProgress {
-                            current_phase: "starting".to_string(),
-                            current_step: 1,
-                            max_steps: 4,
-                            completed_checkpoints: Vec::new(),
-                            verified_facts: Vec::new(),
-                            output_written: false,
-                            output_verified: false,
-                        },
-                        recent_actions: Vec::new(),
-                        working_sources: Vec::new(),
-                        artifact_references: Vec::new(),
-                        compaction: None,
-                    },
+                    continuation_window: ActiveContinuationWindow::default(),
                     recent_context: None,
                     tools: Vec::new(),
                     memory_slice: Vec::new(),
-                    last_result: None,
                     operator_guidance: None,
                     current_step: 1,
                     max_steps: 4,
@@ -335,11 +410,10 @@ mod tests {
                 context: AssembledContext {
                     identity: "Retina/test".to_string(),
                     task: "read startup.md".to_string(),
-                    task_state: TaskState::default(),
+                    continuation_window: ActiveContinuationWindow::default(),
                     recent_context: None,
                     tools: Vec::new(),
                     memory_slice: Vec::new(),
-                    last_result: None,
                     operator_guidance: None,
                     current_step: 1,
                     max_steps: 4,
@@ -417,6 +491,18 @@ mod tests {
         assert!(instructions.contains("same top hit or the same generic portal page"));
         assert!(instructions.contains("MCP tool identifiers and MCP locators are not files"));
         assert!(instructions.contains("input validation error"));
+        assert!(instructions.contains("Do not emit one oversized write_file JSON action"));
+        assert!(
+            instructions.contains("account for every discovered requested input before finishing")
+        );
+        assert!(instructions.contains("keep web enrichment attached to the exact local entity"));
+        assert!(instructions.contains("do not rely on people-search aggregators"));
+        assert!(instructions.contains("do not add recommendation sections"));
+        assert!(instructions.contains(
+            "Keep document-analysis sections limited to facts observed in the local source"
+        ));
+        assert!(instructions.contains("Treat a web result as a direct current update only when the exact entity is clearly named"));
+        assert!(instructions.contains("Do not fill the gap with generic industry context"));
         assert!(
             instructions.contains(
                 "Do not create or modify files unless the user asked for a saved artifact"
@@ -495,31 +581,10 @@ mod tests {
                 identity: "retina".to_string(),
                 task: "read the Patent Center.pdf on Desktop and tell me what it's about"
                     .to_string(),
-                task_state: TaskState {
-                    goal: TaskGoal {
-                        objective:
-                            "read the Patent Center.pdf on Desktop and tell me what it's about"
-                                .to_string(),
-                        constraints: Vec::new(),
-                    },
-                    progress: TaskProgress {
-                        current_phase: "planning".to_string(),
-                        current_step: 1,
-                        max_steps: 6,
-                        completed_checkpoints: Vec::new(),
-                        verified_facts: Vec::new(),
-                        output_written: false,
-                        output_verified: false,
-                    },
-                    recent_actions: Vec::new(),
-                    working_sources: Vec::new(),
-                    artifact_references: Vec::new(),
-                    compaction: None,
-                },
+                continuation_window: ActiveContinuationWindow::default(),
                 recent_context: None,
                 tools: Vec::new(),
                 memory_slice: Vec::new(),
-                last_result: None,
                 operator_guidance: None,
                 current_step: 1,
                 max_steps: 6,
@@ -554,8 +619,8 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             "payload text block",
         );
-        assert!(content.contains("Observed state snapshot"));
-        assert!(content.contains("output_written"));
+        assert!(content.contains("Current local date/time:"));
+        assert!(!content.contains("Observed state snapshot"));
         assert!(!content.contains("- required inputs:"));
         assert!(!content.contains("named source hints"));
     }
@@ -566,11 +631,10 @@ mod tests {
             context: AssembledContext {
                 identity: "retina".to_string(),
                 task: "search the web for what is happening this weekend".to_string(),
-                task_state: TaskState::default(),
+                continuation_window: ActiveContinuationWindow::default(),
                 recent_context: None,
                 tools: Vec::new(),
                 memory_slice: Vec::new(),
-                last_result: None,
                 operator_guidance: None,
                 current_step: 1,
                 max_steps: 4,
@@ -748,5 +812,18 @@ mod tests {
             must(claude_action("respond", json!({ "message": "done" })).into_reason_response());
 
         assert!(!response.task_complete);
+    }
+
+    #[test]
+    fn transient_statuses_are_retryable() {
+        assert!(crate::response::is_retryable_status(429));
+        assert!(crate::response::is_retryable_status(503));
+        assert!(!crate::response::is_retryable_status(400));
+    }
+
+    #[test]
+    fn transient_error_marker_is_detected() {
+        let error = mark_transient(KernelError::Reasoning("timeout".to_string()));
+        assert!(is_transient_error(&error));
     }
 }

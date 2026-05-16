@@ -3,9 +3,9 @@ use crate::cli::{Cli, Commands, InspectCommands};
 use crate::controller::{AgentController, InspectController};
 use crate::maintenance::run_cleanup;
 use crate::output::{
-    render_action_result, render_agent_registry, render_cleanup_report, render_mcp_snapshot,
-    render_memory_inspection, render_runtime_tasks, render_stats, render_task_state,
-    render_timeline, render_worker_overview,
+    render_action_result, render_agent_registry, render_cleanup_report, render_continuation_window,
+    render_mcp_snapshot, render_memory_inspection, render_runtime_tasks, render_stats,
+    render_task_projection, render_timeline, render_worker_overview,
 };
 use crate::runtime::init_runtime;
 use clap::Parser;
@@ -61,9 +61,13 @@ pub fn inspect(command: InspectCommands) -> Result<()> {
             let events = inspector.recent_timeline(50)?;
             print!("{}", render_timeline(&events));
         }
-        InspectCommands::TaskState => match inspector.latest_task_state()? {
-            Some(task_state) => print!("{}", render_task_state(&task_state)),
-            None => println!("No task state snapshots recorded yet."),
+        InspectCommands::Projection => match inspector.latest_task_projection()? {
+            Some(task_state) => print!("{}", render_task_projection(&task_state)),
+            None => println!("No continuation-derived task projection recorded yet."),
+        },
+        InspectCommands::Continuation => match inspector.latest_continuation_window()? {
+            Some(window) => print!("{}", render_continuation_window(&window)),
+            None => println!("No continuation window snapshots recorded yet."),
         },
         InspectCommands::Tasks => {
             let tasks = inspector.recent_runtime_tasks(20)?;

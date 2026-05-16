@@ -9,8 +9,8 @@ mod support;
 pub(crate) use crate::loop_state::{TaskLoopState, action_label};
 use crate::router::Router;
 pub(crate) use crate::support::{
-    ActionExecution, CircuitBreaker, EventSpec, ReflexEngine, StepSelectionContext,
-    tool_authored_completion_message,
+    ActionExecution, EventSpec, StepSelectionContext, completion_blocker_reason,
+    select_reflex_action, tool_authored_completion_message,
 };
 use retina_tools::ToolPolicy;
 use retina_traits::{AgentRuntime, McpRuntime, Memory, Reasoner, Shell};
@@ -22,8 +22,6 @@ pub struct Kernel {
     shell: Box<dyn Shell>,
     reasoner: Box<dyn Reasoner>,
     memory: Box<dyn Memory>,
-    reflex_engine: ReflexEngine,
-    circuit_breaker: CircuitBreaker,
     router: Router,
     tool_policy: ToolPolicy,
     agent_runtime: Option<Arc<dyn AgentRuntime>>,
@@ -83,15 +81,10 @@ impl Kernel {
         agent_runtime: Option<Arc<dyn AgentRuntime>>,
         mcp_runtime: Option<Arc<dyn McpRuntime>>,
     ) -> Result<Self> {
-        let active_rules = memory.active_rules().map_err(|error| {
-            KernelError::Storage(format!("failed to load active rules: {error}"))
-        })?;
         Ok(Self {
             shell,
             reasoner,
             memory,
-            reflex_engine: ReflexEngine::new(active_rules),
-            circuit_breaker: CircuitBreaker::default(),
             router: Router::v1(registry),
             tool_policy,
             agent_runtime,
@@ -166,6 +159,14 @@ impl Kernel {
         }
 
         let mut intent = Intent::from_task(&task);
+        let mut state = task
+            .resume_context
+            .as_ref()
+            .map(TaskLoopState::from_resume_context)
+            .unwrap_or_else(|| TaskLoopState::new(max_steps));
+        if state.transcript.is_empty() {
+            state.record_task_message(&task.description);
+        }
         self.emit_event(EventSpec::new(
             &task,
             Some(&intent),
@@ -178,10 +179,10 @@ impl Kernel {
                 "routing_rationale": routing.rationale,
                 "routing_candidates": routing.candidates,
                 "network_enabled": routing.network_enabled,
-                "task_state": self.build_task_state(
+                "continuation_window": self.build_active_continuation_window(
                     &task,
-                    &TaskLoopState::new(max_steps),
-                    1,
+                    &state,
+                    state.current_step().max(1),
                     max_steps,
                 )
             }),
@@ -194,7 +195,13 @@ impl Kernel {
             json!({ "objective": intent.objective }),
         ))?;
 
-        let reflex_action = self.reflex_engine.check(&task, &intent);
+        let reflex_action = select_reflex_action(
+            &task,
+            &self.memory.active_rules().map_err(|error| {
+                KernelError::Storage(format!("failed to load active rules: {error}"))
+            })?,
+        );
+        state.record_reflex_decision(state.current_step() + 1, reflex_action.as_ref());
         self.emit_event(EventSpec::new(
             &task,
             Some(&intent),
@@ -203,35 +210,68 @@ impl Kernel {
             json!({ "matched": reflex_action.is_some() }),
         ))?;
 
-        let tripped = self.circuit_breaker.is_tripped(&intent);
+        let failure_count = state.circuit_breaker_failure_count();
+        let tripped = state.circuit_breaker_tripped();
+        state.record_circuit_breaker_state(state.current_step() + 1, failure_count, tripped);
         self.emit_event(EventSpec::new(
             &task,
             Some(&intent),
             None,
             TimelineEventType::CircuitBreakerChecked,
-            json!({ "tripped": tripped }),
+            json!({ "tripped": tripped, "failure_count": failure_count }),
         ))?;
         if tripped {
+            let reason = "circuit breaker is tripped".to_string();
+            let continuation_window = self.build_active_continuation_window(
+                &task,
+                &state,
+                state.current_step().max(1),
+                max_steps,
+            );
+            let recovery_snapshot = TaskRecoverySnapshot::from_live_state(
+                &task,
+                continuation_window.clone(),
+                reason.clone(),
+            );
+            self.emit_event(EventSpec::new(
+                &task,
+                Some(&intent),
+                None,
+                TimelineEventType::TaskBlocked,
+                json!({
+                    "reason": reason,
+                    "continuation_window": continuation_window,
+                    "recovery_snapshot": recovery_snapshot
+                }),
+            ))?;
             return Ok(Outcome::Blocked("circuit breaker is tripped".to_string()));
         }
-
-        let mut state = TaskLoopState::new(max_steps);
         let mut next_reflex_action = reflex_action;
 
         loop {
-            if state.step_index >= max_steps {
-                let task_state =
-                    self.build_task_state(&task, &state, state.step_index.max(1), max_steps);
+            if state.current_step() >= max_steps {
+                let continuation_window = self.build_active_continuation_window(
+                    &task,
+                    &state,
+                    state.current_step().max(1),
+                    max_steps,
+                );
                 let reason = format!("step budget exhausted after {} steps", max_steps);
+                let recovery_snapshot = TaskRecoverySnapshot::from_live_state(
+                    &task,
+                    continuation_window.clone(),
+                    reason.clone(),
+                );
                 self.emit_event(EventSpec::new(
                     &task,
                     Some(&intent),
                     None,
-                    TimelineEventType::TaskFailed,
+                    TimelineEventType::TaskBlocked,
                     json!({
                         "reason": reason,
                         "max_steps": max_steps,
-                        "task_state": task_state
+                        "continuation_window": continuation_window,
+                        "recovery_snapshot": recovery_snapshot
                     }),
                 ))?;
                 return Ok(Outcome::Blocked(reason));
@@ -247,8 +287,8 @@ impl Kernel {
                 return Ok(outcome);
             }
 
-            let current_step = state.step_index + 1;
-            let step = self.select_action(
+            let current_step = state.current_step() + 1;
+            let step = match self.select_action(
                 StepSelectionContext {
                     task: &task,
                     intent: &intent,
@@ -258,7 +298,13 @@ impl Kernel {
                     max_steps,
                 },
                 next_reflex_action.take(),
-            )?;
+            ) {
+                Ok(step) => step,
+                Err(error) => {
+                    return self
+                        .finish_terminal_kernel_error(&task, &intent, &state, max_steps, error);
+                }
+            };
             if let Some(outcome) = self.check_cancellation(
                 &task,
                 Some(&intent),
@@ -268,15 +314,36 @@ impl Kernel {
             )? {
                 return Ok(outcome);
             }
-            let execution =
-                self.execute_action(&task, &mut intent, &state, &step, config.control.as_ref())?;
+            let execution = match self.execute_action(
+                &task,
+                &mut intent,
+                &state,
+                &step,
+                config.control.as_ref(),
+            ) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    return self
+                        .finish_terminal_kernel_error(&task, &intent, &state, max_steps, error);
+                }
+            };
             let outcome = match execution {
                 ActionExecution::Outcome(outcome) => outcome,
             };
-            let progress = state.record_step(&step.action, &outcome)?;
-            let compaction = state.apply_live_compaction();
-            let task_state =
-                self.build_task_state(&task, &state, state.step_index.max(1), max_steps);
+            let progress = match state.record_step(&task.id, &step.action, &outcome) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    return self
+                        .finish_terminal_kernel_error(&task, &intent, &state, max_steps, error);
+                }
+            };
+            let compaction = state.apply_live_compaction(&task.id);
+            let continuation_window = self.build_active_continuation_window(
+                &task,
+                &state,
+                state.current_step().max(1),
+                max_steps,
+            );
 
             if let Some(compaction) = compaction {
                 self.emit_event(EventSpec::new(
@@ -287,7 +354,8 @@ impl Kernel {
                     json!({
                         "reason": compaction.reason,
                         "score_explanations": compaction.score_explanations,
-                        "task_state": task_state.clone()
+                        "compacted_results": continuation_window.reannounced_compacted_results.clone(),
+                        "continuation_window": continuation_window.clone()
                     }),
                 ))?;
             }
@@ -299,7 +367,7 @@ impl Kernel {
                 TimelineEventType::TaskStepCompleted,
                 json!({
                     "result": "step_completed",
-                    "task_state": task_state
+                    "continuation_window": continuation_window.clone()
                 }),
             ))?;
 
@@ -312,8 +380,16 @@ impl Kernel {
                     &task,
                     Some(&intent),
                     Some(&step.action),
-                    TimelineEventType::TaskFailed,
-                    json!({ "reason": repeated_reason }),
+                    TimelineEventType::TaskBlocked,
+                    json!({
+                        "reason": repeated_reason,
+                        "continuation_window": continuation_window.clone(),
+                        "recovery_snapshot": TaskRecoverySnapshot::from_live_state(
+                            &task,
+                            continuation_window.clone(),
+                            repeated_reason.clone(),
+                        )
+                    }),
                 ))?;
                 return Ok(Outcome::Blocked(repeated_reason));
             }
@@ -326,7 +402,9 @@ impl Kernel {
                 )
             );
 
-            if explicit_response {
+            let completion_blocker = completion_blocker_reason(&task, &state.working_sources());
+
+            if explicit_response && completion_blocker.is_none() {
                 let final_answer_summary = match &step.action {
                     Action::Respond { message, .. } => Some(compact_answer_summary(message)),
                     _ => None,
@@ -339,12 +417,12 @@ impl Kernel {
                     json!({
                         "outcome": "success",
                         "final_answer_summary": final_answer_summary,
-                        "task_state": task_state
+                        "continuation_window": continuation_window.clone()
                     }),
                 ))?;
             }
 
-            let tool_authored_response = if step.task_complete {
+            let tool_authored_response = if step.task_complete && completion_blocker.is_none() {
                 match &outcome {
                     Outcome::Success(result) if !explicit_response => {
                         tool_authored_completion_message(result, step.framing.as_ref())
@@ -372,13 +450,47 @@ impl Kernel {
                         "outcome": "success",
                         "completion_mode": "tool_authored",
                         "final_answer_summary": final_answer_summary,
-                        "task_state": task_state
+                        "continuation_window": continuation_window.clone()
                     }),
                 ))?;
                 return Ok(outcome);
             }
 
-            if explicit_response || matches!(outcome, Outcome::Blocked(_)) {
+            if let Outcome::Blocked(reason) = &outcome {
+                self.emit_event(EventSpec::new(
+                    &task,
+                    Some(&intent),
+                    Some(&step.action),
+                    TimelineEventType::TaskBlocked,
+                    json!({
+                        "reason": reason,
+                        "continuation_window": continuation_window.clone(),
+                        "recovery_snapshot": TaskRecoverySnapshot::from_live_state(
+                            &task,
+                            continuation_window.clone(),
+                            reason.clone(),
+                        )
+                    }),
+                ))?;
+                return Ok(outcome);
+            }
+
+            if let Some(reason) = completion_blocker {
+                state.record_guidance_update(
+                    state.current_step(),
+                    NextStepGuidance {
+                        directive: NextStepDirective::GatherMissingFact,
+                        reason,
+                        based_on_action: Some(action_label(&step.action)),
+                        evidence_locator: None,
+                        preferred_search_family: None,
+                        suggested_query: None,
+                    },
+                );
+                continue;
+            }
+
+            if explicit_response {
                 return Ok(outcome);
             }
         }
@@ -386,6 +498,50 @@ impl Kernel {
 }
 
 impl Kernel {
+    fn finish_terminal_kernel_error(
+        &self,
+        task: &Task,
+        intent: &Intent,
+        state: &TaskLoopState,
+        max_steps: usize,
+        error: KernelError,
+    ) -> Result<Outcome> {
+        let recoverable = matches!(error, KernelError::Reasoning(_) | KernelError::Execution(_));
+        let reason = error.to_string();
+        let continuation_window = self.build_active_continuation_window(
+            task,
+            state,
+            state.current_step().max(1),
+            max_steps,
+        );
+        let recovery_snapshot = TaskRecoverySnapshot::from_live_state(
+            task,
+            continuation_window.clone(),
+            reason.clone(),
+        );
+        self.emit_event(EventSpec::new(
+            task,
+            Some(intent),
+            None,
+            if recoverable {
+                TimelineEventType::TaskBlocked
+            } else {
+                TimelineEventType::TaskFailed
+            },
+            json!({
+                "reason": reason,
+                "recoverable": recoverable,
+                "continuation_window": continuation_window,
+                "recovery_snapshot": recovery_snapshot
+            }),
+        ))?;
+        Ok(if recoverable {
+            Outcome::Blocked(error.to_string())
+        } else {
+            Outcome::Failure(error.to_string())
+        })
+    }
+
     fn route_assessment(&self, task: &Task) -> RoutingAssessment {
         let latest = self.memory.agent_registry_snapshot().unwrap_or_default();
         if latest.active_agents.is_empty() && latest.archived_agents.is_empty() {

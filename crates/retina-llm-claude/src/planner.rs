@@ -1,7 +1,6 @@
 use retina_types::*;
-pub fn plan_task(task: &str, last_result: Option<&str>) -> Option<ReasonResponse> {
+pub fn plan_task(task: &str) -> Option<ReasonResponse> {
     let trimmed = task.trim();
-    let _ = last_result;
     if trimmed.is_empty() {
         return Some(respond(
             "I need a task to act on. Try asking me to inspect, read, search, or modify something concrete.",
@@ -74,17 +73,9 @@ mod tests {
         value.unwrap_or_else(|| panic!("{message}"))
     }
 
-    fn to_json(value: &ActionResult) -> String {
-        serde_json::to_string(value)
-            .unwrap_or_else(|error| panic!("failed to serialize test action result: {error}"))
-    }
-
     #[test]
     fn plans_capability_response() {
-        let response = must(
-            plan_task("what can you do", None),
-            "expected planner response",
-        );
+        let response = must(plan_task("what can you do"), "expected planner response");
         let Action::Respond { message, .. } = response.action else {
             panic!("expected response action");
         };
@@ -93,28 +84,11 @@ mod tests {
 
     #[test]
     fn concrete_task_without_prior_result_is_not_short_circuited() {
-        assert!(
-            plan_task(
-                "find the resume file on desktop and tell me what is in it",
-                None
-            )
-            .is_none()
-        );
+        assert!(plan_task("find the resume file on desktop and tell me what is in it").is_none());
     }
 
     #[test]
-    fn prior_results_do_not_trigger_deterministic_follow_up_plans() {
-        let previous = to_json(&ActionResult::FileMatches {
-            root: ".".into(),
-            pattern: "Cargo.toml".to_string(),
-            matches: vec!["Cargo.toml".into()],
-        });
-        assert!(
-            plan_task(
-                "find files named Cargo.toml and read the root one",
-                Some(&previous)
-            )
-            .is_none()
-        );
+    fn concrete_file_task_is_not_short_circuited() {
+        assert!(plan_task("find files named Cargo.toml and read the root one").is_none());
     }
 }

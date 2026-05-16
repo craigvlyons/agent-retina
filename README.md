@@ -15,20 +15,21 @@ The model is not the product. The harness is the product.
 Build from these docs in this order:
 
 1. `README.md`
-2. `docs/v1_plan.md`
-3. `docs/plans/research-aligned-execution-plan.md`
-4. `docs/roadmap.md`
-5. `docs/architecture.md`
-6. `docs/trait_contracts.md`
-7. `docs/research_overview.md`
-8. `docs/research_memory.md`
-9. `docs/research_memory_v2.md`
+2. `docs/architecture.md`
+3. `docs/roadmap.md`
+4. `docs/trait_contracts.md`
+5. `docs/research_overview.md`
+6. `docs/memory_layers.md`
+7. `docs/research_memory_v2.md`
+8. `docs/plans/README.md`
+9. `docs/plans/code_source_harness_adoption_plan.md`
+10. `docs/plans/multi_device_specialist_runtime_plan.md`
 
-If an older doc disagrees with these, the list above wins.
+Anything outside this set should be treated as historical unless it gets promoted back into the active stack.
 
 ## Current Status
 
-Retina has completed the first solid chamber of v1:
+Retina has completed the transcript-first local runtime foundation:
 - Rust workspace and private local runtime
 - stable shared types and 5 trait boundaries
 - kernel execute loop with timeline logging
@@ -36,14 +37,16 @@ Retina has completed the first solid chamber of v1:
 - CLI shell with read, search, write, approval, and command execution
 - SQLite memory with experiences, knowledge, rules, and tool registry
 - Claude-backed reasoner with local planner fallback
+- transcript/result-ledger continuity with resume and compaction
 - CLI surfaces for `run`, `chat`, `inspect`, `stats`, and `init`
+- local delegation and specialist routing/runtime support
 
-Retina is not yet the full colony:
-- no specialist spawning
-- no browser or device shells yet
-- no transport layer yet
-- no Wasm fabrication loop yet
-- no root-agent routing network yet
+Retina is not yet the full multi-device swarm:
+- no remote specialist transport yet
+- no remote agent registry/discovery yet
+- no browser or device deployment runtime yet
+- no remote lifecycle supervision across devices yet
+- no full distributed trust and authority model yet
 
 ## Project Rules
 

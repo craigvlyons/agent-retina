@@ -84,10 +84,8 @@ pub fn scoped_authority(
             )
         });
         scoped.allow_mcp = allowed_tools.iter().any(|tool| {
-            matches!(
-                tool.as_str(),
-                "list_mcp_resources" | "read_mcp_resource" | "mcp_call"
-            )
+            matches!(tool.as_str(), "list_mcp_resources" | "read_mcp_resource")
+                || retina_types::parse_mcp_tool_name(tool).is_some()
         });
         scoped.allow_file_search = allowed_tools.iter().any(|tool| {
             matches!(
@@ -112,7 +110,7 @@ pub fn scoped_authority(
             "inspect_path" | "read_file" | "ingest_structured_data" | "extract_document_text" => {
                 scoped.allow_file_reads = false
             }
-            "list_mcp_resources" | "read_mcp_resource" | "mcp_call" => scoped.allow_mcp = false,
+            "list_mcp_resources" | "read_mcp_resource" => scoped.allow_mcp = false,
             "list_directory" | "find_files" | "search_text" => scoped.allow_file_search = false,
             "edit_file" | "write_file" | "append_file" | "edit_notebook" => {
                 scoped.allow_file_writes = false
@@ -120,7 +118,11 @@ pub fn scoped_authority(
             "record_note" => scoped.allow_notes = false,
             "respond" => scoped.allow_text_responses = false,
             "agent_spawn" => scoped.allow_agent_delegation = false,
-            _ => {}
+            _ => {
+                if retina_types::parse_mcp_tool_name(tool).is_some() {
+                    scoped.allow_mcp = false;
+                }
+            }
         }
     }
     scoped
