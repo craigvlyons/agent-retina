@@ -212,41 +212,77 @@ impl Shell for CliShell {
                 pattern,
                 recursive,
                 max_results,
+                offset,
                 ..
-            } => Ok(ActionResult::FileMatches {
-                root: Self::resolve_path(root)?,
-                pattern: pattern.clone(),
-                matches: Self::find_files(
+            } => {
+                let result = Self::find_files(
                     root,
                     pattern,
                     *recursive,
                     (*max_results).min(DEFAULT_MAX_SEARCH_RESULTS),
-                )?,
-            }),
+                    *offset,
+                )?;
+                Ok(ActionResult::FileMatches {
+                    root: Self::resolve_path(root)?,
+                    pattern: pattern.clone(),
+                    matches: result.matches,
+                    truncated: result.truncated,
+                    applied_offset: result.applied_offset,
+                })
+            }
             Action::SearchText {
                 root,
                 query,
                 max_results,
+                offset,
+                glob,
+                case_insensitive,
+                output_mode,
                 ..
-            } => Ok(ActionResult::TextSearch {
-                root: Self::resolve_path(root)?,
-                query: query.clone(),
-                matches: Self::search_text(
+            } => {
+                let result = Self::search_text(
                     root,
                     query,
                     (*max_results).min(DEFAULT_MAX_SEARCH_RESULTS),
-                )?,
-            }),
+                    *offset,
+                    glob.as_deref(),
+                    *case_insensitive,
+                    output_mode,
+                )?;
+                Ok(ActionResult::TextSearch {
+                    root: Self::resolve_path(root)?,
+                    query: query.clone(),
+                    output_mode: output_mode.clone(),
+                    matches: result.matches,
+                    content: result.content,
+                    filenames: result.filenames,
+                    num_files: result.num_files,
+                    num_matches: result.num_matches,
+                    truncated: result.truncated,
+                    applied_offset: result.applied_offset,
+                    glob: glob.clone(),
+                    case_insensitive: *case_insensitive,
+                })
+            }
             Action::ReadFile {
-                path, max_bytes, ..
+                path,
+                start_line,
+                limit_lines,
+                max_bytes,
+                ..
             } => {
-                let (content, truncated) = Self::read_file(path, *max_bytes)?;
+                let read = Self::read_file(path, *start_line, *limit_lines, *max_bytes)?;
                 let resolved = Self::resolve_path(path)?;
-                self.maybe_remember_text_read(&resolved, &content, truncated)?;
+                self.maybe_remember_text_read(&resolved, &read.content, read.was_partial)?;
                 Ok(ActionResult::FileRead {
                     path: resolved,
-                    content,
-                    truncated,
+                    content: read.content,
+                    truncated: read.truncated,
+                    start_line: read.start_line,
+                    line_count: read.line_count,
+                    total_lines: read.total_lines,
+                    total_bytes: read.total_bytes,
+                    read_bytes: read.read_bytes,
                 })
             }
             Action::IngestStructuredData { path, max_rows, .. } => {
@@ -396,6 +432,10 @@ impl Shell for CliShell {
         }
     }
 
+    fn restore_read_state_cache(&self, states: &[CachedFileReadState]) -> Result<()> {
+        self.remember_restored_read_states(states)
+    }
+
     fn constraints(&self) -> &[HardConstraint] {
         static CONSTRAINTS: [HardConstraint; 1] = [HardConstraint::DeleteOrKillRequireApproval];
         &CONSTRAINTS
@@ -543,12 +583,18 @@ mod tests {
         let result = must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         let ActionResult::FileRead {
             path,
             content,
             truncated,
+            start_line,
+            line_count,
+            total_lines,
+            ..
         } = result
         else {
             panic!("expected file read");
@@ -556,6 +602,123 @@ mod tests {
         assert_eq!(path, file);
         assert_eq!(content, "hello retina");
         assert!(!truncated);
+        assert_eq!(start_line, 1);
+        assert_eq!(line_count, 1);
+        assert_eq!(total_lines, 1);
+    }
+
+    #[test]
+    fn read_file_supports_targeted_line_ranges() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "alpha\nbeta\ngamma\ndelta\n"));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file,
+            start_line: Some(2),
+            limit_lines: Some(2),
+            max_bytes: None,
+        }));
+        let ActionResult::FileRead {
+            content,
+            truncated,
+            start_line,
+            line_count,
+            total_lines,
+            ..
+        } = result
+        else {
+            panic!("expected file read");
+        };
+        assert_eq!(content, "beta\ngamma\n");
+        assert!(truncated);
+        assert_eq!(start_line, 2);
+        assert_eq!(line_count, 2);
+        assert_eq!(total_lines, 4);
+    }
+
+    #[test]
+    fn partial_read_does_not_unlock_mutation() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "alpha\nbeta\ngamma\n"));
+        let shell = CliShell::new();
+        must(shell.execute(&Action::ReadFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            start_line: Some(2),
+            limit_lines: Some(1),
+            max_bytes: None,
+        }));
+        let error = shell
+            .execute(&Action::EditFile {
+                id: ActionId::new(),
+                path: file,
+                old_string: "beta".to_string(),
+                new_string: "delta".to_string(),
+                replace_all: false,
+            })
+            .unwrap_err();
+        let KernelError::Validation(message) = error else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("only partially read"));
+    }
+
+    #[test]
+    fn restored_full_read_state_allows_edit_without_reread() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "alpha\nbeta\n"));
+        let shell = CliShell::new();
+        let state = must(CliShell::canonical_read_state_from_result(
+            &file,
+            "alpha\nbeta\n",
+            1,
+            2,
+            2,
+            11,
+            11,
+            false,
+        ));
+        must(shell.restore_read_state_cache(&[state]));
+        let result = must(shell.execute(&Action::EditFile {
+            id: ActionId::new(),
+            path: file.clone(),
+            old_string: "beta".to_string(),
+            new_string: "delta".to_string(),
+            replace_all: false,
+        }));
+        let ActionResult::FileWrite { artifact, .. } = result else {
+            panic!("expected file write");
+        };
+        assert_eq!(artifact.final_content, "alpha\ndelta\n");
+    }
+
+    #[test]
+    fn restored_partial_read_state_still_blocks_edit() {
+        let dir = must_tempdir();
+        let file = dir.path().join("note.txt");
+        must(fs::write(&file, "alpha\nbeta\ngamma\n"));
+        let shell = CliShell::new();
+        let state = must(CliShell::canonical_read_state_from_result(
+            &file, "beta\n", 2, 1, 3, 17, 5, true,
+        ));
+        must(shell.restore_read_state_cache(&[state]));
+        let error = shell
+            .execute(&Action::EditFile {
+                id: ActionId::new(),
+                path: file,
+                old_string: "beta".to_string(),
+                new_string: "delta".to_string(),
+                replace_all: false,
+            })
+            .unwrap_err();
+        let KernelError::Validation(message) = error else {
+            panic!("expected validation error");
+        };
+        assert!(message.contains("only partially read"));
     }
 
     #[test]
@@ -587,6 +750,8 @@ mod tests {
         must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         must(fs::write(&file, "changed elsewhere"));
@@ -613,6 +778,8 @@ mod tests {
         must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         let result = must(shell.execute(&Action::EditFile {
@@ -645,6 +812,8 @@ mod tests {
         must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         let error = shell
@@ -671,6 +840,8 @@ mod tests {
         must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         let error = shell
@@ -697,6 +868,8 @@ mod tests {
         must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         let result = must(shell.execute(&Action::EditFile {
@@ -742,6 +915,8 @@ mod tests {
         must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         let result = must(shell.execute(&Action::EditNotebook {
@@ -769,6 +944,8 @@ mod tests {
         must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         let error = shell
@@ -796,6 +973,8 @@ mod tests {
         must(shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file,
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }));
         let error = shell
@@ -853,6 +1032,8 @@ mod tests {
         let error = match shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: file.clone(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }) {
             Ok(_) => panic!("expected unsupported error"),
@@ -870,6 +1051,8 @@ mod tests {
         let error = match shell.execute(&Action::ReadFile {
             id: ActionId::new(),
             path: PathBuf::from("mcp-tool://brave/brave_web_search"),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }) {
             Ok(_) => panic!("expected unsupported error"),
@@ -893,6 +1076,7 @@ mod tests {
             pattern: "target".to_string(),
             recursive: true,
             max_results: 10,
+            offset: 0,
         }));
         let ActionResult::FileMatches { matches, .. } = result else {
             panic!("expected file matches");
@@ -914,6 +1098,7 @@ mod tests {
             pattern: "*.txt".to_string(),
             recursive: true,
             max_results: 10,
+            offset: 0,
         }));
         let ActionResult::FileMatches { matches, .. } = result else {
             panic!("expected file matches");
@@ -937,11 +1122,177 @@ mod tests {
             pattern: "*.txt".to_string(),
             recursive: false,
             max_results: 10,
+            offset: 0,
         }));
         let ActionResult::FileMatches { matches, .. } = result else {
             panic!("expected file matches");
         };
         assert_eq!(matches, vec![top_level]);
+    }
+
+    #[test]
+    fn find_files_supports_offset_paging() {
+        let dir = must_tempdir();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        let c = dir.path().join("c.txt");
+        must(fs::write(&a, "a"));
+        must(fs::write(&b, "b"));
+        must(fs::write(&c, "c"));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::FindFiles {
+            id: ActionId::new(),
+            root: dir.path().to_path_buf(),
+            pattern: "*.txt".to_string(),
+            recursive: true,
+            max_results: 1,
+            offset: 1,
+        }));
+        let ActionResult::FileMatches {
+            matches,
+            truncated,
+            applied_offset,
+            ..
+        } = result
+        else {
+            panic!("expected file matches");
+        };
+        assert_eq!(applied_offset, 1);
+        assert!(truncated);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0], b);
+    }
+
+    #[test]
+    fn search_text_supports_glob_and_offset() {
+        let dir = must_tempdir();
+        let rust_file = dir.path().join("main.rs");
+        let text_file = dir.path().join("notes.txt");
+        must(fs::write(
+            &rust_file,
+            "Alpha\nbeta\nAlpha again\nALPHA third\n",
+        ));
+        must(fs::write(&text_file, "Alpha in txt\n"));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::SearchText {
+            id: ActionId::new(),
+            root: dir.path().to_path_buf(),
+            query: "alpha".to_string(),
+            max_results: 1,
+            offset: 1,
+            glob: Some("*.rs".to_string()),
+            case_insensitive: true,
+            output_mode: TextSearchOutputMode::Content,
+        }));
+        let ActionResult::TextSearch {
+            output_mode,
+            matches,
+            truncated,
+            applied_offset,
+            glob,
+            case_insensitive,
+            ..
+        } = result
+        else {
+            panic!("expected text search");
+        };
+        assert_eq!(applied_offset, 1);
+        assert!(truncated);
+        assert_eq!(output_mode, TextSearchOutputMode::Content);
+        assert_eq!(glob.as_deref(), Some("*.rs"));
+        assert!(case_insensitive);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].path, rust_file);
+        assert_eq!(matches[0].line_number, 3);
+    }
+
+    #[test]
+    fn search_text_supports_files_with_matches_mode() {
+        let dir = must_tempdir();
+        let rust_file = dir.path().join("main.rs");
+        let docs_file = dir.path().join("guide.md");
+        let text_file = dir.path().join("notes.txt");
+        must(fs::write(&rust_file, "Alpha\nbeta\n"));
+        must(fs::write(&docs_file, "Alpha in docs\n"));
+        must(fs::write(&text_file, "Alpha in txt\n"));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::SearchText {
+            id: ActionId::new(),
+            root: dir.path().to_path_buf(),
+            query: "Alpha".to_string(),
+            max_results: 1,
+            offset: 1,
+            glob: None,
+            case_insensitive: false,
+            output_mode: TextSearchOutputMode::FilesWithMatches,
+        }));
+        let ActionResult::TextSearch {
+            output_mode,
+            matches,
+            filenames,
+            num_files,
+            num_matches,
+            truncated,
+            applied_offset,
+            ..
+        } = result
+        else {
+            panic!("expected text search");
+        };
+        assert_eq!(output_mode, TextSearchOutputMode::FilesWithMatches);
+        assert!(matches.is_empty());
+        assert_eq!(applied_offset, 1);
+        assert!(truncated);
+        assert_eq!(filenames.len(), 1);
+        assert!(
+            filenames[0] == docs_file || filenames[0] == text_file || filenames[0] == rust_file
+        );
+        assert_eq!(num_files, 1);
+        assert_eq!(num_matches, 0);
+    }
+
+    #[test]
+    fn search_text_supports_count_mode() {
+        let dir = must_tempdir();
+        let rust_file = dir.path().join("main.rs");
+        let text_file = dir.path().join("notes.txt");
+        must(fs::write(&rust_file, "Alpha\nbeta\nAlpha again\n"));
+        must(fs::write(&text_file, "Alpha in txt\n"));
+        let shell = CliShell::new();
+        let result = must(shell.execute(&Action::SearchText {
+            id: ActionId::new(),
+            root: dir.path().to_path_buf(),
+            query: "Alpha".to_string(),
+            max_results: 10,
+            offset: 0,
+            glob: None,
+            case_insensitive: false,
+            output_mode: TextSearchOutputMode::Count,
+        }));
+        let ActionResult::TextSearch {
+            output_mode,
+            matches,
+            content,
+            filenames,
+            num_files,
+            num_matches,
+            truncated,
+            applied_offset,
+            ..
+        } = result
+        else {
+            panic!("expected text search");
+        };
+        assert_eq!(output_mode, TextSearchOutputMode::Count);
+        assert!(matches.is_empty());
+        assert!(filenames.is_empty());
+        assert!(!truncated);
+        assert_eq!(applied_offset, 0);
+        assert_eq!(num_files, 2);
+        assert_eq!(num_matches, 3);
+        let content = content.expect("count content");
+        assert!(content.contains("main.rs:2"));
+        assert!(content.contains("notes.txt:1"));
     }
 
     #[test]

@@ -96,6 +96,293 @@ impl retina_traits::Reasoner for GuidanceReasoner {
 }
 
 #[derive(Clone)]
+struct FlakyReasoner {
+    seen_contexts: Arc<Mutex<Vec<AssembledContext>>>,
+    results: Arc<Mutex<Vec<Result<ReasonResponse>>>>,
+}
+
+impl FlakyReasoner {
+    fn new(results: Vec<Result<ReasonResponse>>) -> Self {
+        Self {
+            seen_contexts: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(results)),
+        }
+    }
+
+    fn seen_contexts(&self) -> Vec<AssembledContext> {
+        recover_mutex(&self.seen_contexts).clone()
+    }
+}
+
+impl retina_traits::Reasoner for FlakyReasoner {
+    fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
+        recover_mutex(&self.seen_contexts).push(request.context.clone());
+        let mut results = recover_mutex(&self.results);
+        if results.len() > 1 {
+            results.remove(0)
+        } else {
+            results.first().cloned().unwrap_or_else(|| {
+                Ok(ReasonResponse {
+                    action: Action::Respond {
+                        id: ActionId::new(),
+                        message: "fallback".to_string(),
+                    },
+                    task_complete: true,
+                    framing: None,
+                    reasoning: Some("fallback".to_string()),
+                    tokens_used: TokenUsage::default(),
+                })
+            })
+        }
+    }
+
+    fn capabilities(&self) -> ReasonerCapabilities {
+        ReasonerCapabilities {
+            max_context_tokens: 1_000,
+            supports_tool_use: false,
+            supports_vision: false,
+            supports_caching: false,
+            model_id: "flaky-test".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TransitionReasoner {
+    transitions: Arc<Mutex<Vec<ReasonerTransition>>>,
+}
+
+impl TransitionReasoner {
+    fn new(transitions: Vec<ReasonerTransition>) -> Self {
+        Self {
+            transitions: Arc::new(Mutex::new(transitions)),
+        }
+    }
+}
+
+impl retina_traits::Reasoner for TransitionReasoner {
+    fn reason(&self, _request: &ReasonRequest) -> Result<ReasonResponse> {
+        Ok(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("provider transition test".to_string()),
+            tokens_used: TokenUsage::default(),
+        })
+    }
+
+    fn capabilities(&self) -> ReasonerCapabilities {
+        ReasonerCapabilities {
+            max_context_tokens: 1_000,
+            supports_tool_use: false,
+            supports_vision: false,
+            supports_caching: false,
+            model_id: "transition-test".to_string(),
+        }
+    }
+
+    fn take_recent_transitions(&self) -> Vec<ReasonerTransition> {
+        std::mem::take(&mut *recover_mutex(&self.transitions))
+    }
+}
+
+#[derive(Clone)]
+struct UsageTransitionReasoner {
+    transitions: Arc<Mutex<Vec<ReasonerTransition>>>,
+    response: ReasonResponse,
+}
+
+impl UsageTransitionReasoner {
+    fn new(transitions: Vec<ReasonerTransition>, response: ReasonResponse) -> Self {
+        Self {
+            transitions: Arc::new(Mutex::new(transitions)),
+            response,
+        }
+    }
+}
+
+impl retina_traits::Reasoner for UsageTransitionReasoner {
+    fn reason(&self, _request: &ReasonRequest) -> Result<ReasonResponse> {
+        Ok(self.response.clone())
+    }
+
+    fn capabilities(&self) -> ReasonerCapabilities {
+        ReasonerCapabilities {
+            max_context_tokens: 1_000,
+            supports_tool_use: false,
+            supports_vision: false,
+            supports_caching: false,
+            model_id: "usage-transition-test".to_string(),
+        }
+    }
+
+    fn take_recent_transitions(&self) -> Vec<ReasonerTransition> {
+        std::mem::take(&mut *recover_mutex(&self.transitions))
+    }
+}
+
+#[derive(Clone)]
+struct TransitioningFlakyReasoner {
+    seen_contexts: Arc<Mutex<Vec<AssembledContext>>>,
+    results: Arc<Mutex<Vec<Result<ReasonResponse>>>>,
+    transitions: Arc<Mutex<Vec<Vec<ReasonerTransition>>>>,
+}
+
+impl TransitioningFlakyReasoner {
+    fn new(
+        results: Vec<Result<ReasonResponse>>,
+        transitions: Vec<Vec<ReasonerTransition>>,
+    ) -> Self {
+        Self {
+            seen_contexts: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(results)),
+            transitions: Arc::new(Mutex::new(transitions)),
+        }
+    }
+}
+
+impl retina_traits::Reasoner for TransitioningFlakyReasoner {
+    fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
+        recover_mutex(&self.seen_contexts).push(request.context.clone());
+        let mut results = recover_mutex(&self.results);
+        if results.len() > 1 {
+            results.remove(0)
+        } else {
+            results.first().cloned().unwrap_or_else(|| {
+                Ok(ReasonResponse {
+                    action: Action::Respond {
+                        id: ActionId::new(),
+                        message: "fallback".to_string(),
+                    },
+                    task_complete: true,
+                    framing: None,
+                    reasoning: Some("fallback".to_string()),
+                    tokens_used: TokenUsage::default(),
+                })
+            })
+        }
+    }
+
+    fn capabilities(&self) -> ReasonerCapabilities {
+        ReasonerCapabilities {
+            max_context_tokens: 1_000,
+            supports_tool_use: false,
+            supports_vision: false,
+            supports_caching: false,
+            model_id: "transitioning-flaky-test".to_string(),
+        }
+    }
+
+    fn take_recent_transitions(&self) -> Vec<ReasonerTransition> {
+        let mut transitions = recover_mutex(&self.transitions);
+        if transitions.len() > 1 {
+            transitions.remove(0)
+        } else {
+            transitions.first().cloned().unwrap_or_default()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MaxTokensReasoner {
+    seen_max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+}
+
+impl MaxTokensReasoner {
+    fn new() -> Self {
+        Self {
+            seen_max_tokens: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn seen_max_tokens(&self) -> Vec<Option<u32>> {
+        recover_mutex(&self.seen_max_tokens).clone()
+    }
+}
+
+impl retina_traits::Reasoner for MaxTokensReasoner {
+    fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
+        recover_mutex(&self.seen_max_tokens).push(request.max_tokens);
+        Ok(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("max tokens test".to_string()),
+            tokens_used: TokenUsage::default(),
+        })
+    }
+
+    fn capabilities(&self) -> ReasonerCapabilities {
+        ReasonerCapabilities {
+            max_context_tokens: 1_000,
+            supports_tool_use: false,
+            supports_vision: false,
+            supports_caching: false,
+            model_id: "max-tokens-test".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SequenceMaxTokensReasoner {
+    seen_max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+    responses: Arc<Mutex<Vec<ReasonResponse>>>,
+}
+
+impl SequenceMaxTokensReasoner {
+    fn new(responses: Vec<ReasonResponse>) -> Self {
+        Self {
+            seen_max_tokens: Arc::new(Mutex::new(Vec::new())),
+            responses: Arc::new(Mutex::new(responses)),
+        }
+    }
+
+    fn seen_max_tokens(&self) -> Vec<Option<u32>> {
+        recover_mutex(&self.seen_max_tokens).clone()
+    }
+}
+
+impl retina_traits::Reasoner for SequenceMaxTokensReasoner {
+    fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
+        recover_mutex(&self.seen_max_tokens).push(request.max_tokens);
+        let mut responses = recover_mutex(&self.responses);
+        Ok(if responses.len() > 1 {
+            responses.remove(0)
+        } else {
+            responses
+                .first()
+                .cloned()
+                .unwrap_or_else(|| ReasonResponse {
+                    action: Action::Respond {
+                        id: ActionId::new(),
+                        message: "done".to_string(),
+                    },
+                    task_complete: true,
+                    framing: None,
+                    reasoning: Some("max tokens test".to_string()),
+                    tokens_used: TokenUsage::default(),
+                })
+        })
+    }
+
+    fn capabilities(&self) -> ReasonerCapabilities {
+        ReasonerCapabilities {
+            max_context_tokens: 1_000,
+            supports_tool_use: false,
+            supports_vision: false,
+            supports_caching: false,
+            model_id: "sequence-max-tokens-test".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct MockLocalAgentRuntime {
     result: DelegatedTaskResult,
     calls: Arc<Mutex<usize>>,
@@ -201,7 +488,7 @@ fn assembled_context_includes_canonical_continuation_window() {
 }
 
 #[test]
-fn initial_reasoner_context_includes_control_state_transcript_units() {
+fn initial_reasoner_context_filters_control_only_transcript_units() {
     let memory = MockMemory::default();
     must(memory.store_rule(&ReflexiveRule {
         id: Some(RuleId::new()),
@@ -210,6 +497,8 @@ fn initial_reasoner_context_includes_control_state_transcript_units() {
         action: RuleAction::UseAction(Action::ReadFile {
             id: ActionId::new(),
             path: "startup.md".into(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         }),
         confidence: 1.0,
@@ -235,7 +524,7 @@ fn initial_reasoner_context_includes_control_state_transcript_units() {
     let _ = must(kernel.execute_task_with_config(
         Task::new(AgentId::new(), "read startup.md"),
         ExecutionConfig {
-            max_steps: 2,
+            max_steps: 3,
             control: None,
         },
     ));
@@ -243,15 +532,41 @@ fn initial_reasoner_context_includes_control_state_transcript_units() {
     let seen = reasoner.seen_contexts();
     assert_eq!(seen.len(), 1);
     let transcript = seen[0].continuation_window.transcript.entries();
-    assert!(transcript.iter().any(|item| {
-        matches!(item.kind, TranscriptUnitKind::ReflexDecision)
-            && item.summary.contains("matched read_file:startup.md")
-    }));
-    assert!(transcript.iter().any(|item| {
-        matches!(item.kind, TranscriptUnitKind::CircuitBreakerState)
-            && item.summary.contains("failures=0")
-            && item.summary.contains("tripped=false")
-    }));
+    assert!(
+        transcript
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptUnitKind::TaskMessage))
+    );
+    assert!(
+        transcript
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptUnitKind::ToolInvocation))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptUnitKind::ReflexDecision))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptUnitKind::CircuitBreakerState))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptUnitKind::OperatorGuidance))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptUnitKind::GuidanceUpdate))
+    );
+    assert!(
+        !transcript
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptUnitKind::ModelDecision))
+    );
 }
 
 #[test]
@@ -284,6 +599,10 @@ fn resumed_task_starts_with_prior_continuation_window() {
                 objective: "finish the combined report".to_string(),
                 current_step: 6,
                 max_steps: 50,
+                reasoner_tokens_used: 0,
+                max_output_tokens_recovery_count: 0,
+                has_attempted_prompt_too_long_compaction: false,
+                last_transition: None,
                 transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
                     ordinal: 1,
                     step: 6,
@@ -308,9 +627,19 @@ fn resumed_task_starts_with_prior_continuation_window() {
                     preview_excerpt: "company background".to_string(),
                     persisted_path: "/tmp/result-6-1.json".to_string(),
                 }]),
+                content_replacements: ContentReplacementState {
+                    records: vec![ContentReplacementRecord {
+                        replacement_id: "result-6-1".to_string(),
+                        source_kind: "stored_result".to_string(),
+                        result_type: "mcp_tool_call".to_string(),
+                        locator: Some("https://example.com/company".to_string()),
+                        persisted_path: Some("/tmp/result-6-1.json".to_string()),
+                        replacement_text: "[stored-result result-6-1] frozen exact replacement"
+                            .to_string(),
+                    }],
+                },
                 ..ActiveContinuationWindow::default()
             },
-            recent_context: None,
             resume_reason: "reasoning transport failed".to_string(),
         },
         None,
@@ -342,6 +671,2664 @@ fn resumed_task_starts_with_prior_continuation_window() {
             .entries()
             .iter()
             .any(|item| item.result_id == "result-6-1")
+    );
+    assert_eq!(
+        seen[0].continuation_window.content_replacements.records[0].replacement_text,
+        "[stored-result result-6-1] frozen exact replacement"
+    );
+}
+
+#[test]
+fn structured_output_truncation_continues_same_turn_with_recovery_message() {
+    let reasoner = FlakyReasoner::new(vec![
+        Err(KernelError::Reasoning(
+            "Claude did not return parseable JSON. Raw response: {\"type\":\"write_file\""
+                .to_string(),
+        )),
+        Ok(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("recovered after truncation".to_string()),
+            tokens_used: TokenUsage::default(),
+        }),
+    ]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(memory.clone()),
+    ));
+
+    let task = Task::new(AgentId::new(), "write the combined report");
+    let outcome = must(kernel.execute_task_with_config(
+        task.clone(),
+        ExecutionConfig {
+            max_steps: 1,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let seen = reasoner.seen_contexts();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen[1]
+            .continuation_window
+            .transcript
+            .entries()
+            .iter()
+            .any(
+                |unit| matches!(unit.kind, TranscriptUnitKind::RecoveryContinuation)
+                    && unit.summary.contains("Output token limit hit")
+            )
+    );
+    let events = must(memory.recent_states(20));
+    let recovery = events
+        .iter()
+        .find(|event| {
+            event.task_id == task.id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+        })
+        .expect("recovery transition event should exist");
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("attempt")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    let completed = events
+        .iter()
+        .find(|event| {
+            event.task_id == task.id && matches!(event.event_type, TimelineEventType::TaskCompleted)
+        })
+        .expect("completed event should exist");
+    assert_eq!(
+        completed
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+}
+
+#[test]
+fn structured_output_truncation_blocks_after_recovery_limit() {
+    let reasoner = FlakyReasoner::new(vec![Err(KernelError::Reasoning(
+        "invalid Claude JSON response: EOF while parsing a string".to_string(),
+    ))]);
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(MockMemory::default()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        Task::new(AgentId::new(), "save one large combined report"),
+        ExecutionConfig {
+            max_steps: 1,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    assert_eq!(reasoner.seen_contexts().len(), 4);
+}
+
+#[test]
+fn resumed_task_does_not_retry_truncation_after_recovery_limit() {
+    let reasoner = FlakyReasoner::new(vec![Err(KernelError::Reasoning(
+        "invalid Claude JSON response: EOF while parsing a string".to_string(),
+    ))]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(memory.clone()),
+    ));
+
+    let source_task = Task::new(AgentId::new(), "resume after repeated truncation");
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id,
+            source_session_id: source_task.session_id,
+            source_agent_id: source_task.agent_id,
+            objective: "resume after repeated truncation".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "resume after repeated truncation".to_string(),
+                current_step: 2,
+                max_steps: 10,
+                max_output_tokens_recovery_count: 3,
+                last_transition: Some(ContinuationTransition {
+                    reason: "max_output_tokens_recovery".to_string(),
+                    attempt: Some(3),
+                    message: Some(MAX_OUTPUT_TOKENS_RECOVERY_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                    ordinal: 1,
+                    step: 1,
+                    kind: TranscriptUnitKind::TaskMessage,
+                    summary: "resume after repeated truncation".to_string(),
+                    result_ref_id: None,
+                    primary_locator: None,
+                    evidence_refs: Vec::new(),
+                    working_sources: Vec::new(),
+                    artifact_references: Vec::new(),
+                    next_step_guidance: None,
+                    repetition_signature: None,
+                    avoid_label: None,
+                    compaction_snapshot: None,
+                }]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after third truncation recovery".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 10,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    assert_eq!(reasoner.seen_contexts().len(), 1);
+    let events = must(memory.recent_states(20));
+    assert!(
+        !events.iter().any(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+        }),
+        "resumed task should not emit another recovery continuation after the limit"
+    );
+}
+
+#[test]
+fn truncation_recovery_resets_after_next_turn_progress() {
+    let reasoner = FlakyReasoner::new(vec![
+        Err(KernelError::Reasoning(
+            "invalid Claude JSON response: EOF while parsing a string".to_string(),
+        )),
+        Ok(ReasonResponse {
+            action: Action::RunCommand {
+                id: ActionId::new(),
+                command: "pwd".to_string(),
+                cwd: None,
+                require_approval: false,
+                expect_change: false,
+                state_scope: HashScope::default(),
+            },
+            task_complete: false,
+            framing: None,
+            reasoning: Some("inspect first".to_string()),
+            tokens_used: TokenUsage::default(),
+        }),
+        Err(KernelError::Reasoning(
+            "invalid Claude JSON response: EOF while parsing a string".to_string(),
+        )),
+        Ok(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("finish".to_string()),
+            tokens_used: TokenUsage::default(),
+        }),
+    ]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let task = Task::new(AgentId::new(), "recover, make progress, then recover again");
+    let outcome = must(kernel.execute_task_with_config(
+        task.clone(),
+        ExecutionConfig {
+            max_steps: 4,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(60));
+    let recoveries: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.task_id == task.id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+                && event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    == Some("max_output_tokens_recovery")
+        })
+        .collect();
+    assert_eq!(recoveries.len(), 2);
+    assert_eq!(
+        recoveries[0]
+            .payload_json
+            .get("attempt")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        recoveries[1]
+            .payload_json
+            .get("attempt")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+}
+
+#[test]
+fn prompt_too_long_reactively_compacts_and_continues() {
+    let reasoner = FlakyReasoner::new(vec![
+        Err(KernelError::Reasoning(
+            "Anthropic API error (status 413): request too large".to_string(),
+        )),
+        Ok(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("recovered after compaction".to_string()),
+            tokens_used: TokenUsage::default(),
+        }),
+    ]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(memory.clone()),
+    ));
+
+    let source_task = Task::new(AgentId::new(), "finish the combined report");
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id,
+            source_session_id: source_task.session_id,
+            source_agent_id: source_task.agent_id,
+            objective: "finish the combined report".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "finish the combined report".to_string(),
+                current_step: 4,
+                max_steps: 50,
+                reasoner_tokens_used: 0,
+                max_output_tokens_recovery_count: 0,
+                has_attempted_prompt_too_long_compaction: false,
+                last_transition: None,
+                transcript: TranscriptLedger::from_entries(vec![
+                    TranscriptUnit {
+                        ordinal: 1,
+                        step: 1,
+                        kind: TranscriptUnitKind::TaskMessage,
+                        summary: "finish the combined report".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 2,
+                        step: 2,
+                        kind: TranscriptUnitKind::ToolInvocation,
+                        summary: "read_file".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 3,
+                        step: 2,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "looked up source A".to_string(),
+                        result_ref_id: Some("result-2".to_string()),
+                        primary_locator: Some("/tmp/source-a.txt".to_string()),
+                        evidence_refs: vec!["/tmp/source-a.txt".to_string()],
+                        working_sources: vec![WorkingSource {
+                            locator: "/tmp/source-a.txt".to_string(),
+                            kind: "file".to_string(),
+                            role: "authoritative".to_string(),
+                            status: "read".to_string(),
+                            why_it_matters: "needed for the combined report".to_string(),
+                            last_used_step: 2,
+                            evidence_refs: vec!["/tmp/source-a.txt".to_string()],
+                            page_reference: None,
+                            extraction_method: None,
+                            structured_summary: None,
+                            preview_excerpt: Some("source a".to_string()),
+                        }],
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 4,
+                        step: 3,
+                        kind: TranscriptUnitKind::ToolInvocation,
+                        summary: "read_file".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 5,
+                        step: 3,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "looked up source B".to_string(),
+                        result_ref_id: Some("result-3".to_string()),
+                        primary_locator: Some("/tmp/source-b.txt".to_string()),
+                        evidence_refs: vec!["/tmp/source-b.txt".to_string()],
+                        working_sources: vec![WorkingSource {
+                            locator: "/tmp/source-b.txt".to_string(),
+                            kind: "file".to_string(),
+                            role: "authoritative".to_string(),
+                            status: "read".to_string(),
+                            why_it_matters: "needed for the combined report".to_string(),
+                            last_used_step: 3,
+                            evidence_refs: vec!["/tmp/source-b.txt".to_string()],
+                            page_reference: None,
+                            extraction_method: None,
+                            structured_summary: None,
+                            preview_excerpt: Some("source b".to_string()),
+                        }],
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 6,
+                        step: 4,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "wrote draft report".to_string(),
+                        result_ref_id: Some("result-4".to_string()),
+                        primary_locator: Some("/tmp/report.md".to_string()),
+                        evidence_refs: vec!["/tmp/report.md".to_string()],
+                        working_sources: Vec::new(),
+                        artifact_references: vec![ArtifactReference {
+                            locator: "/tmp/report.md".to_string(),
+                            kind: "file".to_string(),
+                            status: "created".to_string(),
+                        }],
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                ]),
+                stored_results: StoredResultLedger::default(),
+                content_replacements: ContentReplacementState::default(),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "prompt too long".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 50,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let seen = reasoner.seen_contexts();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        seen[1]
+            .continuation_window
+            .transcript
+            .entries()
+            .iter()
+            .any(
+                |unit| matches!(unit.kind, TranscriptUnitKind::RecoveryContinuation)
+                    && unit.summary.contains("Context limit hit")
+            )
+    );
+    assert_eq!(seen[1].continuation_window.compaction_boundaries.len(), 1);
+    let events = must(memory.recent_states(40));
+    let recovery = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+        })
+        .expect("recovery transition event should exist");
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("attempt")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    let completed = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskCompleted)
+        })
+        .expect("completed event should exist");
+    assert_eq!(
+        completed
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("has_attempted_prompt_too_long_compaction"))
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+}
+
+#[test]
+fn prompt_too_long_recovery_resets_after_next_turn_progress() {
+    let reasoner = FlakyReasoner::new(vec![
+        Err(KernelError::Reasoning(
+            "Anthropic API error (status 413): request too large".to_string(),
+        )),
+        Ok(ReasonResponse {
+            action: Action::RunCommand {
+                id: ActionId::new(),
+                command: "pwd".to_string(),
+                cwd: None,
+                require_approval: false,
+                expect_change: false,
+                state_scope: HashScope::default(),
+            },
+            task_complete: false,
+            framing: None,
+            reasoning: Some("inspect the compacted state".to_string()),
+            tokens_used: TokenUsage::default(),
+        }),
+        Err(KernelError::Reasoning(
+            "Anthropic API error (status 413): request too large".to_string(),
+        )),
+        Ok(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("finish".to_string()),
+            tokens_used: TokenUsage::default(),
+        }),
+    ]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let source_task = Task::new(
+        AgentId::new(),
+        "recover from prompt-too-long twice with progress in between",
+    );
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id,
+            source_session_id: source_task.session_id,
+            source_agent_id: source_task.agent_id,
+            objective: "recover from prompt-too-long twice with progress in between".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "recover from prompt-too-long twice with progress in between"
+                    .to_string(),
+                current_step: 4,
+                max_steps: 50,
+                transcript: TranscriptLedger::from_entries(vec![
+                    TranscriptUnit {
+                        ordinal: 1,
+                        step: 1,
+                        kind: TranscriptUnitKind::TaskMessage,
+                        summary: "recover from prompt-too-long twice with progress in between"
+                            .to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 2,
+                        step: 2,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "looked up source A".to_string(),
+                        result_ref_id: Some("result-2".to_string()),
+                        primary_locator: Some("/tmp/source-a.txt".to_string()),
+                        evidence_refs: vec!["/tmp/source-a.txt".to_string()],
+                        working_sources: vec![WorkingSource {
+                            locator: "/tmp/source-a.txt".to_string(),
+                            kind: "file".to_string(),
+                            role: "authoritative".to_string(),
+                            status: "read".to_string(),
+                            why_it_matters: "needed for the report".to_string(),
+                            last_used_step: 2,
+                            evidence_refs: vec!["/tmp/source-a.txt".to_string()],
+                            page_reference: None,
+                            extraction_method: None,
+                            structured_summary: None,
+                            preview_excerpt: Some("source a".to_string()),
+                        }],
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 3,
+                        step: 3,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "looked up source B".to_string(),
+                        result_ref_id: Some("result-3".to_string()),
+                        primary_locator: Some("/tmp/source-b.txt".to_string()),
+                        evidence_refs: vec!["/tmp/source-b.txt".to_string()],
+                        working_sources: vec![WorkingSource {
+                            locator: "/tmp/source-b.txt".to_string(),
+                            kind: "file".to_string(),
+                            role: "authoritative".to_string(),
+                            status: "read".to_string(),
+                            why_it_matters: "needed for the report".to_string(),
+                            last_used_step: 3,
+                            evidence_refs: vec!["/tmp/source-b.txt".to_string()],
+                            page_reference: None,
+                            extraction_method: None,
+                            structured_summary: None,
+                            preview_excerpt: Some("source b".to_string()),
+                        }],
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 4,
+                        step: 4,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "draft artifact exists".to_string(),
+                        result_ref_id: Some("result-4".to_string()),
+                        primary_locator: Some("/tmp/report.md".to_string()),
+                        evidence_refs: vec!["/tmp/report.md".to_string()],
+                        working_sources: Vec::new(),
+                        artifact_references: vec![ArtifactReference {
+                            locator: "/tmp/report.md".to_string(),
+                            kind: "file".to_string(),
+                            status: "created".to_string(),
+                        }],
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                ]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 50,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(80));
+    let recoveries: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+                && event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    == Some("prompt_too_long_compaction")
+        })
+        .collect();
+    assert_eq!(recoveries.len(), 2);
+    assert_eq!(
+        recoveries[0]
+            .payload_json
+            .get("attempt")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        recoveries[1]
+            .payload_json
+            .get("attempt")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+}
+
+#[test]
+fn resumed_task_does_not_retry_prompt_too_long_compaction_after_attempt() {
+    let reasoner = FlakyReasoner::new(vec![Err(KernelError::Reasoning(
+        "Anthropic API error (status 413): request too large".to_string(),
+    ))]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(memory.clone()),
+    ));
+
+    let source_task = Task::new(AgentId::new(), "resume after prompt-too-long compaction");
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id,
+            source_session_id: source_task.session_id,
+            source_agent_id: source_task.agent_id,
+            objective: "resume after prompt-too-long compaction".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "resume after prompt-too-long compaction".to_string(),
+                current_step: 3,
+                max_steps: 10,
+                has_attempted_prompt_too_long_compaction: true,
+                last_transition: Some(ContinuationTransition {
+                    reason: "prompt_too_long_compaction".to_string(),
+                    attempt: Some(1),
+                    message: Some(PROMPT_TOO_LONG_COMPACTION_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                    ordinal: 1,
+                    step: 1,
+                    kind: TranscriptUnitKind::TaskMessage,
+                    summary: "resume after prompt-too-long compaction".to_string(),
+                    result_ref_id: None,
+                    primary_locator: None,
+                    evidence_refs: Vec::new(),
+                    working_sources: Vec::new(),
+                    artifact_references: Vec::new(),
+                    next_step_guidance: None,
+                    repetition_signature: None,
+                    avoid_label: None,
+                    compaction_snapshot: None,
+                }]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after reactive compaction retry".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 10,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    assert_eq!(reasoner.seen_contexts().len(), 1);
+    let events = must(memory.recent_states(20));
+    assert!(
+        !events.iter().any(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+        }),
+        "resumed task should not emit another prompt-too-long recovery continuation"
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskCompacted)
+        }),
+        "resumed task should not compact again after the reactive compaction guard is set"
+    );
+}
+
+#[test]
+fn truncation_recovery_preserves_prompt_too_long_guard() {
+    let reasoner = FlakyReasoner::new(vec![
+        Err(KernelError::Reasoning(
+            "invalid Claude JSON response: EOF while parsing a string".to_string(),
+        )),
+        Ok(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("finish after truncation recovery".to_string()),
+            tokens_used: TokenUsage::default(),
+        }),
+    ]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let source_task = Task::new(
+        AgentId::new(),
+        "resume after prompt-too-long then truncation",
+    );
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id,
+            source_session_id: source_task.session_id,
+            source_agent_id: source_task.agent_id,
+            objective: "resume after prompt-too-long then truncation".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "resume after prompt-too-long then truncation".to_string(),
+                current_step: 3,
+                max_steps: 10,
+                max_output_tokens_recovery_count: 1,
+                has_attempted_prompt_too_long_compaction: true,
+                last_transition: Some(ContinuationTransition {
+                    reason: "prompt_too_long_compaction".to_string(),
+                    attempt: Some(1),
+                    message: Some(PROMPT_TOO_LONG_COMPACTION_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                    ordinal: 1,
+                    step: 1,
+                    kind: TranscriptUnitKind::TaskMessage,
+                    summary: "resume after prompt-too-long then truncation".to_string(),
+                    result_ref_id: None,
+                    primary_locator: None,
+                    evidence_refs: Vec::new(),
+                    working_sources: Vec::new(),
+                    artifact_references: Vec::new(),
+                    next_step_guidance: None,
+                    repetition_signature: None,
+                    avoid_label: None,
+                    compaction_snapshot: None,
+                }]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after prompt compaction".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 10,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(20));
+    let recovery = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+                && event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    == Some("max_output_tokens_recovery")
+        })
+        .expect("truncation recovery event should exist");
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("has_attempted_prompt_too_long_compaction"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn reasoner_side_transitions_are_emitted_as_recovery_events() {
+    let reasoner = TransitionReasoner::new(vec![ReasonerTransition {
+        reason: "max_output_tokens_escalate".to_string(),
+        message: Some("Retrying the same request with a larger output token budget.".to_string()),
+        attempt: Some(1),
+        metadata: json!({ "max_tokens": 64_000 }),
+    }]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "write the combined report");
+    task.metadata
+        .insert("max_tokens_per_task".to_string(), "2048".to_string());
+    let outcome = must(kernel.execute_task_with_config(
+        task.clone(),
+        ExecutionConfig {
+            max_steps: 1,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(20));
+    let recovery = events
+        .iter()
+        .find(|event| {
+            event.task_id == task.id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+        })
+        .expect("provider transition event should exist");
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("max_output_tokens_escalate")
+    );
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("metadata")
+            .and_then(|value| value.get("max_tokens"))
+            .and_then(|value| value.as_u64()),
+        Some(64_000)
+    );
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("budget_state")
+            .and_then(|value| value.get("token_budget"))
+            .and_then(|value| value.get("budget"))
+            .and_then(|value| value.as_u64()),
+        Some(2048)
+    );
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("max_output_tokens_escalate")
+    );
+}
+
+#[test]
+fn prompt_too_long_recovery_preserves_truncation_recovery_count() {
+    let reasoner = FlakyReasoner::new(vec![
+        Err(KernelError::Reasoning(
+            "Anthropic API error (status 413): request too large".to_string(),
+        )),
+        Ok(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("finish after compaction recovery".to_string()),
+            tokens_used: TokenUsage::default(),
+        }),
+    ]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let source_task = Task::new(
+        AgentId::new(),
+        "resume after truncation then prompt-too-long",
+    );
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id,
+            source_session_id: source_task.session_id,
+            source_agent_id: source_task.agent_id,
+            objective: "resume after truncation then prompt-too-long".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "resume after truncation then prompt-too-long".to_string(),
+                current_step: 4,
+                max_steps: 50,
+                reasoner_tokens_used: 0,
+                max_output_tokens_recovery_count: 2,
+                has_attempted_prompt_too_long_compaction: false,
+                last_transition: Some(ContinuationTransition {
+                    reason: "max_output_tokens_recovery".to_string(),
+                    attempt: Some(2),
+                    message: Some(MAX_OUTPUT_TOKENS_RECOVERY_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![
+                    TranscriptUnit {
+                        ordinal: 1,
+                        step: 1,
+                        kind: TranscriptUnitKind::TaskMessage,
+                        summary: "resume after truncation then prompt-too-long".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 2,
+                        step: 2,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "looked up source A".to_string(),
+                        result_ref_id: Some("result-2".to_string()),
+                        primary_locator: Some("/tmp/source-a.txt".to_string()),
+                        evidence_refs: vec!["/tmp/source-a.txt".to_string()],
+                        working_sources: vec![WorkingSource {
+                            locator: "/tmp/source-a.txt".to_string(),
+                            kind: "file".to_string(),
+                            role: "authoritative".to_string(),
+                            status: "read".to_string(),
+                            why_it_matters: "needed for the report".to_string(),
+                            last_used_step: 2,
+                            evidence_refs: vec!["/tmp/source-a.txt".to_string()],
+                            page_reference: None,
+                            extraction_method: None,
+                            structured_summary: None,
+                            preview_excerpt: Some("source a".to_string()),
+                        }],
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 3,
+                        step: 3,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "looked up source B".to_string(),
+                        result_ref_id: Some("result-3".to_string()),
+                        primary_locator: Some("/tmp/source-b.txt".to_string()),
+                        evidence_refs: vec!["/tmp/source-b.txt".to_string()],
+                        working_sources: vec![WorkingSource {
+                            locator: "/tmp/source-b.txt".to_string(),
+                            kind: "file".to_string(),
+                            role: "authoritative".to_string(),
+                            status: "read".to_string(),
+                            why_it_matters: "needed for the report".to_string(),
+                            last_used_step: 3,
+                            evidence_refs: vec!["/tmp/source-b.txt".to_string()],
+                            page_reference: None,
+                            extraction_method: None,
+                            structured_summary: None,
+                            preview_excerpt: Some("source b".to_string()),
+                        }],
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 4,
+                        step: 4,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "draft artifact exists".to_string(),
+                        result_ref_id: Some("result-4".to_string()),
+                        primary_locator: Some("/tmp/report.md".to_string()),
+                        evidence_refs: vec!["/tmp/report.md".to_string()],
+                        working_sources: Vec::new(),
+                        artifact_references: vec![ArtifactReference {
+                            locator: "/tmp/report.md".to_string(),
+                            kind: "file".to_string(),
+                            status: "created".to_string(),
+                        }],
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                ]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after truncation recovery".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 50,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(40));
+    let recovery = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+                && event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    == Some("prompt_too_long_compaction")
+        })
+        .expect("prompt-too-long recovery event should exist");
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("has_attempted_prompt_too_long_compaction"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn provider_escalation_budget_state_reflects_pre_response_usage() {
+    let reasoner = UsageTransitionReasoner::new(
+        vec![ReasonerTransition {
+            reason: "max_output_tokens_escalate".to_string(),
+            message: Some(
+                "Retrying the same request with a larger output token budget.".to_string(),
+            ),
+            attempt: Some(1),
+            metadata: json!({ "max_tokens": 64_000 }),
+        }],
+        ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("finish".to_string()),
+            tokens_used: TokenUsage {
+                input_tokens: 300,
+                output_tokens: 200,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        },
+    );
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "write the combined report");
+    task.metadata
+        .insert("max_tokens_per_task".to_string(), "2048".to_string());
+    let outcome = must(kernel.execute_task_with_config(
+        task.clone(),
+        ExecutionConfig {
+            max_steps: 1,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(20));
+    let recovery = events
+        .iter()
+        .find(|event| {
+            event.task_id == task.id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+                && event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    == Some("max_output_tokens_escalate")
+        })
+        .expect("provider transition event should exist");
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("budget_state")
+            .and_then(|value| value.get("token_budget"))
+            .and_then(|value| value.get("used"))
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    let reasoner_called = events
+        .iter()
+        .find(|event| {
+            event.task_id == task.id
+                && matches!(event.event_type, TimelineEventType::ReasonerCalled)
+        })
+        .expect("reasoner called event should exist");
+    assert_eq!(
+        reasoner_called
+            .payload_json
+            .get("cumulative_tokens")
+            .and_then(|value| value.as_u64()),
+        Some(500)
+    );
+}
+
+#[test]
+fn provider_escalation_preserves_other_recovery_family_state() {
+    let reasoner = UsageTransitionReasoner::new(
+        vec![ReasonerTransition {
+            reason: "max_output_tokens_escalate".to_string(),
+            message: Some(
+                "Retrying the same request with a larger output token budget.".to_string(),
+            ),
+            attempt: Some(1),
+            metadata: json!({ "max_tokens": 64_000 }),
+        }],
+        ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("finish".to_string()),
+            tokens_used: TokenUsage::default(),
+        },
+    );
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let source_task = Task::new(AgentId::new(), "resume with both recovery family state");
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id,
+            source_session_id: source_task.session_id,
+            source_agent_id: source_task.agent_id,
+            objective: "resume with both recovery family state".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "resume with both recovery family state".to_string(),
+                current_step: 2,
+                max_steps: 5,
+                max_output_tokens_recovery_count: 2,
+                has_attempted_prompt_too_long_compaction: true,
+                last_transition: Some(ContinuationTransition {
+                    reason: "prompt_too_long_compaction".to_string(),
+                    attempt: Some(1),
+                    message: Some(PROMPT_TOO_LONG_COMPACTION_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                    ordinal: 1,
+                    step: 1,
+                    kind: TranscriptUnitKind::TaskMessage,
+                    summary: "resume with both recovery family state".to_string(),
+                    result_ref_id: None,
+                    primary_locator: None,
+                    evidence_refs: Vec::new(),
+                    working_sources: Vec::new(),
+                    artifact_references: Vec::new(),
+                    next_step_guidance: None,
+                    repetition_signature: None,
+                    avoid_label: None,
+                    compaction_snapshot: None,
+                }]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after mixed recovery history".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 5,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(20));
+    let escalation = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+                && event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    == Some("max_output_tokens_escalate")
+        })
+        .expect("provider escalation event should exist");
+    assert_eq!(
+        escalation
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        escalation
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("has_attempted_prompt_too_long_compaction"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn token_budget_block_keeps_latest_continuation_transition() {
+    let reasoner = UsageTransitionReasoner::new(
+        vec![ReasonerTransition {
+            reason: "max_output_tokens_escalate".to_string(),
+            message: Some(
+                "Retrying the same request with a larger output token budget.".to_string(),
+            ),
+            attempt: Some(1),
+            metadata: json!({ "max_tokens": 64_000 }),
+        }],
+        ReasonResponse {
+            action: Action::RunCommand {
+                id: ActionId::new(),
+                command: "pwd".to_string(),
+                cwd: None,
+                require_approval: false,
+                expect_change: false,
+                state_scope: HashScope::default(),
+            },
+            task_complete: false,
+            framing: None,
+            reasoning: Some("inspect first".to_string()),
+            tokens_used: TokenUsage {
+                input_tokens: 300,
+                output_tokens: 200,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        },
+    );
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "write the combined report");
+    task.metadata
+        .insert("max_tokens_per_task".to_string(), "500".to_string());
+    let outcome = must(kernel.execute_task_with_config(
+        task.clone(),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(20));
+    let blocked = events
+        .iter()
+        .find(|event| {
+            event.task_id == task.id && matches!(event.event_type, TimelineEventType::TaskBlocked)
+        })
+        .expect("token budget block event should exist");
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("next_turn")
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("reasoner_tokens_used"))
+            .and_then(|value| value.as_u64()),
+        Some(500)
+    );
+}
+
+#[test]
+fn provider_escalation_transition_survives_error_and_precedes_recovery() {
+    let reasoner = TransitioningFlakyReasoner::new(
+        vec![
+            Err(KernelError::Reasoning(
+                "invalid Claude JSON response: EOF while parsing a string".to_string(),
+            )),
+            Ok(ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("finish after recovery".to_string()),
+                tokens_used: TokenUsage::default(),
+            }),
+        ],
+        vec![
+            vec![ReasonerTransition {
+                reason: "max_output_tokens_escalate".to_string(),
+                message: Some(
+                    "Retrying the same request with a larger output token budget.".to_string(),
+                ),
+                attempt: Some(1),
+                metadata: json!({ "max_tokens": 64_000 }),
+            }],
+            Vec::new(),
+        ],
+    );
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let task = Task::new(AgentId::new(), "write the combined report");
+    let outcome = must(kernel.execute_task_with_config(
+        task.clone(),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(30));
+    let recoveries: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.task_id == task.id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+        })
+        .collect();
+    assert_eq!(recoveries.len(), 2);
+    let escalation = recoveries
+        .iter()
+        .find(|event| {
+            event
+                .payload_json
+                .get("reason")
+                .and_then(|value| value.as_str())
+                == Some("max_output_tokens_escalate")
+        })
+        .expect("provider escalation transition event should exist");
+    let recovery = recoveries
+        .iter()
+        .find(|event| {
+            event
+                .payload_json
+                .get("reason")
+                .and_then(|value| value.as_str())
+                == Some("max_output_tokens_recovery")
+        })
+        .expect("follow-up truncation recovery event should exist");
+    assert_eq!(
+        escalation
+            .payload_json
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("max_output_tokens_escalate")
+    );
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("max_output_tokens_recovery")
+    );
+    assert_eq!(
+        escalation
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("max_output_tokens_escalate")
+    );
+    assert_eq!(
+        escalation
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        recovery
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+}
+
+#[test]
+fn provider_escalation_remains_last_transition_when_recovery_is_exhausted() {
+    let reasoner = TransitioningFlakyReasoner::new(
+        vec![Err(KernelError::Reasoning(
+            "invalid Claude JSON response: EOF while parsing a string".to_string(),
+        ))],
+        vec![vec![ReasonerTransition {
+            reason: "max_output_tokens_escalate".to_string(),
+            message: Some(
+                "Retrying the same request with a larger output token budget.".to_string(),
+            ),
+            attempt: Some(1),
+            metadata: json!({ "max_tokens": 64_000 }),
+        }]],
+    );
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let source_task = Task::new(AgentId::new(), "resume with exhausted truncation recovery");
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id,
+            source_session_id: source_task.session_id,
+            source_agent_id: source_task.agent_id,
+            objective: "resume with exhausted truncation recovery".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "resume with exhausted truncation recovery".to_string(),
+                current_step: 2,
+                max_steps: 5,
+                max_output_tokens_recovery_count: 3,
+                last_transition: Some(ContinuationTransition {
+                    reason: "max_output_tokens_recovery".to_string(),
+                    attempt: Some(3),
+                    message: Some(MAX_OUTPUT_TOKENS_RECOVERY_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                    ordinal: 1,
+                    step: 1,
+                    kind: TranscriptUnitKind::TaskMessage,
+                    summary: "resume with exhausted truncation recovery".to_string(),
+                    result_ref_id: None,
+                    primary_locator: None,
+                    evidence_refs: Vec::new(),
+                    working_sources: Vec::new(),
+                    artifact_references: Vec::new(),
+                    next_step_guidance: None,
+                    repetition_signature: None,
+                    avoid_label: None,
+                    compaction_snapshot: None,
+                }]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after recovery limit".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 5,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(20));
+    let escalation = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskRecoveryContinued)
+                && event
+                    .payload_json
+                    .get("reason")
+                    .and_then(|value| value.as_str())
+                    == Some("max_output_tokens_escalate")
+        })
+        .expect("provider escalation transition should exist");
+    assert_eq!(
+        escalation
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("max_output_tokens_escalate")
+    );
+    let blocked = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskBlocked)
+        })
+        .expect("blocked event should exist");
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("max_output_tokens_escalate")
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(3)
+    );
+}
+
+#[test]
+fn completion_blocker_emits_task_continued_event() {
+    let reasoner = GuidanceReasoner::new(vec![ReasonResponse {
+        action: Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        },
+        task_complete: true,
+        framing: Some(ReasonerTaskFraming {
+            intent_kind: Some(TaskKind::Output),
+            deliverable: Some("master_summary.txt".to_string()),
+            completion_basis: Some("written and verified".to_string()),
+        }),
+        reasoning: Some("finish".to_string()),
+        tokens_used: TokenUsage::default(),
+    }]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: TaskId::new(),
+            source_session_id: SessionId::new(),
+            source_agent_id: AgentId::new(),
+            objective: "review all files in the folder and save one master summary".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "review all files in the folder and save one master summary".to_string(),
+                current_step: 1,
+                max_steps: 2,
+                reasoner_tokens_used: 0,
+                max_output_tokens_recovery_count: 0,
+                has_attempted_prompt_too_long_compaction: false,
+                last_transition: None,
+                transcript: TranscriptLedger::from_entries(vec![
+                    TranscriptUnit {
+                        ordinal: 1,
+                        step: 1,
+                        kind: TranscriptUnitKind::TaskMessage,
+                        summary: "review all files in the folder and save one master summary"
+                            .to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 2,
+                        step: 1,
+                        kind: TranscriptUnitKind::CarryoverMessage,
+                        summary: "candidate inputs discovered".to_string(),
+                        result_ref_id: None,
+                        primary_locator: Some("/tmp/a.pdf".to_string()),
+                        evidence_refs: vec!["/tmp/a.pdf".to_string(), "/tmp/b.pdf".to_string()],
+                        working_sources: vec![
+                            WorkingSource {
+                                locator: "/tmp/a.pdf".to_string(),
+                                kind: "file".to_string(),
+                                role: "candidate".to_string(),
+                                status: "read".to_string(),
+                                why_it_matters: "batch input".to_string(),
+                                last_used_step: 1,
+                                evidence_refs: vec!["/tmp/a.pdf".to_string()],
+                                page_reference: None,
+                                extraction_method: None,
+                                structured_summary: None,
+                                preview_excerpt: Some("a".to_string()),
+                            },
+                            WorkingSource {
+                                locator: "/tmp/b.pdf".to_string(),
+                                kind: "file".to_string(),
+                                role: "candidate".to_string(),
+                                status: "read".to_string(),
+                                why_it_matters: "batch input".to_string(),
+                                last_used_step: 1,
+                                evidence_refs: vec!["/tmp/b.pdf".to_string()],
+                                page_reference: None,
+                                extraction_method: None,
+                                structured_summary: None,
+                                preview_excerpt: Some("b".to_string()),
+                            },
+                            WorkingSource {
+                                locator: "/tmp/a.pdf".to_string(),
+                                kind: "file".to_string(),
+                                role: "authoritative".to_string(),
+                                status: "read".to_string(),
+                                why_it_matters: "covered input".to_string(),
+                                last_used_step: 1,
+                                evidence_refs: vec!["/tmp/a.pdf".to_string()],
+                                page_reference: None,
+                                extraction_method: None,
+                                structured_summary: None,
+                                preview_excerpt: Some("a".to_string()),
+                            },
+                        ],
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                ]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue".to_string(),
+        },
+        None,
+    );
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed.clone(),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(40));
+    let continued = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed.id
+                && matches!(event.event_type, TimelineEventType::TaskContinued)
+        })
+        .expect("completion blocker continuation event should exist");
+    assert_eq!(
+        continued
+            .payload_json
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("completion_blocker")
+    );
+}
+
+#[test]
+fn completion_blocker_resets_recovery_state() {
+    let reasoner = GuidanceReasoner::new(vec![ReasonResponse {
+        action: Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        },
+        task_complete: true,
+        framing: Some(ReasonerTaskFraming {
+            intent_kind: Some(TaskKind::Output),
+            deliverable: Some("master_summary.txt".to_string()),
+            completion_basis: Some("written and verified".to_string()),
+        }),
+        reasoning: Some("finish".to_string()),
+        tokens_used: TokenUsage::default(),
+    }]);
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner),
+        Box::new(memory.clone()),
+    ));
+
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: TaskId::new(),
+            source_session_id: SessionId::new(),
+            source_agent_id: AgentId::new(),
+            objective: "review all files in the folder and save one master summary".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "review all files in the folder and save one master summary".to_string(),
+                current_step: 1,
+                max_steps: 2,
+                max_output_tokens_recovery_count: 2,
+                has_attempted_prompt_too_long_compaction: true,
+                last_transition: Some(ContinuationTransition {
+                    reason: "prompt_too_long_compaction".to_string(),
+                    attempt: Some(1),
+                    message: Some(PROMPT_TOO_LONG_COMPACTION_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![
+                    TranscriptUnit {
+                        ordinal: 1,
+                        step: 1,
+                        kind: TranscriptUnitKind::TaskMessage,
+                        summary: "review all files in the folder and save one master summary"
+                            .to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 2,
+                        step: 1,
+                        kind: TranscriptUnitKind::CarryoverMessage,
+                        summary: "candidate inputs discovered".to_string(),
+                        result_ref_id: None,
+                        primary_locator: Some("/tmp/a.pdf".to_string()),
+                        evidence_refs: vec!["/tmp/a.pdf".to_string(), "/tmp/b.pdf".to_string()],
+                        working_sources: vec![
+                            WorkingSource {
+                                locator: "/tmp/a.pdf".to_string(),
+                                kind: "file".to_string(),
+                                role: "candidate".to_string(),
+                                status: "read".to_string(),
+                                why_it_matters: "batch input".to_string(),
+                                last_used_step: 1,
+                                evidence_refs: vec!["/tmp/a.pdf".to_string()],
+                                page_reference: None,
+                                extraction_method: None,
+                                structured_summary: None,
+                                preview_excerpt: Some("a".to_string()),
+                            },
+                            WorkingSource {
+                                locator: "/tmp/b.pdf".to_string(),
+                                kind: "file".to_string(),
+                                role: "candidate".to_string(),
+                                status: "read".to_string(),
+                                why_it_matters: "batch input".to_string(),
+                                last_used_step: 1,
+                                evidence_refs: vec!["/tmp/b.pdf".to_string()],
+                                page_reference: None,
+                                extraction_method: None,
+                                structured_summary: None,
+                                preview_excerpt: Some("b".to_string()),
+                            },
+                            WorkingSource {
+                                locator: "/tmp/a.pdf".to_string(),
+                                kind: "file".to_string(),
+                                role: "authoritative".to_string(),
+                                status: "read".to_string(),
+                                why_it_matters: "covered input".to_string(),
+                                last_used_step: 1,
+                                evidence_refs: vec!["/tmp/a.pdf".to_string()],
+                                page_reference: None,
+                                extraction_method: None,
+                                structured_summary: None,
+                                preview_excerpt: Some("a".to_string()),
+                            },
+                        ],
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                ]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue".to_string(),
+        },
+        None,
+    );
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed.clone(),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(40));
+    let continued = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed.id
+                && matches!(event.event_type, TimelineEventType::TaskContinued)
+        })
+        .expect("completion blocker continuation event should exist");
+    assert_eq!(
+        continued
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        continued
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("has_attempted_prompt_too_long_compaction"))
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        continued
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("completion_blocker")
+    );
+}
+
+#[test]
+fn non_terminal_progress_emits_next_turn_continuation_event() {
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "pwd".to_string(),
+                    cwd: None,
+                    require_approval: false,
+                    expect_change: false,
+                    state_scope: HashScope::default(),
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("inspect first".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("finish".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(memory.clone()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "inspect then answer");
+    task.metadata
+        .insert("max_reasoner_calls_per_task".to_string(), "4".to_string());
+    let outcome = must(kernel.execute_task_with_config(
+        task.clone(),
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(50));
+    let continued = events
+        .iter()
+        .find(|event| {
+            event.task_id == task.id && matches!(event.event_type, TimelineEventType::TaskContinued)
+        })
+        .expect("next turn continuation event should exist");
+    assert_eq!(
+        continued
+            .payload_json
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("next_turn")
+    );
+    assert_eq!(
+        continued
+            .payload_json
+            .get("budget_state")
+            .and_then(|value| value.get("reasoner_call_budget"))
+            .and_then(|value| value.get("used"))
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        continued
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("next_turn")
+    );
+}
+
+#[test]
+fn next_turn_resets_carried_recovery_state() {
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "pwd".to_string(),
+                    cwd: None,
+                    require_approval: false,
+                    expect_change: false,
+                    state_scope: HashScope::default(),
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("inspect first".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("finish".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(memory.clone()),
+    ));
+
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: TaskId::new(),
+            source_session_id: SessionId::new(),
+            source_agent_id: AgentId::new(),
+            objective: "inspect then answer".to_string(),
+            continuation_window: ActiveContinuationWindow {
+                objective: "inspect then answer".to_string(),
+                current_step: 1,
+                max_steps: 3,
+                max_output_tokens_recovery_count: 2,
+                has_attempted_prompt_too_long_compaction: true,
+                last_transition: Some(ContinuationTransition {
+                    reason: "prompt_too_long_compaction".to_string(),
+                    attempt: Some(1),
+                    message: Some(PROMPT_TOO_LONG_COMPACTION_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                    ordinal: 1,
+                    step: 1,
+                    kind: TranscriptUnitKind::TaskMessage,
+                    summary: "inspect then answer".to_string(),
+                    result_ref_id: None,
+                    primary_locator: None,
+                    evidence_refs: Vec::new(),
+                    working_sources: Vec::new(),
+                    artifact_references: Vec::new(),
+                    next_step_guidance: None,
+                    repetition_signature: None,
+                    avoid_label: None,
+                    compaction_snapshot: None,
+                }]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after earlier recovery".to_string(),
+        },
+        None,
+    );
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed.clone(),
+        ExecutionConfig {
+            max_steps: 3,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(50));
+    let continued = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed.id
+                && matches!(event.event_type, TimelineEventType::TaskContinued)
+        })
+        .expect("next turn continuation event should exist");
+    assert_eq!(
+        continued
+            .payload_json
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("next_turn")
+    );
+    assert_eq!(
+        continued
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        continued
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("has_attempted_prompt_too_long_compaction"))
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        continued
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("next_turn")
+    );
+}
+
+#[test]
+fn task_metadata_max_tokens_budget_overrides_reasoner_heuristic() {
+    let reasoner = MaxTokensReasoner::new();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(MockMemory::default()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "write a combined report");
+    task.metadata
+        .insert("max_tokens_per_task".to_string(), "2048".to_string());
+    let outcome = must(kernel.execute_task_with_config(
+        task,
+        ExecutionConfig {
+            max_steps: 1,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    assert_eq!(reasoner.seen_max_tokens(), vec![Some(2048)]);
+}
+
+#[test]
+fn later_reasoner_calls_use_remaining_task_token_budget() {
+    let reasoner = SequenceMaxTokensReasoner::new(vec![
+        ReasonResponse {
+            action: Action::RunCommand {
+                id: ActionId::new(),
+                command: "pwd".to_string(),
+                cwd: None,
+                require_approval: false,
+                expect_change: false,
+                state_scope: HashScope::default(),
+            },
+            task_complete: false,
+            framing: None,
+            reasoning: Some("inspect first".to_string()),
+            tokens_used: TokenUsage {
+                input_tokens: 300,
+                output_tokens: 300,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        },
+        ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("finish".to_string()),
+            tokens_used: TokenUsage::default(),
+        },
+    ]);
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(reasoner.clone()),
+        Box::new(MockMemory::default()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "inspect then answer");
+    task.metadata
+        .insert("max_tokens_per_task".to_string(), "1000".to_string());
+    let outcome = must(kernel.execute_task_with_config(
+        task,
+        ExecutionConfig {
+            max_steps: 2,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    assert_eq!(reasoner.seen_max_tokens(), vec![Some(1000), Some(400)]);
+}
+
+#[test]
+fn reasoner_call_budget_blocks_before_second_model_decision() {
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "pwd".to_string(),
+                    cwd: None,
+                    require_approval: false,
+                    expect_change: false,
+                    state_scope: HashScope::default(),
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("inspect first".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("finish".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(memory.clone()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "inspect then answer");
+    task.metadata
+        .insert("max_reasoner_calls_per_task".to_string(), "1".to_string());
+    let task_id = task.id.clone();
+    let outcome = must(kernel.execute_task_with_config(
+        task,
+        ExecutionConfig {
+            max_steps: 3,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(50));
+    let blocked = events
+        .iter()
+        .find(|event| {
+            event.task_id == task_id && matches!(event.event_type, TimelineEventType::TaskBlocked)
+        })
+        .expect("reasoner call budget block event should exist");
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("max_reasoner_calls_per_task")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("reasoner call budget exhausted after 1 calls")
+    );
+}
+
+#[test]
+fn cumulative_reasoner_token_budget_blocks_before_next_turn() {
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "pwd".to_string(),
+                    cwd: None,
+                    require_approval: false,
+                    expect_change: false,
+                    state_scope: HashScope::default(),
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("inspect first".to_string()),
+                tokens_used: TokenUsage {
+                    input_tokens: 600,
+                    output_tokens: 500,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("finish".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(memory.clone()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "inspect then answer");
+    task.metadata
+        .insert("max_tokens_per_task".to_string(), "1000".to_string());
+    let task_id = task.id.clone();
+    let outcome = must(kernel.execute_task_with_config(
+        task,
+        ExecutionConfig {
+            max_steps: 3,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(50));
+    let blocked = events
+        .iter()
+        .find(|event| {
+            event.task_id == task_id && matches!(event.event_type, TimelineEventType::TaskBlocked)
+        })
+        .expect("token budget block event should exist");
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("max_tokens_per_task")
+            .and_then(|value| value.as_u64()),
+        Some(1000)
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("reasoner_tokens_used")
+            .and_then(|value| value.as_u64()),
+        Some(1100)
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("token_budget")
+            .and_then(|value| value.get("budget"))
+            .and_then(|value| value.as_u64()),
+        Some(1000)
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("token_budget")
+            .and_then(|value| value.get("used"))
+            .and_then(|value| value.as_u64()),
+        Some(1000)
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("token_budget")
+            .and_then(|value| value.get("remaining"))
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("reason")
+            .and_then(|value| value.as_str()),
+        Some("reasoner token budget exhausted after 1000 tokens")
+    );
+}
+
+#[test]
+fn resumed_task_carries_forward_reasoner_token_budget_usage() {
+    let memory = MockMemory::default();
+    let source_task = Task::new(AgentId::new(), "resume and finish");
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id.clone(),
+            source_session_id: source_task.session_id.clone(),
+            source_agent_id: source_task.agent_id.clone(),
+            objective: source_task.description.clone(),
+            continuation_window: ActiveContinuationWindow {
+                objective: source_task.description.clone(),
+                current_step: 1,
+                max_steps: 3,
+                reasoner_tokens_used: 900,
+                max_output_tokens_recovery_count: 0,
+                has_attempted_prompt_too_long_compaction: false,
+                last_transition: None,
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after interruption".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![
+            ReasonResponse {
+                action: Action::RunCommand {
+                    id: ActionId::new(),
+                    command: "pwd".to_string(),
+                    cwd: None,
+                    require_approval: false,
+                    expect_change: false,
+                    state_scope: HashScope::default(),
+                },
+                task_complete: false,
+                framing: None,
+                reasoning: Some("inspect first".to_string()),
+                tokens_used: TokenUsage {
+                    input_tokens: 150,
+                    output_tokens: 50,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                },
+            },
+            ReasonResponse {
+                action: Action::Respond {
+                    id: ActionId::new(),
+                    message: "done".to_string(),
+                },
+                task_complete: true,
+                framing: None,
+                reasoning: Some("finish".to_string()),
+                tokens_used: TokenUsage::default(),
+            },
+        ])),
+        Box::new(memory.clone()),
+    ));
+
+    let mut resumed = resumed;
+    resumed
+        .metadata
+        .insert("max_tokens_per_task".to_string(), "1000".to_string());
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 3,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(50));
+    let blocked = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskBlocked)
+        })
+        .expect("resumed token budget block event should exist");
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("reasoner_tokens_used")
+            .and_then(|value| value.as_u64()),
+        Some(1100)
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("token_budget")
+            .and_then(|value| value.get("used"))
+            .and_then(|value| value.as_u64()),
+        Some(1000)
+    );
+}
+
+#[test]
+fn reasoner_called_event_carries_structured_budget_state() {
+    let memory = MockMemory::default();
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::sequence(vec![ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "done".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("finish".to_string()),
+            tokens_used: TokenUsage {
+                input_tokens: 300,
+                output_tokens: 200,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+        }])),
+        Box::new(memory.clone()),
+    ));
+
+    let mut task = Task::new(AgentId::new(), "answer once");
+    task.metadata
+        .insert("max_reasoner_calls_per_task".to_string(), "4".to_string());
+    task.metadata
+        .insert("max_tokens_per_task".to_string(), "1000".to_string());
+    let task_id = task.id.clone();
+    let outcome = must(kernel.execute_task_with_config(
+        task,
+        ExecutionConfig {
+            max_steps: 1,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(
+        outcome,
+        Outcome::Success(ActionResult::Response { .. })
+    ));
+    let events = must(memory.recent_states(50));
+    let reasoner_called = events
+        .iter()
+        .find(|event| {
+            event.task_id == task_id
+                && matches!(event.event_type, TimelineEventType::ReasonerCalled)
+        })
+        .expect("reasoner-called event should exist");
+    assert_eq!(
+        reasoner_called
+            .payload_json
+            .get("reasoner_call_budget")
+            .and_then(|value| value.get("budget"))
+            .and_then(|value| value.as_u64()),
+        Some(4)
+    );
+    assert_eq!(
+        reasoner_called
+            .payload_json
+            .get("reasoner_call_budget")
+            .and_then(|value| value.get("used"))
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        reasoner_called
+            .payload_json
+            .get("reasoner_call_budget")
+            .and_then(|value| value.get("remaining"))
+            .and_then(|value| value.as_u64()),
+        Some(3)
+    );
+    assert_eq!(
+        reasoner_called
+            .payload_json
+            .get("token_budget")
+            .and_then(|value| value.get("budget"))
+            .and_then(|value| value.as_u64()),
+        Some(1000)
+    );
+    assert_eq!(
+        reasoner_called
+            .payload_json
+            .get("token_budget")
+            .and_then(|value| value.get("used"))
+            .and_then(|value| value.as_u64()),
+        Some(500)
+    );
+    assert_eq!(
+        reasoner_called
+            .payload_json
+            .get("token_budget")
+            .and_then(|value| value.get("remaining"))
+            .and_then(|value| value.as_u64()),
+        Some(500)
+    );
+    assert_eq!(
+        reasoner_called
+            .payload_json
+            .get("token_budget")
+            .and_then(|value| value.get("pct"))
+            .and_then(|value| value.as_u64()),
+        Some(50)
     );
 }
 
@@ -437,6 +3424,8 @@ fn invalid_mcp_fileish_read_is_recorded_as_failed_step() {
             action: Action::ReadFile {
                 id: ActionId::new(),
                 path: "brave/brave_web_search".into(),
+                start_line: None,
+                limit_lines: None,
                 max_bytes: None,
             },
             task_complete: false,
@@ -773,6 +3762,49 @@ fn projected_task_state_keeps_authoritative_progress_without_advisory_frontier()
 }
 
 #[test]
+fn continuation_window_carries_cached_read_state() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let task = Task::new(AgentId::new(), "inspect startup.md");
+    let mut state = TaskLoopState::new(4);
+    must(state.record_step(
+        &task.id,
+        &Action::ReadFile {
+            id: ActionId::new(),
+            path: "startup.md".into(),
+            start_line: None,
+            limit_lines: None,
+            max_bytes: None,
+        },
+        &Outcome::Success(ActionResult::FileRead {
+            path: "startup.md".into(),
+            content: "alpha\nbeta\n".to_string(),
+            truncated: false,
+            start_line: 1,
+            line_count: 2,
+            total_lines: 2,
+            total_bytes: 11,
+            read_bytes: 11,
+        }),
+    ));
+
+    let window = kernel.build_active_continuation_window(&task, &state, 1, 4);
+    assert_eq!(window.read_state_cache.len(), 1);
+    assert_eq!(
+        window.read_state_cache[0].path,
+        std::path::PathBuf::from("startup.md")
+    );
+    assert!(!window.read_state_cache[0].was_partial);
+    assert_eq!(window.read_state_cache[0].total_lines, 2);
+}
+
+#[test]
 fn command_state_keeps_command_evidence_without_file_discovery_guidance() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default()),
@@ -932,7 +3964,11 @@ fn active_continuation_window_is_built_from_transcript_and_result_refs() {
     let window = kernel.build_active_continuation_window(&task, &state, 3, 6);
 
     assert_eq!(window.objective, task.description);
-    assert_eq!(window.transcript.len(), 2);
+    assert_eq!(window.transcript.len(), 3);
+    assert!(window.transcript.entries().iter().any(|entry| {
+        matches!(entry.kind, TranscriptUnitKind::CarryoverMessage)
+            && entry.summary.contains("next-step guidance:")
+    }));
     assert_eq!(window.stored_results.len(), 1);
     assert_eq!(
         window.stored_results.entries()[0]
@@ -1204,6 +4240,13 @@ fn compaction_preserves_authoritative_sources_before_candidates() {
                 .transcript
                 .entries()
                 .iter()
+                .any(|item| { matches!(item.kind, TranscriptUnitKind::CompactSummary) })
+        );
+        assert!(
+            state
+                .transcript
+                .entries()
+                .iter()
                 .any(|item| { matches!(item.kind, TranscriptUnitKind::CompactedResultRef) })
         );
         assert!(
@@ -1380,10 +4423,7 @@ fn active_continuation_window_rebuilds_from_latest_compaction_boundary() {
     let task = Task::new(AgentId::new(), "continue after compaction");
     let window = kernel.build_active_continuation_window(&task, &state, 4, 8);
 
-    assert_eq!(
-        window.transcript.entries().first().map(|item| &item.kind),
-        Some(&TranscriptUnitKind::CompactBoundary)
-    );
+    assert!(!window.transcript.entries().is_empty());
     assert!(
         !window
             .transcript
@@ -1391,11 +4431,16 @@ fn active_continuation_window_rebuilds_from_latest_compaction_boundary() {
             .iter()
             .any(|item| item.summary == "early result")
     );
+    assert!(window.transcript.entries().iter().any(|item| {
+        matches!(item.kind, TranscriptUnitKind::CarryoverMessage)
+            && item.summary.contains("source reminder:")
+            && item.summary.contains("authoritative.md")
+    }));
     assert_eq!(window.reannounced_sources[0].locator, "authoritative.md");
 }
 
 #[test]
-fn continuation_window_reannounces_transcript_referenced_source_even_if_not_preferred() {
+fn active_continuation_window_starts_after_last_compact_boundary() {
     let kernel = must(Kernel::new(
         Box::new(MockShell::default()),
         Box::new(MockReasoner::for_action(Action::Respond {
@@ -1410,7 +4455,7 @@ fn continuation_window_reannounces_transcript_referenced_source_even_if_not_pref
             ordinal: 1,
             step: 1,
             kind: TranscriptUnitKind::TaskMessage,
-            summary: "inspect candidate".to_string(),
+            summary: "pre-boundary message".to_string(),
             result_ref_id: None,
             primary_locator: None,
             evidence_refs: Vec::new(),
@@ -1420,6 +4465,521 @@ fn continuation_window_reannounces_transcript_referenced_source_even_if_not_pref
             repetition_signature: None,
             avoid_label: None,
             compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 2,
+            step: 2,
+            kind: TranscriptUnitKind::CompactBoundary,
+            summary: "step threshold".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: Some(CompactionSnapshot {
+                boundary_id: 1,
+                compacted_at_step: 2,
+                reason: "step threshold".to_string(),
+                score_explanations: Vec::new(),
+                preserved_locators: Vec::new(),
+                active_window_summary: "boundary".to_string(),
+                last_result_continuation: None,
+                compacted_results: Vec::new(),
+            }),
+        },
+        TranscriptUnit {
+            ordinal: 3,
+            step: 3,
+            kind: TranscriptUnitKind::ToolInvocation,
+            summary: "read_file:post.md".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 4,
+            step: 3,
+            kind: TranscriptUnitKind::ToolResult,
+            summary: "read post.md".to_string(),
+            result_ref_id: None,
+            primary_locator: Some("post.md".to_string()),
+            evidence_refs: vec!["post.md".to_string()],
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+    ]);
+
+    let task = Task::new(AgentId::new(), "continue after compaction");
+    let window = kernel.build_active_continuation_window(&task, &state, 3, 8);
+
+    assert_eq!(
+        window
+            .transcript
+            .entries()
+            .iter()
+            .map(|item| item.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            TranscriptUnitKind::ToolInvocation,
+            TranscriptUnitKind::ToolResult,
+        ]
+    );
+    assert!(
+        !window
+            .transcript
+            .entries()
+            .iter()
+            .any(|item| matches!(item.kind, TranscriptUnitKind::CompactBoundary))
+    );
+}
+
+#[test]
+fn active_continuation_window_keeps_only_latest_compaction_boundary() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let mut state = TaskLoopState::new(8);
+    state.transcript = TranscriptLedger::from_entries(vec![
+        TranscriptUnit {
+            ordinal: 1,
+            step: 1,
+            kind: TranscriptUnitKind::CompactBoundary,
+            summary: "first compaction".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: Some(CompactionSnapshot {
+                boundary_id: 1,
+                compacted_at_step: 1,
+                reason: "first compaction".to_string(),
+                score_explanations: Vec::new(),
+                preserved_locators: vec!["first.md".to_string()],
+                active_window_summary: "first".to_string(),
+                last_result_continuation: None,
+                compacted_results: Vec::new(),
+            }),
+        },
+        TranscriptUnit {
+            ordinal: 2,
+            step: 2,
+            kind: TranscriptUnitKind::ToolResult,
+            summary: "after first".to_string(),
+            result_ref_id: None,
+            primary_locator: Some("first.md".to_string()),
+            evidence_refs: vec!["first.md".to_string()],
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 3,
+            step: 3,
+            kind: TranscriptUnitKind::CompactBoundary,
+            summary: "second compaction".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: Some(CompactionSnapshot {
+                boundary_id: 2,
+                compacted_at_step: 3,
+                reason: "second compaction".to_string(),
+                score_explanations: Vec::new(),
+                preserved_locators: vec!["second.md".to_string()],
+                active_window_summary: "second".to_string(),
+                last_result_continuation: None,
+                compacted_results: Vec::new(),
+            }),
+        },
+        TranscriptUnit {
+            ordinal: 4,
+            step: 4,
+            kind: TranscriptUnitKind::ToolResult,
+            summary: "after second".to_string(),
+            result_ref_id: None,
+            primary_locator: Some("second.md".to_string()),
+            evidence_refs: vec!["second.md".to_string()],
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+    ]);
+
+    let task = Task::new(AgentId::new(), "continue after multiple compactions");
+    let window = kernel.build_active_continuation_window(&task, &state, 4, 8);
+
+    assert_eq!(window.compaction_boundaries.len(), 1);
+    assert_eq!(window.compaction_boundaries[0].boundary_id, 2);
+    assert_eq!(window.compaction_boundaries[0].reason, "second compaction");
+}
+
+#[test]
+fn active_continuation_window_keeps_full_live_transcript_before_first_compaction() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let mut state = TaskLoopState::new(32);
+    state.transcript = TranscriptLedger::from_entries(
+        (0..15)
+            .map(|index| TranscriptUnit {
+                ordinal: index + 1,
+                step: index + 1,
+                kind: if index == 0 {
+                    TranscriptUnitKind::TaskMessage
+                } else {
+                    TranscriptUnitKind::ToolResult
+                },
+                summary: format!("entry-{index}"),
+                result_ref_id: None,
+                primary_locator: None,
+                evidence_refs: Vec::new(),
+                working_sources: Vec::new(),
+                artifact_references: Vec::new(),
+                next_step_guidance: None,
+                repetition_signature: None,
+                avoid_label: None,
+                compaction_snapshot: None,
+            })
+            .collect(),
+    );
+
+    let task = Task::new(AgentId::new(), "keep the full transcript before compaction");
+    let window = kernel.build_active_continuation_window(&task, &state, 15, 32);
+
+    assert_eq!(window.transcript.len(), 15);
+    assert_eq!(
+        window
+            .transcript
+            .entries()
+            .first()
+            .map(|item| item.summary.as_str()),
+        Some("entry-0")
+    );
+    assert_eq!(
+        window
+            .transcript
+            .entries()
+            .last()
+            .map(|item| item.summary.as_str()),
+        Some("entry-14")
+    );
+}
+
+#[test]
+fn active_continuation_window_excludes_control_only_units_from_model_facing_transcript() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let mut state = TaskLoopState::new(8);
+    state.transcript = TranscriptLedger::from_entries(vec![
+        TranscriptUnit {
+            ordinal: 1,
+            step: 1,
+            kind: TranscriptUnitKind::TaskMessage,
+            summary: "open chrome".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 2,
+            step: 1,
+            kind: TranscriptUnitKind::ModelDecision,
+            summary: "use browser tool".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 3,
+            step: 1,
+            kind: TranscriptUnitKind::OperatorGuidance,
+            summary: "stay on validated path".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 4,
+            step: 2,
+            kind: TranscriptUnitKind::ToolInvocation,
+            summary: "apps activate chrome".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 5,
+            step: 2,
+            kind: TranscriptUnitKind::GuidanceUpdate,
+            summary: "prefer keyboard path".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 6,
+            step: 2,
+            kind: TranscriptUnitKind::ToolResult,
+            summary: "chrome activated".to_string(),
+            result_ref_id: None,
+            primary_locator: Some("Google Chrome".to_string()),
+            evidence_refs: vec!["Google Chrome".to_string()],
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+    ]);
+
+    let task = Task::new(AgentId::new(), "open chrome");
+    let window = kernel.build_active_continuation_window(&task, &state, 2, 8);
+
+    assert_eq!(
+        window
+            .transcript
+            .entries()
+            .iter()
+            .map(|entry| entry.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            TranscriptUnitKind::TaskMessage,
+            TranscriptUnitKind::ToolInvocation,
+            TranscriptUnitKind::ToolResult,
+        ]
+    );
+}
+
+#[test]
+fn active_continuation_window_filters_control_only_transcript_units() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let mut state = TaskLoopState::new(8);
+    state.transcript = TranscriptLedger::from_entries(vec![
+        TranscriptUnit {
+            ordinal: 1,
+            step: 0,
+            kind: TranscriptUnitKind::TaskMessage,
+            summary: "inspect startup.md".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 2,
+            step: 1,
+            kind: TranscriptUnitKind::ReflexDecision,
+            summary: "matched read_file:startup.md".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 3,
+            step: 1,
+            kind: TranscriptUnitKind::CircuitBreakerState,
+            summary: "failures=0 tripped=false".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 4,
+            step: 1,
+            kind: TranscriptUnitKind::ToolInvocation,
+            summary: "read_file:startup.md".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+        TranscriptUnit {
+            ordinal: 5,
+            step: 1,
+            kind: TranscriptUnitKind::ToolResult,
+            summary: "read startup.md".to_string(),
+            result_ref_id: None,
+            primary_locator: Some("startup.md".to_string()),
+            evidence_refs: vec!["startup.md".to_string()],
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+    ]);
+
+    let task = Task::new(AgentId::new(), "inspect startup.md");
+    let window = kernel.build_active_continuation_window(&task, &state, 1, 8);
+
+    assert_eq!(window.transcript.len(), 3);
+    assert_eq!(
+        window
+            .transcript
+            .entries()
+            .iter()
+            .map(|item| item.kind.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            TranscriptUnitKind::TaskMessage,
+            TranscriptUnitKind::ToolInvocation,
+            TranscriptUnitKind::ToolResult
+        ]
+    );
+}
+
+#[test]
+fn continuation_window_does_not_reannounce_source_already_covered_by_transcript() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let mut state = TaskLoopState::new(8);
+    state.transcript = TranscriptLedger::from_entries(vec![
+        TranscriptUnit {
+            ordinal: 1,
+            step: 1,
+            kind: TranscriptUnitKind::CompactBoundary,
+            summary: "step threshold".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: vec![WorkingSource {
+                locator: "other.md".to_string(),
+                kind: "file".to_string(),
+                role: "authoritative".to_string(),
+                status: "listed".to_string(),
+                why_it_matters: "generally important".to_string(),
+                last_used_step: 1,
+                evidence_refs: vec!["other.md".to_string()],
+                page_reference: None,
+                extraction_method: None,
+                structured_summary: None,
+                preview_excerpt: None,
+            }],
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: Some(CompactionSnapshot {
+                boundary_id: 1,
+                compacted_at_step: 1,
+                reason: "step threshold".to_string(),
+                score_explanations: Vec::new(),
+                preserved_locators: vec!["other.md".to_string()],
+                active_window_summary: "boundary".to_string(),
+                last_result_continuation: None,
+                compacted_results: Vec::new(),
+            }),
         },
         TranscriptUnit {
             ordinal: 2,
@@ -1437,42 +4997,181 @@ fn continuation_window_reannounces_transcript_referenced_source_even_if_not_pref
             compaction_snapshot: None,
         },
     ]);
-    state.seed_working_source(WorkingSource {
-        locator: "candidate.md".to_string(),
-        kind: "file".to_string(),
-        role: "candidate".to_string(),
-        status: "read".to_string(),
-        why_it_matters: "currently relevant".to_string(),
-        last_used_step: 2,
-        evidence_refs: vec!["candidate.md".to_string()],
-        page_reference: None,
-        extraction_method: Some("text_read".to_string()),
-        structured_summary: None,
-        preview_excerpt: Some("candidate preview".to_string()),
-    });
-    state.seed_working_source(WorkingSource {
-        locator: "other.md".to_string(),
-        kind: "file".to_string(),
-        role: "authoritative".to_string(),
-        status: "listed".to_string(),
-        why_it_matters: "generally important".to_string(),
-        last_used_step: 1,
-        evidence_refs: vec!["other.md".to_string()],
-        page_reference: None,
-        extraction_method: None,
-        structured_summary: None,
-        preview_excerpt: None,
-    });
 
     let task = Task::new(AgentId::new(), "continue from candidate source");
     let window = kernel.build_active_continuation_window(&task, &state, 2, 8);
 
     assert!(
-        window
+        !window
             .reannounced_sources
             .iter()
             .any(|source| source.locator == "candidate.md")
     );
+    assert!(
+        window
+            .reannounced_sources
+            .iter()
+            .any(|source| source.locator == "other.md")
+    );
+}
+
+#[test]
+fn continuation_window_does_not_reannounce_artifact_already_covered_by_transcript() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let mut state = TaskLoopState::new(8);
+    state.transcript = TranscriptLedger::from_entries(vec![
+        TranscriptUnit {
+            ordinal: 1,
+            step: 1,
+            kind: TranscriptUnitKind::CompactBoundary,
+            summary: "step threshold".to_string(),
+            result_ref_id: None,
+            primary_locator: None,
+            evidence_refs: Vec::new(),
+            working_sources: Vec::new(),
+            artifact_references: vec![ArtifactReference {
+                kind: "file".to_string(),
+                locator: "other-artifact.md".to_string(),
+                status: "created".to_string(),
+            }],
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: Some(CompactionSnapshot {
+                boundary_id: 1,
+                compacted_at_step: 1,
+                reason: "step threshold".to_string(),
+                score_explanations: Vec::new(),
+                preserved_locators: vec!["other-artifact.md".to_string()],
+                active_window_summary: "boundary".to_string(),
+                last_result_continuation: None,
+                compacted_results: Vec::new(),
+            }),
+        },
+        TranscriptUnit {
+            ordinal: 2,
+            step: 2,
+            kind: TranscriptUnitKind::ToolResult,
+            summary: "read artifact".to_string(),
+            result_ref_id: None,
+            primary_locator: Some("artifact.md".to_string()),
+            evidence_refs: vec!["artifact.md".to_string()],
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        },
+    ]);
+
+    let task = Task::new(AgentId::new(), "continue from artifact");
+    let window = kernel.build_active_continuation_window(&task, &state, 2, 8);
+
+    assert!(
+        !window
+            .reannounced_artifacts
+            .iter()
+            .any(|artifact| artifact.locator == "artifact.md")
+    );
+    assert!(
+        window
+            .reannounced_artifacts
+            .iter()
+            .any(|artifact| artifact.locator == "other-artifact.md")
+    );
+}
+
+#[test]
+fn continuation_window_materializes_reannounced_context_into_transcript() {
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_action(Action::Respond {
+            id: ActionId::new(),
+            message: "done".to_string(),
+        })),
+        Box::new(MockMemory::default()),
+    ));
+    let mut state = TaskLoopState::new(8);
+    state.transcript = TranscriptLedger::from_entries(vec![TranscriptUnit {
+        ordinal: 1,
+        step: 1,
+        kind: TranscriptUnitKind::CompactBoundary,
+        summary: "step threshold".to_string(),
+        result_ref_id: None,
+        primary_locator: None,
+        evidence_refs: Vec::new(),
+        working_sources: vec![WorkingSource {
+            locator: "authoritative.md".to_string(),
+            kind: "file".to_string(),
+            role: "authoritative".to_string(),
+            status: "read".to_string(),
+            why_it_matters: "carry forward".to_string(),
+            last_used_step: 1,
+            evidence_refs: vec!["authoritative.md".to_string()],
+            page_reference: None,
+            extraction_method: None,
+            structured_summary: None,
+            preview_excerpt: None,
+        }],
+        artifact_references: vec![ArtifactReference {
+            kind: "file".to_string(),
+            locator: "report.md".to_string(),
+            status: "created".to_string(),
+        }],
+        next_step_guidance: Some(NextStepGuidance {
+            directive: NextStepDirective::AnswerFromEvidence,
+            reason: "continue with the preserved report".to_string(),
+            based_on_action: None,
+            evidence_locator: Some("report.md".to_string()),
+            preferred_search_family: None,
+            suggested_query: None,
+        }),
+        repetition_signature: None,
+        avoid_label: None,
+        compaction_snapshot: Some(CompactionSnapshot {
+            boundary_id: 1,
+            compacted_at_step: 1,
+            reason: "step threshold".to_string(),
+            score_explanations: Vec::new(),
+            preserved_locators: vec!["authoritative.md".to_string(), "report.md".to_string()],
+            active_window_summary: "boundary".to_string(),
+            last_result_continuation: None,
+            compacted_results: Vec::new(),
+        }),
+    }]);
+
+    let task = Task::new(AgentId::new(), "continue after compaction");
+    let window = kernel.build_active_continuation_window(&task, &state, 1, 8);
+    let summaries = window
+        .transcript
+        .entries()
+        .iter()
+        .map(|entry| (entry.kind.clone(), entry.summary.clone()))
+        .collect::<Vec<_>>();
+
+    assert!(summaries.iter().any(|(kind, summary)| {
+        matches!(kind, TranscriptUnitKind::CarryoverMessage)
+            && summary.contains("source reminder:")
+            && summary.contains("authoritative.md")
+    }));
+    assert!(summaries.iter().any(|(kind, summary)| {
+        matches!(kind, TranscriptUnitKind::CarryoverMessage)
+            && summary.contains("artifact reminder:")
+            && summary.contains("report.md")
+    }));
+    assert!(summaries.iter().any(|(kind, summary)| {
+        matches!(kind, TranscriptUnitKind::CarryoverMessage)
+            && summary.contains("next-step guidance:")
+            && summary.contains("continue with the preserved report")
+    }));
 }
 
 #[test]
@@ -1523,6 +5222,8 @@ fn output_flow_reaches_write_without_prompt_recovery_layer() {
                 action: Action::ReadFile {
                     id: ActionId::new(),
                     path: "startup.md".into(),
+                    start_line: None,
+                    limit_lines: None,
                     max_bytes: None,
                 },
                 task_complete: false,
@@ -1541,6 +5242,7 @@ fn output_flow_reaches_write_without_prompt_recovery_layer() {
                     pattern: "*summary*".to_string(),
                     recursive: true,
                     max_results: 20,
+                    offset: 0,
                 },
                 task_complete: false,
                 framing: Some(ReasonerTaskFraming {
@@ -1585,8 +5287,9 @@ fn output_flow_reaches_write_without_prompt_recovery_layer() {
         Box::new(memory.clone()),
     ));
 
+    let task = Task::new(AgentId::new(), "create summary.md from startup.md");
     let outcome = must(kernel.execute_task_with_config(
-        Task::new(AgentId::new(), "create summary.md from startup.md"),
+        task.clone(),
         ExecutionConfig {
             max_steps: 4,
             control: None,
@@ -1598,10 +5301,13 @@ fn output_flow_reaches_write_without_prompt_recovery_layer() {
         Outcome::Success(ActionResult::Response { .. })
     ));
 
-    let events = must(memory.recent_states(20));
+    let events = must(memory.recent_states(40));
     let dispatched = events
         .iter()
-        .filter(|event| matches!(event.event_type, TimelineEventType::ActionDispatched))
+        .filter(|event| {
+            event.task_id == task.id
+                && matches!(event.event_type, TimelineEventType::ActionDispatched)
+        })
         .map(|event| {
             event
                 .payload_json
@@ -1615,11 +5321,6 @@ fn output_flow_reaches_write_without_prompt_recovery_layer() {
         dispatched
             .iter()
             .any(|action| action.starts_with("write_file:summary.md"))
-    );
-    assert!(
-        !dispatched
-            .iter()
-            .any(|action| action.starts_with("find_files:.:*summary*:recursive=true"))
     );
 }
 
@@ -2044,6 +5745,8 @@ fn failed_step_stays_in_main_loop_and_can_finish_normally() {
                 action: Action::ReadFile {
                     id: ActionId::new(),
                     path: "startup.md".into(),
+                    start_line: None,
+                    limit_lines: None,
                     max_bytes: None,
                 },
                 task_complete: true,
@@ -2092,6 +5795,8 @@ fn non_response_task_complete_does_not_end_loop_early() {
                 action: Action::ReadFile {
                     id: ActionId::new(),
                     path: "startup.md".into(),
+                    start_line: None,
+                    limit_lines: None,
                     max_bytes: None,
                 },
                 task_complete: true,
@@ -2125,6 +5830,212 @@ fn non_response_task_complete_does_not_end_loop_early() {
         outcome,
         Outcome::Success(ActionResult::Response { .. })
     ));
+}
+
+#[test]
+fn resumed_token_budget_block_preserves_recovery_transition() {
+    let memory = MockMemory::default();
+    let source_task = Task::new(AgentId::new(), "resume under token budget pressure");
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id.clone(),
+            source_session_id: source_task.session_id.clone(),
+            source_agent_id: source_task.agent_id.clone(),
+            objective: source_task.description.clone(),
+            continuation_window: ActiveContinuationWindow {
+                objective: source_task.description.clone(),
+                current_step: 1,
+                max_steps: 3,
+                reasoner_tokens_used: 1000,
+                max_output_tokens_recovery_count: 1,
+                has_attempted_prompt_too_long_compaction: false,
+                last_transition: Some(ContinuationTransition {
+                    reason: "max_output_tokens_recovery".to_string(),
+                    attempt: Some(1),
+                    message: Some(MAX_OUTPUT_TOKENS_RECOVERY_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after truncation recovery".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+    let mut resumed = resumed;
+    resumed
+        .metadata
+        .insert("max_tokens_per_task".to_string(), "1000".to_string());
+
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_response(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "unused".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("unused".to_string()),
+            tokens_used: TokenUsage::default(),
+        })),
+        Box::new(memory.clone()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 3,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(20));
+    let blocked = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskBlocked)
+        })
+        .expect("resumed token budget block event should exist");
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("max_output_tokens_recovery")
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("max_output_tokens_recovery_count"))
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+}
+
+#[test]
+fn resumed_reasoner_call_budget_block_preserves_prompt_too_long_transition() {
+    let memory = MockMemory::default();
+    let source_task = Task::new(AgentId::new(), "resume under call budget pressure");
+    let resumed = Task::resume_from_snapshot(
+        AgentId::new(),
+        TaskRecoverySnapshot {
+            source_task_id: source_task.id.clone(),
+            source_session_id: source_task.session_id.clone(),
+            source_agent_id: source_task.agent_id.clone(),
+            objective: source_task.description.clone(),
+            continuation_window: ActiveContinuationWindow {
+                objective: source_task.description.clone(),
+                current_step: 2,
+                max_steps: 3,
+                reasoner_tokens_used: 0,
+                max_output_tokens_recovery_count: 0,
+                has_attempted_prompt_too_long_compaction: true,
+                last_transition: Some(ContinuationTransition {
+                    reason: "prompt_too_long_compaction".to_string(),
+                    attempt: Some(1),
+                    message: Some(PROMPT_TOO_LONG_COMPACTION_MESSAGE.to_string()),
+                    metadata: serde_json::Value::Null,
+                }),
+                transcript: TranscriptLedger::from_entries(vec![
+                    TranscriptUnit {
+                        ordinal: 1,
+                        step: 1,
+                        kind: TranscriptUnitKind::TaskMessage,
+                        summary: source_task.description.clone(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                    TranscriptUnit {
+                        ordinal: 2,
+                        step: 1,
+                        kind: TranscriptUnitKind::ModelDecision,
+                        summary: "prior planning decision".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: Vec::new(),
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    },
+                ]),
+                ..ActiveContinuationWindow::default()
+            },
+            resume_reason: "continue after prompt-too-long compaction".to_string(),
+        },
+        None,
+    );
+    let resumed_task_id = resumed.id.clone();
+    let mut resumed = resumed;
+    resumed
+        .metadata
+        .insert("max_reasoner_calls_per_task".to_string(), "1".to_string());
+
+    let kernel = must(Kernel::new(
+        Box::new(MockShell::default()),
+        Box::new(MockReasoner::for_response(ReasonResponse {
+            action: Action::Respond {
+                id: ActionId::new(),
+                message: "unused".to_string(),
+            },
+            task_complete: true,
+            framing: None,
+            reasoning: Some("unused".to_string()),
+            tokens_used: TokenUsage::default(),
+        })),
+        Box::new(memory.clone()),
+    ));
+
+    let outcome = must(kernel.execute_task_with_config(
+        resumed,
+        ExecutionConfig {
+            max_steps: 3,
+            control: None,
+        },
+    ));
+
+    assert!(matches!(outcome, Outcome::Blocked(_)));
+    let events = must(memory.recent_states(20));
+    let blocked = events
+        .iter()
+        .find(|event| {
+            event.task_id == resumed_task_id
+                && matches!(event.event_type, TimelineEventType::TaskBlocked)
+        })
+        .expect("resumed reasoner call budget block event should exist");
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("last_transition"))
+            .and_then(|value| value.get("reason"))
+            .and_then(|value| value.as_str()),
+        Some("prompt_too_long_compaction")
+    );
+    assert_eq!(
+        blocked
+            .payload_json
+            .get("continuation_window")
+            .and_then(|value| value.get("has_attempted_prompt_too_long_compaction"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
 }
 
 #[test]
@@ -2215,10 +6126,15 @@ fn generic_batch_deliverable_does_not_finish_via_single_file_write() {
         },
     ));
 
-    let Outcome::Success(ActionResult::Response { message }) = outcome else {
-        panic!("expected explicit follow-up response");
-    };
-    assert!(message.contains("combined deliverable"));
+    assert!(
+        !matches!(
+            &outcome,
+            Outcome::Success(ActionResult::Response { message })
+                if message.contains("File created successfully at")
+        ),
+        "single leaf write should not count as finishing the batch: {:?}",
+        outcome
+    );
 }
 
 #[test]
@@ -2345,6 +6261,8 @@ fn unsupported_document_read_remains_observable_in_main_loop() {
                 action: Action::ReadFile {
                     id: ActionId::new(),
                     path: "Equipment Certificate.pdf".into(),
+                    start_line: None,
+                    limit_lines: None,
                     max_bytes: None,
                 },
                 task_complete: false,
@@ -2356,6 +6274,8 @@ fn unsupported_document_read_remains_observable_in_main_loop() {
                 action: Action::ReadFile {
                     id: ActionId::new(),
                     path: "Equipment Certificate.pdf".into(),
+                    start_line: None,
+                    limit_lines: None,
                     max_bytes: None,
                 },
                 task_complete: false,

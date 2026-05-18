@@ -22,6 +22,7 @@ pub struct ChatSession {
     debug_events: Arc<AtomicBool>,
     input_rx: Receiver<String>,
     prompt_rx: Receiver<PromptRequestEvent>,
+    last_follow_up_seed: Option<TaskFollowUpSeed>,
 }
 
 impl ChatSession {
@@ -35,22 +36,23 @@ impl ChatSession {
             ScopedShell::new(CliShell::new(), authority.clone()),
             PromptBridge::new(prompt_tx),
         ));
+        let agent =
+            AgentController::new_with_streaming_and_shell(shell, authority, debug_events.clone())?;
+        let inspector = InspectController::new()?;
+        let last_follow_up_seed = inspector.latest_follow_up_seed()?;
         Ok(Self {
-            agent: AgentController::new_with_streaming_and_shell(
-                shell,
-                authority,
-                debug_events.clone(),
-            )?,
-            inspector: InspectController::new()?,
+            agent,
+            inspector,
             debug_events,
             input_rx,
             prompt_rx,
+            last_follow_up_seed,
         })
     }
 
     pub fn run(&mut self) -> Result<()> {
         println!(
-            "Retina chat is live. Enter a task, or type /help, /exit, /timeline, /memory <query>, /debug, /resume-last, or /resume <task_id>. Type /s while a task is running to stop it. Use /guide <text> to steer the next step."
+            "Retina chat is live. Enter a task, or type /help, /exit, /new, /timeline, /memory <query>, /debug, /resume-last, or /resume <task_id>. Type /s while a task is running to stop it. Use /guide <text> to steer the next step."
         );
 
         let mut active_task: Option<RuntimeTaskHandle> = None;
@@ -111,6 +113,15 @@ impl ChatSession {
 
         match line {
             "/exit" | "/quit" => return Ok(true),
+            "/new" => {
+                if active_task.is_some() {
+                    println!("A task is already running. Stop it before starting a fresh thread.");
+                    return Ok(false);
+                }
+                self.last_follow_up_seed = None;
+                println!("Cleared follow-up continuity. The next task will start fresh.");
+                return Ok(false);
+            }
             "/help" => {
                 self.print_help();
                 return Ok(false);
@@ -169,13 +180,24 @@ impl ChatSession {
             return Ok(false);
         }
 
-        let task = self.agent.spawn_task(
-            line.to_string(),
-            ExecutionConfig {
-                max_steps: 50,
-                control: None,
-            },
-        );
+        let task = if let Some(seed) = self.last_follow_up_seed.clone() {
+            self.agent.spawn_follow_up_task(
+                seed,
+                line.to_string(),
+                ExecutionConfig {
+                    max_steps: 50,
+                    control: None,
+                },
+            )
+        } else {
+            self.agent.spawn_task(
+                line.to_string(),
+                ExecutionConfig {
+                    max_steps: 50,
+                    control: None,
+                },
+            )
+        };
         *active_task = Some(task);
         Ok(false)
     }
@@ -316,6 +338,7 @@ impl ChatSession {
 
         match task.try_recv() {
             Ok(Ok(outcome)) => {
+                self.last_follow_up_seed = self.inspector.follow_up_seed_for_task(&task.task.id)?;
                 match outcome {
                     Outcome::Success(result) => println!("{}", render_action_result(&result)),
                     Outcome::Failure(reason) => println!("Task failed: {reason}"),
@@ -325,12 +348,14 @@ impl ChatSession {
                 Ok(true)
             }
             Ok(Err(error)) => {
+                self.last_follow_up_seed = self.inspector.follow_up_seed_for_task(&task.task.id)?;
                 println!("Task error: {error}");
                 *active_task = None;
                 Ok(true)
             }
             Err(TryRecvError::Empty) => Ok(false),
             Err(TryRecvError::Disconnected) => {
+                self.last_follow_up_seed = self.inspector.follow_up_seed_for_task(&task.task.id)?;
                 println!("Task error: execution channel disconnected.");
                 *active_task = None;
                 Ok(true)
@@ -342,6 +367,7 @@ impl ChatSession {
         println!("Commands:");
         println!("  /help                Show this help");
         println!("  /exit                Exit chat");
+        println!("  /new                 Clear follow-up continuity and start fresh");
         println!("  /timeline            Show recent timeline events");
         println!("  /memory <query>      Show recalled memory");
         println!("  /debug               Toggle verbose internal event output");

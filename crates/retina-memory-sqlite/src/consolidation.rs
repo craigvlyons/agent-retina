@@ -212,6 +212,8 @@ mod tests {
         let action = Action::ReadFile {
             id: ActionId::new(),
             path: "startup.md".into(),
+            start_line: None,
+            limit_lines: None,
             max_bytes: None,
         };
         let experiences = (0..3)

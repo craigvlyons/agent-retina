@@ -1,12 +1,286 @@
 use crate::{
-    Action, AgentId, ArtifactReference, CompactedResultReference, CompactionSnapshot,
-    NextStepGuidance, RecentActionStatus, RecentActionSummary, StoredResultLedger, TaskGoal,
-    TaskKind, TaskProgress, TaskState, TranscriptLedger, TranscriptUnitKind, WorkingSource,
+    Action, ActionResult, AgentId, ArtifactReference, CompactedResultReference, CompactionSnapshot,
+    NextStepGuidance, RecentActionStatus, RecentActionSummary, StoredResultLedger,
+    StoredResultReference, TaskGoal, TaskKind, TaskProgress, TaskState, TextSearchOutputMode,
+    TranscriptLedger, TranscriptUnitKind, WorkingSource,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContinuationTransition {
+    pub reason: String,
+    #[serde(default)]
+    pub attempt: Option<u64>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub metadata: Value,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CachedLineEndingStyle {
+    #[default]
+    Lf,
+    Crlf,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CachedFileVersionSnapshot {
+    pub exists: bool,
+    pub size: Option<u64>,
+    pub modified_at: Option<DateTime<Utc>>,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CachedFileReadState {
+    pub path: PathBuf,
+    pub content: String,
+    pub start_line: usize,
+    pub line_count: usize,
+    pub total_lines: usize,
+    pub total_bytes: usize,
+    pub read_bytes: usize,
+    pub was_partial: bool,
+    pub read_at: Option<DateTime<Utc>>,
+    pub version: CachedFileVersionSnapshot,
+    pub line_endings: CachedLineEndingStyle,
+}
+
+impl CachedFileReadState {
+    pub fn from_action_result(result: &ActionResult) -> Option<Self> {
+        match result {
+            ActionResult::FileRead {
+                path,
+                content,
+                truncated,
+                start_line,
+                line_count,
+                total_lines,
+                total_bytes,
+                read_bytes,
+            } => Some(Self {
+                path: path.clone(),
+                content: content.clone(),
+                start_line: *start_line,
+                line_count: *line_count,
+                total_lines: *total_lines,
+                total_bytes: *total_bytes,
+                read_bytes: *read_bytes,
+                was_partial: *truncated || *start_line > 1 || *line_count < *total_lines,
+                read_at: Some(Utc::now()),
+                version: CachedFileVersionSnapshot {
+                    exists: true,
+                    size: Some(*total_bytes as u64),
+                    modified_at: None,
+                    content_hash: None,
+                },
+                line_endings: if content.contains("\r\n") {
+                    CachedLineEndingStyle::Crlf
+                } else {
+                    CachedLineEndingStyle::Lf
+                },
+            }),
+            ActionResult::FileWrite {
+                path,
+                bytes_written,
+                artifact,
+                ..
+            } => {
+                let content = artifact.final_content.clone();
+                let line_count = if content.is_empty() {
+                    0
+                } else {
+                    content.lines().count()
+                };
+                Some(Self {
+                    path: path.clone(),
+                    content: content.clone(),
+                    start_line: 1,
+                    line_count,
+                    total_lines: line_count,
+                    total_bytes: *bytes_written,
+                    read_bytes: *bytes_written,
+                    was_partial: false,
+                    read_at: Some(Utc::now()),
+                    version: CachedFileVersionSnapshot {
+                        exists: true,
+                        size: Some(*bytes_written as u64),
+                        modified_at: None,
+                        content_hash: None,
+                    },
+                    line_endings: if content.contains("\r\n") {
+                        CachedLineEndingStyle::Crlf
+                    } else {
+                        CachedLineEndingStyle::Lf
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CachedSearchState {
+    pub kind: String,
+    pub root: PathBuf,
+    pub query: String,
+    pub applied_offset: usize,
+    pub truncated: bool,
+    pub result_count: usize,
+    pub output_mode: Option<TextSearchOutputMode>,
+    pub glob: Option<String>,
+    pub case_insensitive: Option<bool>,
+    pub samples: Vec<String>,
+    pub recorded_at: Option<DateTime<Utc>>,
+}
+
+impl CachedSearchState {
+    pub fn from_action_result(result: &ActionResult) -> Option<Self> {
+        match result {
+            ActionResult::FileMatches {
+                root,
+                pattern,
+                matches,
+                truncated,
+                applied_offset,
+            } => Some(Self {
+                kind: "find_files".to_string(),
+                root: root.clone(),
+                query: pattern.clone(),
+                applied_offset: *applied_offset,
+                truncated: *truncated,
+                result_count: matches.len(),
+                output_mode: None,
+                glob: None,
+                case_insensitive: None,
+                samples: matches
+                    .iter()
+                    .take(6)
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                recorded_at: Some(Utc::now()),
+            }),
+            ActionResult::TextSearch {
+                root,
+                query,
+                output_mode,
+                matches,
+                filenames,
+                num_files: _,
+                num_matches,
+                truncated,
+                applied_offset,
+                glob,
+                case_insensitive,
+                ..
+            } => {
+                let samples = match output_mode {
+                    TextSearchOutputMode::Content => matches
+                        .iter()
+                        .take(6)
+                        .map(|item| format!("{}:{}", item.path.display(), item.line_number))
+                        .collect(),
+                    TextSearchOutputMode::FilesWithMatches => filenames
+                        .iter()
+                        .take(6)
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                    TextSearchOutputMode::Count => filenames
+                        .iter()
+                        .take(6)
+                        .map(|path| path.display().to_string())
+                        .collect(),
+                };
+                Some(Self {
+                    kind: "search_text".to_string(),
+                    root: root.clone(),
+                    query: query.clone(),
+                    applied_offset: *applied_offset,
+                    truncated: *truncated,
+                    result_count: match output_mode {
+                        TextSearchOutputMode::Content => matches.len(),
+                        TextSearchOutputMode::FilesWithMatches => filenames.len(),
+                        TextSearchOutputMode::Count => *num_matches,
+                    },
+                    output_mode: Some(output_mode.clone()),
+                    glob: glob.clone(),
+                    case_insensitive: Some(*case_insensitive),
+                    samples,
+                    recorded_at: Some(Utc::now()),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn cache_key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.kind,
+            self.root.display(),
+            self.query,
+            self.applied_offset,
+            self.glob.as_deref().unwrap_or_default(),
+            self.output_mode
+                .as_ref()
+                .map(|mode| match mode {
+                    TextSearchOutputMode::Content => "content",
+                    TextSearchOutputMode::FilesWithMatches => "files_with_matches",
+                    TextSearchOutputMode::Count => "count",
+                })
+                .unwrap_or(""),
+        )
+    }
+
+    pub fn render(&self) -> String {
+        let mode = self
+            .output_mode
+            .as_ref()
+            .map(|mode| match mode {
+                TextSearchOutputMode::Content => " mode=content",
+                TextSearchOutputMode::FilesWithMatches => " mode=files_with_matches",
+                TextSearchOutputMode::Count => " mode=count",
+            })
+            .unwrap_or("");
+        let glob = self
+            .glob
+            .as_deref()
+            .map(|value| format!(" glob={value}"))
+            .unwrap_or_default();
+        let ci = self
+            .case_insensitive
+            .map(|value| format!(" case_insensitive={value}"))
+            .unwrap_or_default();
+        let truncated = if self.truncated {
+            " truncated=true"
+        } else {
+            ""
+        };
+        let samples = if self.samples.is_empty() {
+            String::new()
+        } else {
+            format!(" samples={}", self.samples.join(", "))
+        };
+        format!(
+            "- {} root={} query=\"{}\" offset={} count={}{}{}{}{}{}",
+            self.kind,
+            self.root.display(),
+            self.query,
+            self.applied_offset,
+            self.result_count,
+            mode,
+            glob,
+            ci,
+            truncated,
+            samples
+        )
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AssembledContext {
@@ -30,18 +304,22 @@ impl AssembledContext {
             .map(ToolDescriptor::render)
             .collect::<Vec<_>>()
             .join("\n");
-        let operator_guidance = self
-            .operator_guidance
-            .clone()
-            .unwrap_or_else(|| "none".to_string());
-        format!(
-            "Identity:\n{}\n\nTask:\n{}\n\nActive continuation window:\n{}\n\nTools:\n{}\n\nOperator guidance:\n{}",
-            self.identity,
-            self.task,
-            self.continuation_window.render(),
-            tools,
-            operator_guidance,
-        )
+        let mut sections = vec![
+            format!("Identity:\n{}", self.identity),
+            format!("Task:\n{}", self.task),
+        ];
+        if let Some(recent_context) = self.recent_context.as_ref() {
+            sections.push(format!("Recent context:\n{}", recent_context.render()));
+        }
+        sections.push(format!(
+            "Active continuation window:\n{}",
+            self.continuation_window.render()
+        ));
+        sections.push(format!("Tools:\n{}", tools));
+        if let Some(operator_guidance) = self.operator_guidance.as_ref() {
+            sections.push(format!("Operator guidance:\n{}", operator_guidance));
+        }
+        sections.join("\n\n")
     }
 }
 
@@ -51,8 +329,20 @@ pub struct ActiveContinuationWindow {
     pub objective: String,
     pub current_step: usize,
     pub max_steps: usize,
+    pub reasoner_tokens_used: u32,
+    #[serde(default)]
+    pub max_output_tokens_recovery_count: usize,
+    #[serde(default)]
+    pub has_attempted_prompt_too_long_compaction: bool,
+    #[serde(default)]
+    pub last_transition: Option<ContinuationTransition>,
+    #[serde(default)]
+    pub read_state_cache: Vec<CachedFileReadState>,
+    #[serde(default)]
+    pub search_state_cache: Vec<CachedSearchState>,
     pub transcript: TranscriptLedger,
     pub stored_results: StoredResultLedger,
+    pub content_replacements: ContentReplacementState,
     pub reannounced_sources: Vec<WorkingSource>,
     pub reannounced_artifacts: Vec<ArtifactReference>,
     pub next_step_guidance: Option<NextStepGuidance>,
@@ -110,79 +400,212 @@ impl ActiveContinuationWindow {
     }
 
     pub fn render(&self) -> String {
-        let transcript_units = if self.transcript.is_empty() {
+        let replacement_by_id = self
+            .content_replacements
+            .records
+            .iter()
+            .map(|record| (record.replacement_id.as_str(), record))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let transcript_lines = self
+            .transcript
+            .entries()
+            .iter()
+            .map(|item| {
+                item.result_ref_id
+                    .as_deref()
+                    .and_then(|id| replacement_by_id.get(id).copied())
+                    .map(|record| item.render_with_override(&record.replacement_text))
+                    .unwrap_or_else(|| item.render())
+            })
+            .collect::<Vec<_>>();
+
+        let transcript_units = if transcript_lines.is_empty() {
             "none".to_string()
         } else {
-            self.transcript
-                .entries()
+            transcript_lines.join("\n")
+        };
+        let search_state = if self.search_state_cache.is_empty() {
+            "none".to_string()
+        } else {
+            self.search_state_cache
                 .iter()
-                .map(|item| item.render())
+                .map(CachedSearchState::render)
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let stored_result_refs = if self.stored_results.is_empty() {
+        let sections = vec![
+            format!("- objective: {}", self.objective),
+            format!("- step: {} / {}", self.current_step, self.max_steps),
+            format!(
+                "- read_state_cache_entries: {}",
+                self.read_state_cache.len()
+            ),
+            format!(
+                "- search_state_cache_entries: {}",
+                self.search_state_cache.len()
+            ),
+            format!("- search_state_cache:\n{}", search_state),
+            format!("- transcript_units:\n{}", transcript_units),
+        ];
+
+        sections.join("\n")
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContentReplacementState {
+    pub records: Vec<ContentReplacementRecord>,
+}
+
+impl ContentReplacementState {
+    pub fn from_continuation(
+        stored_results: &StoredResultLedger,
+        compacted_results: &[CompactedResultReference],
+    ) -> Self {
+        let mut state = Self::default();
+        state.extend_from_continuation(stored_results, compacted_results);
+        state
+    }
+
+    pub fn extend_from_continuation(
+        &mut self,
+        stored_results: &StoredResultLedger,
+        compacted_results: &[CompactedResultReference],
+    ) {
+        for reference in stored_results.entries() {
+            self.record_stored_result(reference);
+        }
+        for reference in compacted_results {
+            self.record_compacted_result(reference);
+        }
+    }
+
+    pub fn record_stored_result(
+        &mut self,
+        reference: &StoredResultReference,
+    ) -> Option<ContentReplacementRecord> {
+        self.push_record(ContentReplacementRecord::for_stored_result(reference))
+    }
+
+    pub fn record_compacted_result(
+        &mut self,
+        reference: &CompactedResultReference,
+    ) -> Option<ContentReplacementRecord> {
+        self.push_record(ContentReplacementRecord::for_compacted_result(reference))
+    }
+
+    pub fn render(&self) -> String {
+        if self.records.is_empty() {
             "none".to_string()
         } else {
-            self.stored_results
-                .entries()
+            self.records
                 .iter()
-                .map(|item| item.render())
+                .map(ContentReplacementRecord::render)
                 .collect::<Vec<_>>()
                 .join("\n")
-        };
-        let reannounced_sources = if self.reannounced_sources.is_empty() {
-            "none".to_string()
-        } else {
-            self.reannounced_sources
-                .iter()
-                .map(WorkingSource::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let reannounced_artifacts = if self.reannounced_artifacts.is_empty() {
-            "none".to_string()
-        } else {
-            self.reannounced_artifacts
-                .iter()
-                .map(ArtifactReference::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let next_step_guidance = self
-            .next_step_guidance
+        }
+    }
+
+    fn push_record(
+        &mut self,
+        record: ContentReplacementRecord,
+    ) -> Option<ContentReplacementRecord> {
+        const MAX_REPLACEMENT_RECORDS: usize = 10;
+        if self
+            .records
+            .iter()
+            .any(|existing| existing.replacement_id == record.replacement_id)
+        {
+            return None;
+        }
+        self.records.push(record.clone());
+        if self.records.len() > MAX_REPLACEMENT_RECORDS {
+            let excess = self.records.len() - MAX_REPLACEMENT_RECORDS;
+            self.records.drain(0..excess);
+        }
+        Some(record)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContentReplacementRecord {
+    pub replacement_id: String,
+    pub source_kind: String,
+    pub result_type: String,
+    pub locator: Option<String>,
+    pub persisted_path: Option<String>,
+    pub replacement_text: String,
+}
+
+impl ContentReplacementRecord {
+    pub fn for_stored_result(reference: &StoredResultReference) -> Self {
+        Self {
+            replacement_id: reference.result_id.clone(),
+            source_kind: "stored_result".to_string(),
+            result_type: reference.result_type.clone(),
+            locator: reference.primary_locator.clone(),
+            persisted_path: Some(reference.persisted_path.clone()),
+            replacement_text: format!(
+                "[stored-result {}] type={} preview=\"{}\"{} persisted={}",
+                reference.result_id,
+                reference.result_type,
+                reference.preview_excerpt,
+                reference
+                    .primary_locator
+                    .as_ref()
+                    .map(|locator| format!(" locator={locator}"))
+                    .unwrap_or_default(),
+                reference.persisted_path
+            ),
+        }
+    }
+
+    pub fn for_compacted_result(reference: &CompactedResultReference) -> Self {
+        Self {
+            replacement_id: format!("boundary-{}", reference.boundary_id),
+            source_kind: "compacted_result".to_string(),
+            result_type: reference.result_type.clone(),
+            locator: reference.locator.clone(),
+            persisted_path: reference.persisted_path.clone(),
+            replacement_text: format!(
+                "[compacted-result boundary={}] type={} preview=\"{}\"{}{}",
+                reference.boundary_id,
+                reference.result_type,
+                reference.preview_excerpt,
+                reference
+                    .locator
+                    .as_ref()
+                    .map(|locator| format!(" locator={locator}"))
+                    .unwrap_or_default(),
+                reference
+                    .persisted_path
+                    .as_ref()
+                    .map(|path| format!(" persisted={path}"))
+                    .unwrap_or_default()
+            ),
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let locator = self
+            .locator
             .as_ref()
-            .map(NextStepGuidance::render)
-            .unwrap_or_else(|| "none".to_string());
-        let compaction_boundaries = if self.compaction_boundaries.is_empty() {
-            "none".to_string()
-        } else {
-            self.compaction_boundaries
-                .iter()
-                .map(CompactionSnapshot::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let reannounced_compacted_results = if self.reannounced_compacted_results.is_empty() {
-            "none".to_string()
-        } else {
-            self.reannounced_compacted_results
-                .iter()
-                .map(CompactedResultReference::render)
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
+            .map(|value| format!(" locator={value}"))
+            .unwrap_or_default();
+        let persisted_path = self
+            .persisted_path
+            .as_ref()
+            .map(|value| format!(" persisted={value}"))
+            .unwrap_or_default();
         format!(
-            "- objective: {}\n- step: {} / {}\n- transcript_units:\n{}\n- stored_result_refs:\n{}\n- reannounced_sources:\n{}\n- reannounced_artifacts:\n{}\n- next_step_guidance:\n{}\n- compaction_boundaries:\n{}\n- reannounced_compacted_results:\n{}",
-            self.objective,
-            self.current_step,
-            self.max_steps,
-            transcript_units,
-            stored_result_refs,
-            reannounced_sources,
-            reannounced_artifacts,
-            next_step_guidance,
-            compaction_boundaries,
-            reannounced_compacted_results
+            "- {} [{}:{}]{}{} text=\"{}\"",
+            self.replacement_id,
+            self.source_kind,
+            self.result_type,
+            locator,
+            persisted_path,
+            self.replacement_text
         )
     }
 }
@@ -362,6 +785,7 @@ fn push_unique_fact(facts: &mut Vec<String>, fact: String) {
 pub struct RecentContext {
     pub prior_objective: String,
     pub prior_answer_summary: Option<String>,
+    pub sticky_constraints: Vec<String>,
     pub sources: Vec<WorkingSource>,
     pub artifacts: Vec<ArtifactReference>,
 }
@@ -372,6 +796,15 @@ impl RecentContext {
             .prior_answer_summary
             .clone()
             .unwrap_or_else(|| "none".to_string());
+        let sticky_constraints = if self.sticky_constraints.is_empty() {
+            "  - none".to_string()
+        } else {
+            self.sticky_constraints
+                .iter()
+                .map(|item| format!("  - {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         let sources = if self.sources.is_empty() {
             "  - none".to_string()
         } else {
@@ -393,8 +826,8 @@ impl RecentContext {
                 .join("\n")
         };
         format!(
-            "- prior_objective: {}\n- prior_answer_summary: {}\n- sources:\n{}\n- artifacts:\n{}",
-            self.prior_objective, answer, sources, artifacts
+            "- prior_objective: {}\n- prior_answer_summary: {}\n- sticky_constraints:\n{}\n- sources:\n{}\n- artifacts:\n{}",
+            self.prior_objective, answer, sticky_constraints, sources, artifacts
         )
     }
 }
@@ -547,6 +980,17 @@ pub struct ReasonResponse {
     pub framing: Option<ReasonerTaskFraming>,
     pub reasoning: Option<String>,
     pub tokens_used: TokenUsage,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ReasonerTransition {
+    pub reason: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub attempt: Option<u64>,
+    #[serde(default)]
+    pub metadata: Value,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

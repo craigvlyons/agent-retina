@@ -2,6 +2,7 @@ use super::*;
 use crate::state_helpers::{
     looks_binary, normalize_requested_page_range, prefers_document_extraction,
 };
+use std::io::BufRead;
 
 const DEFAULT_MAX_STRUCTURED_ROWS: usize = 25;
 
@@ -12,6 +13,33 @@ pub(crate) struct StructuredDataIngestion {
     pub(crate) total_rows: usize,
     pub(crate) truncated: bool,
     pub(crate) extraction_method: String,
+}
+
+pub(crate) struct TextReadResult {
+    pub(crate) content: String,
+    pub(crate) truncated: bool,
+    pub(crate) start_line: usize,
+    pub(crate) line_count: usize,
+    pub(crate) total_lines: usize,
+    pub(crate) total_bytes: usize,
+    pub(crate) read_bytes: usize,
+    pub(crate) was_partial: bool,
+}
+
+pub(crate) struct FileMatchResult {
+    pub(crate) matches: Vec<PathBuf>,
+    pub(crate) truncated: bool,
+    pub(crate) applied_offset: usize,
+}
+
+pub(crate) struct TextSearchResult {
+    pub(crate) matches: Vec<SearchMatch>,
+    pub(crate) content: Option<String>,
+    pub(crate) filenames: Vec<PathBuf>,
+    pub(crate) num_files: usize,
+    pub(crate) num_matches: usize,
+    pub(crate) truncated: bool,
+    pub(crate) applied_offset: usize,
 }
 
 impl CliShell {
@@ -102,18 +130,28 @@ impl CliShell {
         pattern: &str,
         recursive: bool,
         max_results: usize,
-    ) -> Result<Vec<PathBuf>> {
+        offset: usize,
+    ) -> Result<FileMatchResult> {
         let root = Self::resolve_path(root)?;
         let mut matches = Vec::new();
         Self::collect_matching_files(
             &root,
             &pattern.to_lowercase(),
             recursive,
-            max_results.max(1),
+            offset.saturating_add(max_results.max(1)).saturating_add(1),
             &mut matches,
         )?;
         matches.sort();
-        Ok(matches)
+        let applied_offset = offset.min(matches.len());
+        let limit = max_results.max(1);
+        let remaining = &matches[applied_offset..];
+        let truncated = remaining.len() > limit;
+        let matches = remaining.iter().take(limit).cloned().collect::<Vec<_>>();
+        Ok(FileMatchResult {
+            matches,
+            truncated,
+            applied_offset,
+        })
     }
 
     fn collect_matching_files(
@@ -159,21 +197,76 @@ impl CliShell {
         root: &Path,
         query: &str,
         max_results: usize,
-    ) -> Result<Vec<SearchMatch>> {
+        offset: usize,
+        glob: Option<&str>,
+        case_insensitive: bool,
+        output_mode: &TextSearchOutputMode,
+    ) -> Result<TextSearchResult> {
         let root = Self::resolve_path(root)?;
+        if let Some(result) = Self::search_text_with_ripgrep(
+            &root,
+            query,
+            max_results,
+            offset,
+            glob,
+            case_insensitive,
+            output_mode,
+        )? {
+            return Ok(result);
+        }
+        if !matches!(output_mode, TextSearchOutputMode::Content) {
+            return Err(KernelError::Unsupported(
+                "search_text files_with_matches/count fallback requires ripgrep".to_string(),
+            ));
+        }
         let mut matches = Vec::new();
         Self::collect_text_matches(
             &root,
-            &query.to_lowercase(),
-            max_results.max(1),
+            query,
+            glob.map(|value| value.to_lowercase()),
+            case_insensitive,
+            offset.saturating_add(max_results.max(1)).saturating_add(1),
             &mut matches,
         )?;
-        Ok(matches)
+        matches.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.line_number.cmp(&right.line_number))
+        });
+        let applied_offset = offset.min(matches.len());
+        let limit = max_results.max(1);
+        let remaining = &matches[applied_offset..];
+        let truncated = remaining.len() > limit;
+        let matches = remaining.iter().take(limit).cloned().collect::<Vec<_>>();
+        let content = if matches.is_empty() {
+            None
+        } else {
+            Some(
+                matches
+                    .iter()
+                    .map(|item| {
+                        format!("{}:{}:{}", item.path.display(), item.line_number, item.line)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        };
+        Ok(TextSearchResult {
+            num_matches: matches.len(),
+            matches,
+            content,
+            filenames: Vec::new(),
+            num_files: 0,
+            truncated,
+            applied_offset,
+        })
     }
 
     fn collect_text_matches(
         root: &Path,
         query: &str,
+        glob: Option<String>,
+        case_insensitive: bool,
         max_results: usize,
         matches: &mut Vec<SearchMatch>,
     ) -> Result<()> {
@@ -188,19 +281,47 @@ impl CliShell {
             let path = item.path();
             let metadata = item.metadata()?;
             if metadata.is_dir() {
-                Self::collect_text_matches(&path, query, max_results, matches)?;
+                Self::collect_text_matches(
+                    &path,
+                    query,
+                    glob.clone(),
+                    case_insensitive,
+                    max_results,
+                    matches,
+                )?;
                 continue;
             }
             if metadata.len() > 512 * 1024 {
                 continue;
+            }
+            if let Some(pattern) = glob.as_ref() {
+                let name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                let path_text = path.display().to_string().to_lowercase();
+                if !path_matches_pattern(&name, &path_text, pattern) {
+                    continue;
+                }
             }
             let bytes = fs::read(&path)?;
             if bytes.contains(&0) {
                 continue;
             }
             let content = String::from_utf8_lossy(&bytes);
+            let query_cmp = if case_insensitive {
+                query.to_lowercase()
+            } else {
+                query.to_string()
+            };
             for (index, line) in content.lines().enumerate() {
-                if line.to_lowercase().contains(query) {
+                let haystack = if case_insensitive {
+                    line.to_lowercase()
+                } else {
+                    line.to_string()
+                };
+                if haystack.contains(&query_cmp) {
                     matches.push(SearchMatch {
                         path: path.clone(),
                         line_number: index + 1,
@@ -215,7 +336,187 @@ impl CliShell {
         Ok(())
     }
 
-    pub(crate) fn read_file(path: &Path, max_bytes: Option<usize>) -> Result<(String, bool)> {
+    fn search_text_with_ripgrep(
+        root: &Path,
+        query: &str,
+        max_results: usize,
+        offset: usize,
+        glob: Option<&str>,
+        case_insensitive: bool,
+        output_mode: &TextSearchOutputMode,
+    ) -> Result<Option<TextSearchResult>> {
+        let mut command = std::process::Command::new("rg");
+        command.arg("--color").arg("never");
+        match output_mode {
+            TextSearchOutputMode::Content => {
+                command.arg("-n").arg("--no-heading");
+            }
+            TextSearchOutputMode::FilesWithMatches => {
+                command.arg("-l");
+            }
+            TextSearchOutputMode::Count => {
+                command.arg("-c");
+            }
+        }
+        if case_insensitive {
+            command.arg("-i");
+        }
+        if let Some(pattern) = glob {
+            command.arg("--glob").arg(pattern);
+        }
+        command.arg(query).arg(root);
+
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(KernelError::Execution(format!(
+                    "failed to invoke ripgrep: {error}"
+                )));
+            }
+        };
+
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(KernelError::Execution(format!(
+                "ripgrep failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let limit = max_results.max(1);
+        let capture_limit = offset.saturating_add(limit).saturating_add(1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        match output_mode {
+            TextSearchOutputMode::Content => {
+                let mut matches = Vec::new();
+                for line in stdout.lines() {
+                    if matches.len() >= capture_limit {
+                        break;
+                    }
+                    let mut parts = line.splitn(3, ':');
+                    let Some(path) = parts.next() else {
+                        continue;
+                    };
+                    let Some(line_number) =
+                        parts.next().and_then(|value| value.parse::<usize>().ok())
+                    else {
+                        continue;
+                    };
+                    let Some(content) = parts.next() else {
+                        continue;
+                    };
+                    matches.push(SearchMatch {
+                        path: PathBuf::from(path),
+                        line_number,
+                        line: content.to_string(),
+                    });
+                }
+
+                let applied_offset = offset.min(matches.len());
+                let remaining = &matches[applied_offset..];
+                let truncated = remaining.len() > limit;
+                let matches = remaining.iter().take(limit).cloned().collect::<Vec<_>>();
+                let content = if matches.is_empty() {
+                    None
+                } else {
+                    Some(
+                        matches
+                            .iter()
+                            .map(|item| {
+                                format!(
+                                    "{}:{}:{}",
+                                    item.path.display(),
+                                    item.line_number,
+                                    item.line
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                };
+                Ok(Some(TextSearchResult {
+                    num_matches: matches.len(),
+                    matches,
+                    content,
+                    filenames: Vec::new(),
+                    num_files: 0,
+                    truncated,
+                    applied_offset,
+                }))
+            }
+            TextSearchOutputMode::FilesWithMatches => {
+                let mut filenames = Vec::new();
+                for line in stdout.lines() {
+                    if filenames.len() >= capture_limit {
+                        break;
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    filenames.push(PathBuf::from(trimmed));
+                }
+                let applied_offset = offset.min(filenames.len());
+                let remaining = &filenames[applied_offset..];
+                let truncated = remaining.len() > limit;
+                let filenames = remaining.iter().take(limit).cloned().collect::<Vec<_>>();
+                let num_files = filenames.len();
+                Ok(Some(TextSearchResult {
+                    matches: Vec::new(),
+                    content: None,
+                    filenames,
+                    num_files,
+                    num_matches: 0,
+                    truncated,
+                    applied_offset,
+                }))
+            }
+            TextSearchOutputMode::Count => {
+                let mut lines = Vec::new();
+                let mut num_files = 0usize;
+                let mut num_matches = 0usize;
+                for line in stdout.lines() {
+                    if lines.len() >= capture_limit {
+                        break;
+                    }
+                    let Some((path, count_text)) = line.rsplit_once(':') else {
+                        continue;
+                    };
+                    let Ok(count) = count_text.parse::<usize>() else {
+                        continue;
+                    };
+                    lines.push(format!("{path}:{count}"));
+                    num_files += 1;
+                    num_matches += count;
+                }
+                let applied_offset = offset.min(lines.len());
+                let remaining = &lines[applied_offset..];
+                let truncated = remaining.len() > limit;
+                let selected = remaining.iter().take(limit).cloned().collect::<Vec<_>>();
+                let content = if selected.is_empty() {
+                    None
+                } else {
+                    Some(selected.join("\n"))
+                };
+                Ok(Some(TextSearchResult {
+                    matches: Vec::new(),
+                    content,
+                    filenames: Vec::new(),
+                    num_files,
+                    num_matches,
+                    truncated,
+                    applied_offset,
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn read_file(
+        path: &Path,
+        start_line: Option<usize>,
+        limit_lines: Option<usize>,
+        max_bytes: Option<usize>,
+    ) -> Result<TextReadResult> {
         let path = Self::resolve_path(path)?;
         if prefers_document_extraction(&path) {
             return Err(KernelError::Unsupported(format!(
@@ -223,23 +524,106 @@ impl CliShell {
                 path.display()
             )));
         }
-        let mut file = fs::File::open(&path)?;
+        let metadata = fs::metadata(&path)?;
+        if metadata.is_dir() {
+            return Err(KernelError::Execution(format!(
+                "EISDIR: illegal operation on a directory, read '{}'",
+                path.display()
+            )));
+        }
+
+        let file = fs::File::open(&path)?;
+        let mut reader = io::BufReader::new(file);
+        let requested_start_line = start_line.unwrap_or(1).max(1);
+        let requested_limit_lines = limit_lines.filter(|value| *value > 0);
         let limit = max_bytes.unwrap_or(DEFAULT_MAX_READ_BYTES);
-        let mut buffer = Vec::new();
-        Read::by_ref(&mut file)
-            .take((limit + 1) as u64)
-            .read_to_end(&mut buffer)?;
-        if looks_binary(&buffer) {
+        let max_selected_line = requested_limit_lines
+            .map(|count| requested_start_line.saturating_add(count).saturating_sub(1));
+
+        let mut content = String::new();
+        let mut line_count = 0usize;
+        let mut total_lines = 0usize;
+        let mut selected_bytes = 0usize;
+        let mut saw_binary = false;
+        let mut hit_byte_limit = false;
+        let mut raw_line = Vec::new();
+
+        loop {
+            raw_line.clear();
+            let bytes_read = reader.read_until(b'\n', &mut raw_line)?;
+            if bytes_read == 0 {
+                break;
+            }
+            total_lines += 1;
+
+            if raw_line.contains(&0) {
+                saw_binary = true;
+                break;
+            }
+
+            if total_lines == 1 && raw_line.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                raw_line.drain(..3);
+            }
+
+            let had_line_terminator = if raw_line.ends_with(b"\n") {
+                raw_line.pop();
+                if raw_line.ends_with(b"\r") {
+                    raw_line.pop();
+                }
+                true
+            } else if raw_line.ends_with(b"\r") {
+                raw_line.pop();
+                true
+            } else {
+                false
+            };
+
+            let in_requested_range = total_lines >= requested_start_line
+                && max_selected_line
+                    .map(|end| total_lines <= end)
+                    .unwrap_or(true);
+            if !in_requested_range || hit_byte_limit {
+                continue;
+            }
+
+            let line = String::from_utf8_lossy(&raw_line).to_string();
+            let mut fragment = line;
+            if had_line_terminator {
+                fragment.push('\n');
+            }
+            let next_bytes = selected_bytes + fragment.len();
+            if next_bytes > limit {
+                hit_byte_limit = true;
+                continue;
+            }
+
+            selected_bytes = next_bytes;
+            line_count += 1;
+            content.push_str(&fragment);
+        }
+
+        if saw_binary || (content.is_empty() && total_lines == 1 && looks_binary(&raw_line)) {
             return Err(KernelError::Unsupported(format!(
                 "read_file only supports text-like files; {} appears to be binary",
                 path.display()
             )));
         }
-        let truncated = buffer.len() > limit;
-        if truncated {
-            buffer.truncate(limit);
-        }
-        Ok((String::from_utf8_lossy(&buffer).to_string(), truncated))
+
+        let requested_end_line = max_selected_line.unwrap_or(usize::MAX);
+        let range_truncated = total_lines > requested_end_line;
+        let truncated = hit_byte_limit || range_truncated;
+        let read_bytes = content.len();
+
+        Ok(TextReadResult {
+            content,
+            truncated,
+            start_line: requested_start_line,
+            line_count,
+            total_lines,
+            total_bytes: metadata.len() as usize,
+            read_bytes,
+            was_partial: requested_start_line > 1 || requested_limit_lines.is_some() || truncated,
+        })
     }
 
     pub(crate) fn ingest_structured_data(
@@ -368,8 +752,14 @@ impl CliShell {
                             path.display()
                         )));
                     }
-                    let (content, _) = Self::read_file(&path, None)?;
-                    (content, extension, "text_read".to_string(), None, false)
+                    let text_read = Self::read_file(&path, None, None, None)?;
+                    (
+                        text_read.content,
+                        extension,
+                        "text_read".to_string(),
+                        None,
+                        false,
+                    )
                 }
                 _ => {
                     return Err(KernelError::Unsupported(format!(

@@ -26,22 +26,50 @@ pub(crate) struct StoredReadState {
 }
 
 impl CliShell {
+    pub(crate) fn remember_restored_read_states(
+        &self,
+        states: &[CachedFileReadState],
+    ) -> Result<()> {
+        let mut read_states = lock_state(&self.read_states)?;
+        read_states.clear();
+        for state in states {
+            read_states.insert(
+                state.path.clone(),
+                StoredReadState {
+                    path: state.path.clone(),
+                    content: state.content.clone(),
+                    normalized_content: Self::normalize_line_endings(&state.content),
+                    version: FileVersionSnapshot {
+                        exists: state.version.exists,
+                        size: state.version.size,
+                        modified_at: state.version.modified_at,
+                        content_hash: state.version.content_hash.clone(),
+                    },
+                    was_partial: state.was_partial,
+                    read_at: state.read_at.unwrap_or_else(Utc::now),
+                    line_endings: match state.line_endings {
+                        CachedLineEndingStyle::Lf => LineEndingStyle::Lf,
+                        CachedLineEndingStyle::Crlf => LineEndingStyle::Crlf,
+                    },
+                },
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn maybe_remember_text_read(
         &self,
         path: &Path,
         content: &str,
-        truncated: bool,
+        was_partial: bool,
     ) -> Result<()> {
-        if truncated {
-            return Ok(());
-        }
         let version = Self::current_file_version(path)?;
         let state = StoredReadState {
             path: path.to_path_buf(),
             content: content.to_string(),
             normalized_content: Self::normalize_line_endings(content),
             version,
-            was_partial: false,
+            was_partial,
             read_at: Utc::now(),
             line_endings: Self::detect_line_endings(content),
         };
@@ -109,6 +137,41 @@ impl CliShell {
         }
 
         Ok(current)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn canonical_read_state_from_result(
+        path: &Path,
+        content: &str,
+        start_line: usize,
+        line_count: usize,
+        total_lines: usize,
+        total_bytes: usize,
+        read_bytes: usize,
+        was_partial: bool,
+    ) -> Result<CachedFileReadState> {
+        let version = Self::current_file_version(path)?;
+        Ok(CachedFileReadState {
+            path: path.to_path_buf(),
+            content: content.to_string(),
+            start_line,
+            line_count,
+            total_lines,
+            total_bytes,
+            read_bytes,
+            was_partial,
+            read_at: Some(Utc::now()),
+            version: CachedFileVersionSnapshot {
+                exists: version.exists,
+                size: version.size,
+                modified_at: version.modified_at,
+                content_hash: version.content_hash,
+            },
+            line_endings: match Self::detect_line_endings(content) {
+                LineEndingStyle::Lf => CachedLineEndingStyle::Lf,
+                LineEndingStyle::Crlf => CachedLineEndingStyle::Crlf,
+            },
+        })
     }
 
     pub(crate) fn current_file_version(path: &Path) -> Result<FileVersionSnapshot> {

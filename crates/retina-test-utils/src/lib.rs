@@ -483,11 +483,29 @@ impl Shell for MockShell {
                 root: root.clone(),
                 pattern: pattern.clone(),
                 matches: Vec::new(),
+                truncated: false,
+                applied_offset: 0,
             }),
-            Action::SearchText { root, query, .. } => Ok(ActionResult::TextSearch {
+            Action::SearchText {
+                root,
+                query,
+                output_mode,
+                glob,
+                case_insensitive,
+                ..
+            } => Ok(ActionResult::TextSearch {
                 root: root.clone(),
                 query: query.clone(),
+                output_mode: output_mode.clone(),
                 matches: Vec::new(),
+                content: None,
+                filenames: Vec::new(),
+                num_files: 0,
+                num_matches: 0,
+                truncated: false,
+                applied_offset: 0,
+                glob: glob.clone(),
+                case_insensitive: *case_insensitive,
             }),
             Action::ReadFile { path, .. } => Ok(ActionResult::FileRead {
                 path: path.clone(),
@@ -496,6 +514,11 @@ impl Shell for MockShell {
                     .cloned()
                     .unwrap_or_else(|| "mock-content".to_string()),
                 truncated: false,
+                start_line: 1,
+                line_count: 1,
+                total_lines: 1,
+                total_bytes: 12,
+                read_bytes: 12,
             }),
             Action::IngestStructuredData { path, .. } => Ok(ActionResult::StructuredData {
                 path: path.clone(),

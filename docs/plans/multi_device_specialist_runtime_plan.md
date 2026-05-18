@@ -28,6 +28,33 @@ The target state is:
 - no product-cloud rewrite
 - no old plan resurrection
 
+## Cross-Cutting Track: Specialist Capability Adapters
+
+Before a remote or local specialist can be dependable, Retina needs a stronger execution layer for complex external systems.
+The `gabactl` exploration made this concrete: the main agent can now stay on the right tool family, but it still should not reason directly over a raw unfamiliar CLI forever.
+
+This track stays inside the current architecture and supports both local and remote specialists.
+
+Deliverables:
+
+- define adapter boundaries for complex external systems such as desktop automation, browser automation, and voice I/O
+- prefer specialist-facing capability tools over exposing raw external command grammar directly to the general agent
+- persist capability-discovery artifacts for adopted external tools so validated subcommands, flags, and failure modes survive follow-up turns
+- decide which behaviors belong in the raw substrate, which belong in a Retina adapter, and which belong in a specialist-only surface
+- use `gabactl` and the Gabanode browser layer as the first reference integration for:
+  - `desktop_activate_app`
+  - `browser_launch`
+  - `browser_open_url`
+  - `browser_search`
+  - `browser_click_text`
+  - `browser_fill_field`
+
+Acceptance:
+
+- specialists operate on stable high-level capabilities rather than guessing raw CLI subcommands and flags at runtime
+- follow-up tasks can reuse validated external-tool paths and capability artifacts without rediscovering the surface from scratch
+- the same adapter-backed specialist can be deployed locally first and then moved to a remote worker without changing the parent orchestration model
+
 ## Phase 1: Remote Transport Contract
 
 Define the transport contract for off-device workers using the existing runtime seams.

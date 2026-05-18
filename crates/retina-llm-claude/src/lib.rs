@@ -6,7 +6,9 @@ mod planner;
 mod response;
 
 use config::{ClaudeContextManagement, ClaudePromptCaching, anthropic_beta_header_value};
+#[cfg(test)]
 use payload::build_payload;
+use payload::{build_payload_with_max_tokens, resolved_max_tokens};
 use planner::plan_task;
 use reqwest::blocking::{Client, ClientBuilder, RequestBuilder};
 use response::{
@@ -16,6 +18,7 @@ use retina_traits::Reasoner;
 use retina_types::*;
 use std::env;
 use std::error::Error as _;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
@@ -38,6 +41,7 @@ pub struct ClaudeReasoner {
     api_key: Option<String>,
     prompt_caching: ClaudePromptCaching,
     context_management: ClaudeContextManagement,
+    recent_transitions: Mutex<Vec<ReasonerTransition>>,
 }
 
 impl ClaudeReasoner {
@@ -55,6 +59,7 @@ impl ClaudeReasoner {
             api_key: env::var("ANTHROPIC_API_KEY").ok(),
             prompt_caching: ClaudePromptCaching::from_env(),
             context_management: ClaudeContextManagement::from_env(),
+            recent_transitions: Mutex::new(Vec::new()),
         }
     }
 
@@ -82,36 +87,89 @@ impl ClaudeReasoner {
             KernelError::Configuration("ANTHROPIC_API_KEY is not set".to_string())
         })?;
 
-        let payload = build_payload(
-            &self.model_id,
-            request,
-            reflection,
-            &self.prompt_caching,
-            &self.context_management,
-        );
+        let mut max_tokens_override = request.max_tokens;
+        let mut escalated_output_retry_used = false;
+        let mut transitions = Vec::new();
 
-        let mut last_error: Option<KernelError> = None;
-        for attempt in 0..=self.max_transient_retries() {
-            let client = if attempt == 0 {
-                &self.client
-            } else {
-                &self.http1_retry_client
-            };
-            let request_builder = self.build_request_builder(client, &api_key);
-            match self.call_claude_once(request_builder, &payload) {
-                Ok(response) => return Ok(response),
-                Err(error)
-                    if attempt < self.max_transient_retries() && is_transient_error(&error) =>
-                {
-                    last_error = Some(error);
-                    thread::sleep(Duration::from_millis(transient_retry_delay_ms(attempt)));
+        'budget: loop {
+            let payload = build_payload_with_max_tokens(
+                &self.model_id,
+                request,
+                reflection,
+                &self.prompt_caching,
+                &self.context_management,
+                max_tokens_override,
+            );
+
+            let current_max_tokens =
+                resolved_max_tokens(request.max_tokens, reflection, max_tokens_override);
+            let escalation_target = max_output_tokens_escalation_target();
+            let mut last_error: Option<KernelError> = None;
+
+            for attempt in 0..=self.max_transient_retries() {
+                let client = if attempt == 0 {
+                    &self.client
+                } else {
+                    &self.http1_retry_client
+                };
+                let request_builder = self.build_request_builder(client, &api_key);
+                match self.call_claude_once(request_builder, &payload) {
+                    Ok(response) => {
+                        self.set_recent_transitions(transitions);
+                        return Ok(response);
+                    }
+                    Err(error)
+                        if attempt < self.max_transient_retries() && is_transient_error(&error) =>
+                    {
+                        last_error = Some(error);
+                        thread::sleep(Duration::from_millis(transient_retry_delay_ms(attempt)));
+                    }
+                    Err(error)
+                        if !escalated_output_retry_used
+                            && should_retry_with_escalated_output(
+                                &error,
+                                current_max_tokens,
+                                escalation_target,
+                            ) =>
+                    {
+                        escalated_output_retry_used = true;
+                        transitions.push(ReasonerTransition {
+                            reason: "max_output_tokens_escalate".to_string(),
+                            message: Some(
+                                "Retrying the same request with a larger output token budget."
+                                    .to_string(),
+                            ),
+                            attempt: Some(1),
+                            metadata: serde_json::json!({
+                                "max_tokens": escalation_target
+                            }),
+                        });
+                        max_tokens_override = Some(escalation_target);
+                        continue 'budget;
+                    }
+                    Err(error) => {
+                        self.set_recent_transitions(transitions);
+                        return Err(error);
+                    }
                 }
-                Err(error) => return Err(error),
             }
+
+            if escalated_output_retry_used && max_tokens_override == Some(escalation_target) {
+                self.set_recent_transitions(transitions);
+                return Err(last_error.unwrap_or_else(|| {
+                    KernelError::Reasoning(
+                        "Claude request failed without a retryable error".to_string(),
+                    )
+                }));
+            }
+
+            self.set_recent_transitions(transitions);
+            return Err(last_error.unwrap_or_else(|| {
+                KernelError::Reasoning(
+                    "Claude request failed without a retryable error".to_string(),
+                )
+            }));
         }
-        Err(last_error.unwrap_or_else(|| {
-            KernelError::Reasoning("Claude request failed without a retryable error".to_string())
-        }))
     }
 
     fn build_request_builder(&self, client: &Client, api_key: &str) -> RequestBuilder {
@@ -172,6 +230,13 @@ impl ClaudeReasoner {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(2)
     }
+
+    fn set_recent_transitions(&self, transitions: Vec<ReasonerTransition>) {
+        *self
+            .recent_transitions
+            .lock()
+            .expect("recent transitions mutex poisoned") = transitions;
+    }
 }
 
 fn build_http_client(http1_only: bool) -> Client {
@@ -226,6 +291,28 @@ fn is_transient_error(error: &KernelError) -> bool {
     matches!(error, KernelError::Reasoning(message) if message.starts_with("transient provider error:"))
 }
 
+fn max_output_tokens_escalation_target() -> u32 {
+    env::var("RETINA_CLAUDE_MAX_OUTPUT_TOKENS_ESCALATE")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(64_000)
+}
+
+fn should_retry_with_escalated_output(
+    error: &KernelError,
+    current_max_tokens: u32,
+    escalation_target: u32,
+) -> bool {
+    current_max_tokens < escalation_target && is_structured_output_truncation(error)
+}
+
+fn is_structured_output_truncation(error: &KernelError) -> bool {
+    matches!(error, KernelError::Reasoning(message)
+        if message.starts_with("Claude did not return parseable JSON.")
+            || message.starts_with("invalid Claude JSON response:"))
+}
+
 impl Default for ClaudeReasoner {
     fn default() -> Self {
         Self::new()
@@ -235,6 +322,7 @@ impl Default for ClaudeReasoner {
 impl Reasoner for ClaudeReasoner {
     fn reason(&self, request: &ReasonRequest) -> Result<ReasonResponse> {
         if let Some(response) = plan_task(&request.context.task) {
+            self.set_recent_transitions(Vec::new());
             return Ok(response);
         }
 
@@ -253,6 +341,15 @@ impl Reasoner for ClaudeReasoner {
             supports_caching: self.prompt_caching.enabled,
             model_id: self.model_id.clone(),
         }
+    }
+
+    fn take_recent_transitions(&self) -> Vec<ReasonerTransition> {
+        std::mem::take(
+            &mut *self
+                .recent_transitions
+                .lock()
+                .expect("recent transitions mutex poisoned"),
+        )
     }
 }
 
@@ -825,5 +922,65 @@ mod tests {
     fn transient_error_marker_is_detected() {
         let error = mark_transient(KernelError::Reasoning("timeout".to_string()));
         assert!(is_transient_error(&error));
+    }
+
+    #[test]
+    fn parseable_json_failure_is_structured_output_truncation_candidate() {
+        let error = KernelError::Reasoning(
+            "Claude did not return parseable JSON. Raw response: {\"type\":\"write_file\""
+                .to_string(),
+        );
+        assert!(is_structured_output_truncation(&error));
+    }
+
+    #[test]
+    fn invalid_json_failure_is_structured_output_truncation_candidate() {
+        let error =
+            KernelError::Reasoning("invalid Claude JSON response: EOF while parsing".to_string());
+        assert!(is_structured_output_truncation(&error));
+    }
+
+    #[test]
+    fn non_parse_error_is_not_structured_output_truncation_candidate() {
+        let error =
+            KernelError::Reasoning("Claude response did not include text content".to_string());
+        assert!(!is_structured_output_truncation(&error));
+    }
+
+    #[test]
+    fn escalated_output_retry_requires_larger_budget_and_truncation_signal() {
+        let error =
+            KernelError::Reasoning("invalid Claude JSON response: EOF while parsing".to_string());
+        assert!(should_retry_with_escalated_output(&error, 4_096, 64_000));
+        assert!(!should_retry_with_escalated_output(&error, 64_000, 64_000));
+    }
+
+    #[test]
+    fn resolved_max_tokens_prefers_override_before_request_or_default() {
+        assert_eq!(
+            resolved_max_tokens(Some(4_096), false, Some(16_384)),
+            16_384
+        );
+        assert_eq!(resolved_max_tokens(Some(4_096), false, None), 4_096);
+        assert_eq!(resolved_max_tokens(None, true, None), 256);
+        assert_eq!(resolved_max_tokens(None, false, None), 512);
+    }
+
+    #[test]
+    fn recent_transitions_are_drained_after_read() {
+        let reasoner = ClaudeReasoner::with_model("claude-sonnet-test");
+        reasoner.set_recent_transitions(vec![ReasonerTransition {
+            reason: "max_output_tokens_escalate".to_string(),
+            message: Some("Retrying with a larger output token budget.".to_string()),
+            attempt: Some(1),
+            metadata: json!({ "max_tokens": 64_000 }),
+        }]);
+
+        let first = reasoner.take_recent_transitions();
+        let second = reasoner.take_recent_transitions();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].reason, "max_output_tokens_escalate");
+        assert!(second.is_empty());
     }
 }

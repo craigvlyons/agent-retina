@@ -229,8 +229,18 @@ pub(crate) fn action_utility(action: &Action, result: &ActionResult, delta: &Sta
                 0.85
             }
         }
-        ActionResult::TextSearch { matches, .. } => {
-            if matches.is_empty() {
+        ActionResult::TextSearch {
+            matches,
+            filenames,
+            content,
+            num_matches,
+            ..
+        } => {
+            if matches.is_empty()
+                && filenames.is_empty()
+                && content.as_deref().unwrap_or_default().is_empty()
+                && *num_matches == 0
+            {
                 0.1
             } else {
                 0.65

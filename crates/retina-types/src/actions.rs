@@ -62,16 +62,23 @@ pub enum Action {
         pattern: String,
         recursive: bool,
         max_results: usize,
+        offset: usize,
     },
     SearchText {
         id: ActionId,
         root: PathBuf,
         query: String,
         max_results: usize,
+        offset: usize,
+        glob: Option<String>,
+        case_insensitive: bool,
+        output_mode: TextSearchOutputMode,
     },
     ReadFile {
         id: ActionId,
         path: PathBuf,
+        start_line: Option<usize>,
+        limit_lines: Option<usize>,
         max_bytes: Option<usize>,
     },
     IngestStructuredData {
@@ -363,6 +370,14 @@ pub struct SearchMatch {
     pub line: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TextSearchOutputMode {
+    Content,
+    FilesWithMatches,
+    Count,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommandResult {
     pub command: String,
@@ -537,11 +552,18 @@ pub enum ActionResult {
         root: PathBuf,
         pattern: String,
         matches: Vec<PathBuf>,
+        truncated: bool,
+        applied_offset: usize,
     },
     FileRead {
         path: PathBuf,
         content: String,
         truncated: bool,
+        start_line: usize,
+        line_count: usize,
+        total_lines: usize,
+        total_bytes: usize,
+        read_bytes: usize,
     },
     StructuredData {
         path: PathBuf,
@@ -564,7 +586,16 @@ pub enum ActionResult {
     TextSearch {
         root: PathBuf,
         query: String,
+        output_mode: TextSearchOutputMode,
         matches: Vec<SearchMatch>,
+        content: Option<String>,
+        filenames: Vec<PathBuf>,
+        num_files: usize,
+        num_matches: usize,
+        truncated: bool,
+        applied_offset: usize,
+        glob: Option<String>,
+        case_insensitive: bool,
     },
     McpResources {
         server: Option<String>,

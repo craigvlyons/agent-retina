@@ -6,13 +6,60 @@ use crate::support::{
     ActionExecution, ContextAssemblyInput, EventSpec, StepDecision, StepSelectionContext,
     action_failure_reason, action_requires_approval, action_utility, approval_reason,
 };
-use crate::{Kernel, TaskLoopState, action_label};
+use crate::{
+    Kernel, TaskLoopState, action_label, task_reasoner_call_budget_snapshot,
+    task_token_budget_snapshot, transition_budget_payload,
+};
 use chrono::Utc;
 use retina_tools::{ToolExecutor, ToolRegistry};
 use retina_types::*;
 use serde_json::json;
 
 impl Kernel {
+    fn emit_reasoner_transitions(
+        &self,
+        task: &Task,
+        intent: &Intent,
+        state: &mut TaskLoopState,
+        current_step: usize,
+        max_steps: usize,
+        model_decision_count: usize,
+        cumulative_tokens: u32,
+    ) -> Result<()> {
+        for transition in self.reasoner.take_recent_transitions() {
+            state.record_transition(
+                transition.reason.clone(),
+                transition.attempt,
+                transition.message.clone(),
+                transition.metadata.clone(),
+            );
+            self.emit_event(EventSpec::new(
+                task,
+                Some(intent),
+                None,
+                TimelineEventType::TaskRecoveryContinued,
+                json!({
+                    "reason": transition.reason,
+                    "message": transition.message,
+                    "attempt": transition.attempt,
+                    "metadata": transition.metadata,
+                    "budget_state": transition_budget_payload(
+                        task,
+                        model_decision_count,
+                        cumulative_tokens,
+                    ),
+                    "continuation_window": self.build_active_continuation_window(
+                        task,
+                        state,
+                        current_step,
+                        max_steps,
+                    )
+                }),
+            ))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn select_action(
         &self,
         selection: StepSelectionContext<'_>,
@@ -51,7 +98,8 @@ impl Kernel {
         if let Some(guidance) = context.operator_guidance.as_deref() {
             state.record_operator_guidance(current_step, guidance);
         }
-        let response = self.reasoner.reason(&ReasonRequest {
+        let pre_response_tokens = state.reasoner_tokens_used();
+        let response = match self.reasoner.reason(&ReasonRequest {
             tools: context.tools.clone(),
             context,
             constraints: self
@@ -60,8 +108,35 @@ impl Kernel {
                 .iter()
                 .map(|constraint| format!("{constraint:?}"))
                 .collect(),
-            max_tokens: Some(reasoner_max_tokens(task)),
-        })?;
+            max_tokens: Some(reasoner_max_tokens(task, state)),
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                self.emit_reasoner_transitions(
+                    task,
+                    intent,
+                    state,
+                    current_step,
+                    max_steps,
+                    state.model_decision_count() + 1,
+                    state.reasoner_tokens_used(),
+                )?;
+                return Err(error);
+            }
+        };
+        let cumulative_tokens = state.record_reasoner_usage(&response.tokens_used);
+        let reasoner_call_budget =
+            task_reasoner_call_budget_snapshot(task, state.model_decision_count() + 1);
+        let token_budget = task_token_budget_snapshot(task, cumulative_tokens);
+        self.emit_reasoner_transitions(
+            task,
+            intent,
+            state,
+            current_step,
+            max_steps,
+            state.model_decision_count() + 1,
+            pre_response_tokens,
+        )?;
         self.emit_event(EventSpec::new(
             task,
             Some(intent),
@@ -72,6 +147,9 @@ impl Kernel {
                 "reasoning": response.reasoning,
                 "framing": response.framing,
                 "tokens": response.tokens_used,
+                "cumulative_tokens": cumulative_tokens,
+                "reasoner_call_budget": reasoner_call_budget,
+                "token_budget": token_budget,
                 "task_complete": response.task_complete
             }),
         ))?;
@@ -94,6 +172,7 @@ impl Kernel {
         intent: &mut Intent,
         state: &TaskLoopState,
         step: &StepDecision,
+        max_steps: usize,
         control: Option<&ExecutionControlHandle>,
     ) -> Result<ActionExecution> {
         let mut action = step.action.clone();
@@ -190,9 +269,16 @@ impl Kernel {
                         "local agent delegation is not available in this runtime".to_string(),
                     )));
                 };
+                let parent_continuation_window = self.build_active_continuation_window(
+                    task,
+                    state,
+                    state.current_step().max(1),
+                    max_steps,
+                );
                 ActionResult::DelegatedTask(runtime.spawn_local_agent(
                     &SpawnAgentRequest {
                         parent_task: task.clone(),
+                        parent_continuation_window: Some(parent_continuation_window),
                         prompt: prompt.clone(),
                         allowed_tools: allowed_tools.clone(),
                         denied_tools: denied_tools.clone(),
@@ -441,18 +527,16 @@ impl Kernel {
         current_step: usize,
         max_steps: usize,
     ) -> ActiveContinuationWindow {
-        const TRANSCRIPT_LIMIT: usize = 12;
         const RESULT_REF_LIMIT: usize = 6;
         const SOURCE_LIMIT: usize = 6;
         const ARTIFACT_LIMIT: usize = 6;
-        const BOUNDARY_LIMIT: usize = 3;
+        const BOUNDARY_LIMIT: usize = 1;
         const COMPACTED_RESULT_LIMIT: usize = 4;
+        const READ_STATE_LIMIT: usize = 8;
+        const SEARCH_STATE_LIMIT: usize = 8;
 
-        let transcript_start = state
-            .transcript
-            .latest_boundary_start()
-            .unwrap_or_else(|| state.transcript.len().saturating_sub(TRANSCRIPT_LIMIT));
-        let window_transcript = state.transcript.tail_from(transcript_start);
+        let transcript_start = state.transcript.latest_boundary_tail_start().unwrap_or(0);
+        let window_transcript = state.transcript.model_facing_tail_from(transcript_start);
         let referenced_result_ids = window_transcript
             .iter()
             .filter_map(|item| item.result_ref_id.clone())
@@ -485,31 +569,74 @@ impl Kernel {
         ));
         let working_sources = state.working_sources();
         let artifact_references = state.artifact_references();
+        let stored_result_ledger = StoredResultLedger::from_entries(stored_result_refs);
+        let reannounced_compacted_result_refs = reannounced_compacted_results(
+            &compacted_result_refs[compacted_result_start..],
+            COMPACTED_RESULT_LIMIT,
+        );
+        let reannounced_sources = reannounced_working_sources(
+            &working_sources,
+            &preserved_locators,
+            &transcript_locators,
+            SOURCE_LIMIT,
+        );
+        let reannounced_artifacts = reannounced_artifact_references(
+            &artifact_references,
+            &preserved_locators,
+            &transcript_locators,
+            ARTIFACT_LIMIT,
+        );
+        let next_step_guidance = state.next_step_guidance();
+
+        let mut content_replacements = state.content_replacements.clone();
+        content_replacements
+            .extend_from_continuation(&stored_result_ledger, &reannounced_compacted_result_refs);
+        let window_transcript = materialize_model_facing_transcript(
+            window_transcript,
+            &content_replacements,
+            &reannounced_sources,
+            &reannounced_artifacts,
+            next_step_guidance.as_ref(),
+            &reannounced_compacted_result_refs,
+        );
 
         ActiveContinuationWindow {
             objective: task.description.clone(),
             current_step,
             max_steps,
+            reasoner_tokens_used: state.reasoner_tokens_used(),
+            max_output_tokens_recovery_count: state.max_output_tokens_recovery_count,
+            has_attempted_prompt_too_long_compaction: state
+                .has_attempted_prompt_too_long_compaction,
+            last_transition: state.last_transition.clone(),
+            read_state_cache: state
+                .read_state_cache()
+                .iter()
+                .rev()
+                .take(READ_STATE_LIMIT)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            search_state_cache: state
+                .search_state_cache()
+                .iter()
+                .rev()
+                .take(SEARCH_STATE_LIMIT)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
             transcript: TranscriptLedger::from_entries(window_transcript),
-            stored_results: StoredResultLedger::from_entries(stored_result_refs),
-            reannounced_sources: reannounced_working_sources(
-                &working_sources,
-                &preserved_locators,
-                &transcript_locators,
-                SOURCE_LIMIT,
-            ),
-            reannounced_artifacts: reannounced_artifact_references(
-                &artifact_references,
-                &preserved_locators,
-                &transcript_locators,
-                ARTIFACT_LIMIT,
-            ),
-            next_step_guidance: state.next_step_guidance(),
+            stored_results: stored_result_ledger.clone(),
+            content_replacements,
+            reannounced_sources,
+            reannounced_artifacts,
+            next_step_guidance,
             compaction_boundaries: compaction_history[boundary_start..].to_vec(),
-            reannounced_compacted_results: reannounced_compacted_results(
-                &compacted_result_refs[compacted_result_start..],
-                COMPACTED_RESULT_LIMIT,
-            ),
+            reannounced_compacted_results: reannounced_compacted_result_refs,
         }
     }
 
@@ -603,7 +730,151 @@ impl Kernel {
     }
 }
 
-fn reasoner_max_tokens(task: &Task) -> u32 {
+fn materialize_model_facing_transcript(
+    transcript: Vec<TranscriptUnit>,
+    content_replacements: &ContentReplacementState,
+    reannounced_sources: &[WorkingSource],
+    reannounced_artifacts: &[ArtifactReference],
+    next_step_guidance: Option<&NextStepGuidance>,
+    reannounced_compacted_results: &[CompactedResultReference],
+) -> Vec<TranscriptUnit> {
+    let transcript_bound_replacement_ids = transcript
+        .iter()
+        .filter_map(|entry| entry.result_ref_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    let base_step = transcript.first().map(|entry| entry.step).unwrap_or(1);
+    let mut entries = Vec::new();
+
+    for record in &content_replacements.records {
+        if transcript_bound_replacement_ids.contains(record.replacement_id.as_str()) {
+            continue;
+        }
+        entries.push(TranscriptUnit {
+            ordinal: 0,
+            step: base_step,
+            kind: TranscriptUnitKind::CarryoverMessage,
+            summary: record.replacement_text.clone(),
+            result_ref_id: None,
+            primary_locator: record.locator.clone(),
+            evidence_refs: record
+                .locator
+                .iter()
+                .cloned()
+                .chain(record.persisted_path.iter().cloned())
+                .take(4)
+                .collect(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        });
+    }
+
+    for source in reannounced_sources {
+        entries.push(TranscriptUnit {
+            ordinal: 0,
+            step: base_step,
+            kind: TranscriptUnitKind::CarryoverMessage,
+            summary: format!(
+                "source reminder: {}",
+                source.render().trim_start_matches("- ")
+            ),
+            result_ref_id: None,
+            primary_locator: Some(source.locator.clone()),
+            evidence_refs: source.evidence_refs.clone(),
+            working_sources: vec![source.clone()],
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        });
+    }
+
+    for artifact in reannounced_artifacts {
+        entries.push(TranscriptUnit {
+            ordinal: 0,
+            step: base_step,
+            kind: TranscriptUnitKind::CarryoverMessage,
+            summary: format!(
+                "artifact reminder: {}",
+                artifact.render().trim_start_matches("- ")
+            ),
+            result_ref_id: None,
+            primary_locator: Some(artifact.locator.clone()),
+            evidence_refs: vec![artifact.locator.clone()],
+            working_sources: Vec::new(),
+            artifact_references: vec![artifact.clone()],
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        });
+    }
+
+    if let Some(guidance) = next_step_guidance {
+        entries.push(TranscriptUnit {
+            ordinal: 0,
+            step: base_step,
+            kind: TranscriptUnitKind::CarryoverMessage,
+            summary: format!("next-step guidance: {}", guidance.render()),
+            result_ref_id: None,
+            primary_locator: guidance.evidence_locator.clone(),
+            evidence_refs: guidance.evidence_locator.iter().cloned().collect(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: Some(guidance.clone()),
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        });
+    }
+
+    for compacted in reannounced_compacted_results {
+        entries.push(TranscriptUnit {
+            ordinal: 0,
+            step: base_step,
+            kind: TranscriptUnitKind::CarryoverMessage,
+            summary: format!(
+                "compacted result reminder: {}",
+                compacted.render().trim_start_matches("- ")
+            ),
+            result_ref_id: None,
+            primary_locator: compacted.locator.clone(),
+            evidence_refs: compacted
+                .locator
+                .iter()
+                .cloned()
+                .chain(compacted.persisted_path.iter().cloned())
+                .take(4)
+                .collect(),
+            working_sources: Vec::new(),
+            artifact_references: Vec::new(),
+            next_step_guidance: None,
+            repetition_signature: None,
+            avoid_label: None,
+            compaction_snapshot: None,
+        });
+    }
+
+    entries.extend(transcript);
+    for (index, entry) in entries.iter_mut().enumerate() {
+        entry.ordinal = index + 1;
+    }
+    entries
+}
+
+fn reasoner_max_tokens(task: &Task, state: &TaskLoopState) -> u32 {
+    if let Some(value) = task
+        .metadata
+        .get("max_tokens_per_task")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+    {
+        return value.saturating_sub(state.reasoner_tokens_used()).max(1);
+    }
     let description = task.description.to_ascii_lowercase();
     if description.contains("save")
         || description.contains("write")

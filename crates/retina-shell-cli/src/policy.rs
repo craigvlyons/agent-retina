@@ -49,6 +49,10 @@ impl<S: Shell> Shell for ScopedShell<S> {
         self.inner.execute_controlled(action, control)
     }
 
+    fn restore_read_state_cache(&self, states: &[CachedFileReadState]) -> Result<()> {
+        self.inner.restore_read_state_cache(states)
+    }
+
     fn constraints(&self) -> &[HardConstraint] {
         self.inner.constraints()
     }
@@ -221,6 +225,8 @@ mod tests {
             .execute(&Action::ReadFile {
                 id: ActionId::new(),
                 path: outside,
+                start_line: None,
+                limit_lines: None,
                 max_bytes: None,
             })
             .unwrap_err();
@@ -252,6 +258,8 @@ mod tests {
             .execute(&Action::ReadFile {
                 id: ActionId::new(),
                 path: file.clone(),
+                start_line: None,
+                limit_lines: None,
                 max_bytes: None,
             })
             .unwrap();

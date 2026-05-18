@@ -56,9 +56,15 @@ pub fn render_action_result(result: &ActionResult) -> String {
             root,
             pattern,
             matches,
+            truncated,
+            applied_offset,
         } => format!(
-            "Paths matching '{pattern}' under {}\n{}",
+            "Paths matching '{pattern}' under {} (offset={}, count={}{}{})\n{}",
             root.display(),
+            applied_offset,
+            matches.len(),
+            if *truncated { ", truncated" } else { "" },
+            if *applied_offset > 0 { ", paged" } else { "" },
             if matches.is_empty() {
                 "(no matches)".to_string()
             } else {
@@ -73,9 +79,16 @@ pub fn render_action_result(result: &ActionResult) -> String {
             path,
             content,
             truncated,
+            start_line,
+            line_count,
+            total_lines,
+            ..
         } => format!(
-            "Read file {}\n{}\n{}",
+            "Read file {} (start_line={}, line_count={}, total_lines={})\n{}\n{}",
             path.display(),
+            start_line,
+            line_count,
+            total_lines,
             content,
             if *truncated {
                 "\n[output truncated]"
@@ -143,27 +156,72 @@ pub fn render_action_result(result: &ActionResult) -> String {
         ActionResult::TextSearch {
             root,
             query,
+            output_mode,
             matches,
-        } => format!(
-            "Text search for '{query}' under {}\n{}",
-            root.display(),
-            if matches.is_empty() {
-                "(no matches)".to_string()
-            } else {
-                matches
-                    .iter()
-                    .map(|item| {
-                        format!(
-                            "- {}:{} {}",
-                            item.path.display(),
-                            item.line_number,
-                            item.line
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-        ),
+            content,
+            filenames,
+            num_files,
+            num_matches,
+            truncated,
+            applied_offset,
+            glob,
+            case_insensitive,
+        } => {
+            let mode_label = match output_mode {
+                TextSearchOutputMode::Content => "content",
+                TextSearchOutputMode::FilesWithMatches => "files_with_matches",
+                TextSearchOutputMode::Count => "count",
+            };
+            let body = match output_mode {
+                TextSearchOutputMode::Content => {
+                    if matches.is_empty() {
+                        "(no matches)".to_string()
+                    } else {
+                        matches
+                            .iter()
+                            .map(|item| {
+                                format!(
+                                    "- {}:{} {}",
+                                    item.path.display(),
+                                    item.line_number,
+                                    item.line
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                }
+                TextSearchOutputMode::FilesWithMatches => {
+                    if filenames.is_empty() {
+                        "(no files matched)".to_string()
+                    } else {
+                        filenames
+                            .iter()
+                            .map(|path| format!("- {}", path.display()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    }
+                }
+                TextSearchOutputMode::Count => content
+                    .clone()
+                    .unwrap_or_else(|| "(no counted matches)".to_string()),
+            };
+            format!(
+                "Text search for '{query}' under {}{} (mode={}, offset={}, files={}, matches={}{}{}, case_insensitive={})\n{}",
+                root.display(),
+                glob.as_ref()
+                    .map(|value| format!(" [glob={}]", value))
+                    .unwrap_or_default(),
+                mode_label,
+                applied_offset,
+                num_files,
+                num_matches,
+                if *truncated { ", truncated" } else { "" },
+                if *applied_offset > 0 { ", paged" } else { "" },
+                case_insensitive,
+                body
+            )
+        }
         ActionResult::FileWrite {
             path,
             mutation_kind,
@@ -335,12 +393,14 @@ pub fn render_timeline_event(event: &TimelineEvent) -> String {
         .get("continuation_window")
         .and_then(|value| serde_json::from_value::<ActiveContinuationWindow>(value.clone()).ok())
         .map(|window| {
+            let source_count = window.transcript.reduced_working_sources().len();
+            let artifact_count = window.transcript.reduced_artifact_references().len();
             format!(
                 " continuation=transcript:{} refs:{} reannounce:{}/{}/{}",
                 window.transcript.len(),
                 window.stored_results.len(),
-                window.reannounced_sources.len(),
-                window.reannounced_artifacts.len(),
+                source_count,
+                artifact_count,
                 window.reannounced_compacted_results.len()
             )
         })
@@ -451,6 +511,9 @@ pub fn render_task_projection(task_state: &TaskState) -> String {
 }
 
 pub fn render_continuation_window(window: &ActiveContinuationWindow) -> String {
+    let derived_sources = window.transcript.reduced_working_sources();
+    let derived_artifacts = window.transcript.reduced_artifact_references();
+    let derived_guidance = window.transcript.latest_next_step_guidance();
     let transcript_units = if window.transcript.is_empty() {
         "(none)".to_string()
     } else {
@@ -473,21 +536,19 @@ pub fn render_continuation_window(window: &ActiveContinuationWindow) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let reannounced_sources = if window.reannounced_sources.is_empty() {
+    let reannounced_sources = if derived_sources.is_empty() {
         "(none)".to_string()
     } else {
-        window
-            .reannounced_sources
+        derived_sources
             .iter()
             .map(WorkingSource::render)
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let reannounced_artifacts = if window.reannounced_artifacts.is_empty() {
+    let reannounced_artifacts = if derived_artifacts.is_empty() {
         "(none)".to_string()
     } else {
-        window
-            .reannounced_artifacts
+        derived_artifacts
             .iter()
             .map(ArtifactReference::render)
             .collect::<Vec<_>>()
@@ -513,17 +574,47 @@ pub fn render_continuation_window(window: &ActiveContinuationWindow) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let guidance = window
-        .next_step_guidance
+    let guidance = derived_guidance
         .as_ref()
         .map(NextStepGuidance::render)
         .unwrap_or_else(|| "none".to_string());
+    let last_transition = window
+        .last_transition
+        .as_ref()
+        .map(|transition| {
+            let mut line = transition.reason.clone();
+            if let Some(attempt) = transition.attempt {
+                line.push_str(&format!(" (attempt {attempt})"));
+            }
+            if let Some(message) = transition.message.as_deref() {
+                line.push_str(&format!(": {message}"));
+            }
+            line
+        })
+        .unwrap_or_else(|| "(none)".to_string());
+    let search_state_cache = if window.search_state_cache.is_empty() {
+        "(none)".to_string()
+    } else {
+        window
+            .search_state_cache
+            .iter()
+            .map(CachedSearchState::render)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
     format!(
-        "objective: {}\nstep: {} / {}\n\ntranscript_units:\n{}\n\nstored_result_refs:\n{}\n\nreannounced_sources:\n{}\n\nreannounced_artifacts:\n{}\n\nreannounced_compacted_results:\n{}\n\nnext_step_guidance:\n{}\n\ncompaction_boundaries:\n{}\n",
+        "objective: {}\nstep: {} / {}\nreasoner_tokens_used: {}\nread_state_cache_entries: {}\nsearch_state_cache_entries: {}\nmax_output_tokens_recovery_count: {}\nhas_attempted_prompt_too_long_compaction: {}\nlast_transition:\n{}\n\nsearch_state_cache:\n{}\n\ntranscript_units:\n{}\n\nstored_result_refs:\n{}\n\nreannounced_sources:\n{}\n\nreannounced_artifacts:\n{}\n\nreannounced_compacted_results:\n{}\n\nnext_step_guidance:\n{}\n\ncompaction_boundaries:\n{}\n",
         window.objective,
         window.current_step,
         window.max_steps,
+        window.reasoner_tokens_used,
+        window.read_state_cache.len(),
+        window.search_state_cache.len(),
+        window.max_output_tokens_recovery_count,
+        window.has_attempted_prompt_too_long_compaction,
+        last_transition,
+        search_state_cache,
         transcript_units,
         stored_result_refs,
         reannounced_sources,
@@ -617,12 +708,14 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
                 serde_json::from_value::<ActiveContinuationWindow>(value.clone()).ok()
             })
             .map(|window| {
+                let source_count = window.transcript.reduced_working_sources().len();
+                let artifact_count = window.transcript.reduced_artifact_references().len();
                 format!(
                     "context ready (transcript {}, refs {}, reannounce {}/{}/{})",
                     window.transcript.len(),
                     window.stored_results.len(),
-                    window.reannounced_sources.len(),
-                    window.reannounced_artifacts.len(),
+                    source_count,
+                    artifact_count,
                     window.reannounced_compacted_results.len()
                 )
             }),
@@ -631,6 +724,15 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
             .get("result")
             .and_then(|value| serde_json::from_value::<ActionResult>(value.clone()).ok())
             .and_then(render_observed_result),
+        TimelineEventType::ContentReplacementsRecorded => event
+            .payload_json
+            .get("records")
+            .and_then(|value| {
+                serde_json::from_value::<Vec<ContentReplacementRecord>>(value.clone()).ok()
+            })
+            .map(|records| format!("persisted {} exact replacement record(s)", records.len())),
+        TimelineEventType::TaskRecoveryContinued => render_recovery_line(event),
+        TimelineEventType::TaskContinued => render_continuation_line(event),
         TimelineEventType::TaskStepCompleted => event
             .payload_json
             .get("continuation_window")
@@ -669,6 +771,46 @@ pub fn render_chat_event(event: &TimelineEvent, debug: bool) -> String {
     };
 
     line.map(|line| format!("{line}\n")).unwrap_or_default()
+}
+
+fn render_recovery_line(event: &TimelineEvent) -> Option<String> {
+    let reason = event.payload_json.get("reason").and_then(Value::as_str)?;
+    let attempt = event.payload_json.get("attempt").and_then(Value::as_u64);
+    let label = match reason {
+        "max_output_tokens_escalate" => {
+            let max_tokens = event
+                .payload_json
+                .get("metadata")
+                .and_then(|value| value.get("max_tokens"))
+                .and_then(Value::as_u64);
+            match max_tokens {
+                Some(max_tokens) => {
+                    format!("recover: max output tokens via larger budget ({max_tokens})")
+                }
+                None => "recover: max output tokens via larger budget".to_string(),
+            }
+        }
+        "max_output_tokens_recovery" => match attempt {
+            Some(attempt) => format!("recover: max output tokens (attempt {attempt})"),
+            None => "recover: max output tokens".to_string(),
+        },
+        "prompt_too_long_compaction" => "recover: prompt too long via compaction".to_string(),
+        other => format!("recover: {other}"),
+    };
+    Some(label)
+}
+
+fn render_continuation_line(event: &TimelineEvent) -> Option<String> {
+    let reason = event.payload_json.get("reason").and_then(Value::as_str)?;
+    match reason {
+        "completion_blocker" => event
+            .payload_json
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|message| format!("continue: {message}")),
+        "next_turn" => None,
+        other => Some(format!("continue: {other}")),
+    }
 }
 
 fn render_compaction_line_from_window(window: &ActiveContinuationWindow) -> Option<String> {
@@ -737,16 +879,25 @@ fn render_observed_result(result: ActionResult) -> Option<String> {
             root,
             pattern,
             matches,
+            truncated,
+            applied_offset,
         } => Some(format!(
-            "observed: {} [matched {} under {}]",
+            "observed: {} [matched {} under {}{}{}]",
             pattern,
             matches.len(),
-            root.display()
+            root.display(),
+            if truncated { ", truncated" } else { "" },
+            if applied_offset > 0 {
+                format!(", offset={applied_offset}")
+            } else {
+                String::new()
+            }
         )),
         ActionResult::FileRead {
             path,
             content,
             truncated,
+            ..
         } => Some(format!(
             "observed: {} [read via text_read]{}",
             path.display(),
@@ -785,13 +936,61 @@ fn render_observed_result(result: ActionResult) -> Option<String> {
         ActionResult::TextSearch {
             root,
             query,
+            output_mode,
             matches,
-        } => Some(format!(
-            "observed: {} [search '{}' matched {}]",
-            root.display(),
-            query,
-            matches.len()
-        )),
+            filenames,
+            num_files,
+            num_matches,
+            truncated,
+            applied_offset,
+            glob,
+            case_insensitive,
+            ..
+        } => {
+            let mode_summary = match output_mode {
+                TextSearchOutputMode::Content => format!("matched {}", matches.len()),
+                TextSearchOutputMode::FilesWithMatches => format!("matched {} file(s)", num_files),
+                TextSearchOutputMode::Count => {
+                    format!(
+                        "counted {} match(es) across {} file(s)",
+                        num_matches, num_files
+                    )
+                }
+            };
+            let preview = match output_mode {
+                TextSearchOutputMode::FilesWithMatches if !filenames.is_empty() => format!(
+                    " [{}]",
+                    filenames
+                        .iter()
+                        .take(3)
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => String::new(),
+            };
+            Some(format!(
+                "observed: {} [search '{}' {}{}{}{}{}{}]",
+                root.display(),
+                query,
+                mode_summary,
+                if truncated { ", truncated" } else { "" },
+                if applied_offset > 0 {
+                    format!(", offset={applied_offset}")
+                } else {
+                    String::new()
+                },
+                glob.as_ref()
+                    .map(|value| format!(", glob={value}"))
+                    .unwrap_or_default(),
+                if case_insensitive {
+                    ", case_insensitive"
+                } else {
+                    ""
+                },
+                preview
+            ))
+        }
         ActionResult::FileWrite {
             path,
             mutation_kind,
@@ -1148,7 +1347,7 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
     let runtime_tasks = render_runtime_tasks_inline(&overview.runtime_tasks);
 
     format!(
-        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\nruntime_tasks:\n{}\ncompaction:\n- task_compactions: {}\n- cache_reads: {}\n- cache_creations: {}\n\nclaude_runtime:\n- model: {}\n- prompt_caching: {}\n- context_editing: {}\n- tool_result_trigger_tokens: {}\n- server_compaction_requested: {}\n- server_compaction_supported: {}\n- server_compaction_effective: {}\n- compaction_trigger_tokens: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nagent_model:\n{}\n\nrole_prompt:\n{}\n\ninitial_prompt:\n{}\n\ntool_scope:\n- allowed: {}\n- denied: {}\n- required_mcp_servers: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
+        "agent: {} [{}]\nstatus: {:?}/{:?}\nreason: {}\nlast_active: {}\ndb_path: {}\ndb_size_mb: {:.2}\n\ncounts:\n- timeline_events: {}\n- experiences: {}\n- knowledge: {}\n- rules: {}\n- tools: {}\n\nrecent terminal tasks:\n- completed: {}\n- failed: {}\n- cancelled: {}\n- blocked: {}\n\nrecovery transitions:\n- total: {}\n- max_output_tokens_escalate: {}\n- max_output_tokens_recovery: {}\n- prompt_too_long_compaction: {}\n\nruntime_tasks:\n{}\ncompaction:\n- task_compactions: {}\n- cache_reads: {}\n- cache_creations: {}\n\nclaude_runtime:\n- model: {}\n- prompt_caching: {}\n- context_editing: {}\n- tool_result_trigger_tokens: {}\n- server_compaction_requested: {}\n- server_compaction_supported: {}\n- server_compaction_effective: {}\n- compaction_trigger_tokens: {}\n\nbudget:\n- max_steps_per_task: {}\n- max_reasoner_calls_per_task: {}\n- max_tokens_per_task: {}\n- idle_archive_after_hours: {}\n\nagent_model:\n{}\n\nrole_prompt:\n{}\n\ninitial_prompt:\n{}\n\ntool_scope:\n- allowed: {}\n- denied: {}\n- required_mcp_servers: {}\n\nauthority_roots:\n- {}\n\nactive_rules:\n- {}\n",
         overview.manifest.agent_id.0,
         overview.manifest.domain,
         overview.manifest.status,
@@ -1176,6 +1375,10 @@ pub fn render_worker_overview(overview: &WorkerOverview) -> String {
         overview.terminal_tasks.failed,
         overview.terminal_tasks.cancelled,
         overview.terminal_tasks.blocked,
+        overview.recovery_stats.total,
+        overview.recovery_stats.max_output_tokens_escalate,
+        overview.recovery_stats.max_output_tokens_recovery,
+        overview.recovery_stats.prompt_too_long_compaction,
         runtime_tasks,
         overview.compaction_stats.compaction_events,
         overview.compaction_stats.cache_reads,
@@ -1291,6 +1494,11 @@ mod tests {
                     path: "/tmp/plan.pdf".into(),
                     content: "panel schedule and electrical notes".to_string(),
                     truncated: false,
+                    start_line: 1,
+                    line_count: 1,
+                    total_lines: 1,
+                    total_bytes: 35,
+                    read_bytes: 35,
                 }
             }),
             delta_summary: None,
@@ -1560,6 +1768,142 @@ mod tests {
     }
 
     #[test]
+    fn task_recovery_continued_renders_recovery_reason() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskRecoveryContinued,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "reason": "max_output_tokens_recovery",
+                "attempt": 2,
+                "message": "Output token limit hit. Resume directly."
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "recover: max output tokens (attempt 2)\n"
+        );
+    }
+
+    #[test]
+    fn task_recovery_continued_renders_max_output_tokens_escalation_reason() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskRecoveryContinued,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "reason": "max_output_tokens_escalate",
+                "attempt": 1,
+                "message": "Retrying the same request with a larger output token budget.",
+                "metadata": { "max_tokens": 64000 }
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "recover: max output tokens via larger budget (64000)\n"
+        );
+    }
+
+    #[test]
+    fn task_recovery_continued_renders_prompt_too_long_compaction_reason() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskRecoveryContinued,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "reason": "prompt_too_long_compaction",
+                "attempt": 1,
+                "message": "Context limit hit. Continue from the compacted thread only."
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "recover: prompt too long via compaction\n"
+        );
+    }
+
+    #[test]
+    fn task_continued_renders_completion_blocker_reason() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskContinued,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "reason": "completion_blocker",
+                "message": "still missing one source from the batch input"
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(
+            render_chat_event(&event, false),
+            "continue: still missing one source from the batch input\n"
+        );
+    }
+
+    #[test]
+    fn task_continued_hides_next_turn_noise_in_chat_mode() {
+        let event = TimelineEvent {
+            event_id: EventId::new(),
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            agent_id: AgentId::new(),
+            event_type: TimelineEventType::TaskContinued,
+            timestamp: Utc::now(),
+            intent_id: None,
+            action_id: None,
+            pre_state_hash: None,
+            post_state_hash: None,
+            duration_ms: None,
+            payload_json: json!({
+                "reason": "next_turn",
+                "message": "continuing after non-terminal tool progress"
+            }),
+            delta_summary: None,
+        };
+
+        assert_eq!(render_chat_event(&event, false), "");
+    }
+
+    #[test]
     fn task_context_assembled_renders_continuation_window_counts() {
         let event = TimelineEvent {
             event_id: EventId::new(),
@@ -1579,6 +1923,12 @@ mod tests {
                     objective: "search".to_string(),
                     current_step: 1,
                     max_steps: 4,
+                    reasoner_tokens_used: 0,
+                    max_output_tokens_recovery_count: 0,
+                    has_attempted_prompt_too_long_compaction: false,
+                    last_transition: None,
+                    read_state_cache: Vec::new(),
+                    search_state_cache: Vec::new(),
                     transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
                         ordinal: 1,
                         step: 1,
@@ -1603,6 +1953,18 @@ mod tests {
                         preview_excerpt: "preview".to_string(),
                         persisted_path: "/tmp/result.json".to_string(),
                     }]),
+                    content_replacements: ContentReplacementState::from_continuation(
+                        &StoredResultLedger::from_entries(vec![StoredResultReference {
+                            result_id: "result-1-1".to_string(),
+                            source_transcript_ordinal: 1,
+                            step: 1,
+                            result_type: "mcp_tool_call".to_string(),
+                            primary_locator: None,
+                            preview_excerpt: "preview".to_string(),
+                            persisted_path: "/tmp/result.json".to_string(),
+                        }]),
+                        &[],
+                    ),
                     reannounced_sources: Vec::new(),
                     reannounced_artifacts: Vec::new(),
                     next_step_guidance: None,
@@ -1616,6 +1978,78 @@ mod tests {
             render_chat_event(&event, false),
             "context ready (transcript 1, refs 1, reannounce 0/0/0)\n"
         );
+    }
+
+    #[test]
+    fn render_continuation_window_prefers_transcript_derived_context() {
+        let rendered = render_continuation_window(&ActiveContinuationWindow {
+            objective: "inspect gabactl".to_string(),
+            current_step: 3,
+            max_steps: 8,
+            reasoner_tokens_used: 640,
+            read_state_cache: Vec::new(),
+            search_state_cache: Vec::new(),
+            max_output_tokens_recovery_count: 2,
+            has_attempted_prompt_too_long_compaction: true,
+            last_transition: Some(ContinuationTransition {
+                reason: "max_output_tokens_escalate".to_string(),
+                attempt: Some(1),
+                message: Some(
+                    "Retrying the same request with a larger output token budget.".to_string(),
+                ),
+                metadata: serde_json::Value::Null,
+            }),
+            transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                ordinal: 1,
+                step: 3,
+                kind: TranscriptUnitKind::CarryoverMessage,
+                summary: "source reminder: /tmp/gabactl [tool|read]".to_string(),
+                result_ref_id: None,
+                primary_locator: Some("/tmp/gabactl".to_string()),
+                evidence_refs: vec!["/tmp/gabactl".to_string()],
+                working_sources: vec![WorkingSource {
+                    kind: "tool".to_string(),
+                    locator: "/tmp/gabactl".to_string(),
+                    role: "validated".to_string(),
+                    status: "read".to_string(),
+                    why_it_matters: "validated external tool path".to_string(),
+                    last_used_step: 3,
+                    evidence_refs: vec!["/tmp/gabactl".to_string()],
+                    page_reference: None,
+                    extraction_method: None,
+                    structured_summary: None,
+                    preview_excerpt: Some("validated gabactl binary".to_string()),
+                }],
+                artifact_references: vec![ArtifactReference {
+                    kind: "file".to_string(),
+                    locator: "/tmp/result.json".to_string(),
+                    status: "written".to_string(),
+                }],
+                next_step_guidance: Some(NextStepGuidance {
+                    directive: NextStepDirective::AnswerFromEvidence,
+                    reason: "the tool path is already validated".to_string(),
+                    based_on_action: None,
+                    evidence_locator: Some("/tmp/gabactl".to_string()),
+                    preferred_search_family: None,
+                    suggested_query: None,
+                }),
+                repetition_signature: None,
+                avoid_label: None,
+                compaction_snapshot: None,
+            }]),
+            reannounced_sources: Vec::new(),
+            reannounced_artifacts: Vec::new(),
+            next_step_guidance: None,
+            ..ActiveContinuationWindow::default()
+        });
+
+        assert!(rendered.contains("/tmp/gabactl"));
+        assert!(rendered.contains("/tmp/result.json"));
+        assert!(rendered.contains("the tool path is already validated"));
+        assert!(rendered.contains("reasoner_tokens_used: 640"));
+        assert!(rendered.contains("max_output_tokens_recovery_count: 2"));
+        assert!(rendered.contains("has_attempted_prompt_too_long_compaction: true"));
+        assert!(rendered.contains("max_output_tokens_escalate (attempt 1)"));
     }
 
     #[test]
@@ -1638,6 +2072,12 @@ mod tests {
                     objective: "search".to_string(),
                     current_step: 3,
                     max_steps: 4,
+                    reasoner_tokens_used: 0,
+                    max_output_tokens_recovery_count: 0,
+                    has_attempted_prompt_too_long_compaction: false,
+                    last_transition: None,
+                    read_state_cache: Vec::new(),
+                    search_state_cache: Vec::new(),
                     compaction_boundaries: vec![CompactionSnapshot {
                         boundary_id: 1,
                         compacted_at_step: 3,

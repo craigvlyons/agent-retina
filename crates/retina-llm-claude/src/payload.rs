@@ -5,6 +5,7 @@ use chrono::Local;
 use retina_types::ReasonRequest;
 use serde_json::json;
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_payload(
     model_id: &str,
     request: &ReasonRequest,
@@ -12,11 +13,29 @@ pub(crate) fn build_payload(
     prompt_caching: &ClaudePromptCaching,
     context_management: &ClaudeContextManagement,
 ) -> serde_json::Value {
+    build_payload_with_max_tokens(
+        model_id,
+        request,
+        reflection,
+        prompt_caching,
+        context_management,
+        None,
+    )
+}
+
+pub(crate) fn build_payload_with_max_tokens(
+    model_id: &str,
+    request: &ReasonRequest,
+    reflection: bool,
+    prompt_caching: &ClaudePromptCaching,
+    context_management: &ClaudeContextManagement,
+    max_tokens_override: Option<u32>,
+) -> serde_json::Value {
     let system_blocks = build_system_blocks(request, reflection, prompt_caching);
     let user_content = build_user_content_blocks(request);
     let mut payload = json!({
         "model": model_id,
-        "max_tokens": request.max_tokens.unwrap_or(if reflection { 256 } else { 512 }),
+        "max_tokens": resolved_max_tokens(request.max_tokens, reflection, max_tokens_override),
         "system": system_blocks,
         "messages": [
             {
@@ -33,6 +52,16 @@ pub(crate) fn build_payload(
     }
 
     payload
+}
+
+pub(crate) fn resolved_max_tokens(
+    request_max_tokens: Option<u32>,
+    reflection: bool,
+    max_tokens_override: Option<u32>,
+) -> u32 {
+    max_tokens_override
+        .or(request_max_tokens)
+        .unwrap_or(if reflection { 256 } else { 512 })
 }
 
 fn build_system_blocks(
@@ -131,6 +160,8 @@ Planning rules:\n\
   - use news search for current-event coverage, roundup articles, and recent reporting\n\
   - use local search for place-aware venue or nearby business lookup when location resolution matters\n\
 - If continuation_window next_step_guidance includes `preferred_search_family` or `suggested_query`, treat that as the preferred reformulation path unless the latest observed evidence clearly supports a better grounded alternative.\n\
+- If recent_context is present, treat it as active follow-up continuity rather than background chatter. Reuse previously validated tools, library paths, working sources, saved artifacts, and successful execution paths before introducing a different stack.\n\
+- If recent_context sticky_constraints mention reusing a library, toolchain, path, or prior execution path, treat that as binding unless the observed evidence shows it cannot satisfy the new task.\n\
 - For time-sensitive web tasks such as today, tonight, tomorrow, this weekend, current, or latest, use the current local date/time from context, prefer event-specific/date-specific search results over evergreen attraction pages, and do one more targeted search before answering if the first result is too generic.\n\
 - For time-sensitive event searches, do not answer with generic city attractions, venue lists, or “types of things to do” unless the search results actually contain concrete event names or date-specific details. If the first result is only an events portal or broad listing page, do one more targeted search for specific events before responding. If you still cannot verify concrete events, say that clearly instead of inventing a lineup.\n\
 - For time-sensitive event searches, do not fill gaps with general knowledge about the city. Do not mention attractions, neighborhoods, sports teams, venues, or activity categories unless they appear in the observed search results or snippets. If the results only prove that an events portal exists, say that and ask whether the user wants a narrower follow-up search.\n\
@@ -144,11 +175,15 @@ Planning rules:\n\
 - Use edit_notebook for `.ipynb` files; do not use text mutation tools for notebooks.\n\
 - Do not create or modify files unless the user asked for a saved artifact or a file change is actually required to complete the task. For answer-only tasks, prefer respond.\n\
 - For respond, put the operator-facing answer in `input.message`.\n\
+- For read_file, use `input.start_line` and `input.limit_lines` when you only need a specific region of a large file. If you expect to edit an existing file, prefer a full read before the mutation step instead of relying on a partial excerpt.\n\
 - When a file mutation succeeds, treat the saved artifact path and the verified artifact/tool-result evidence in continuation_window as the grounded source of truth for what was actually written.\n\
 - For multi-file batch tasks, do not mark task_complete=true immediately after writing one per-source artifact unless the user explicitly asked for separate output files. If the request implies one combined summary, report, or deliverable over many inputs, keep going until that combined artifact exists or you are surfacing a grounded blocker.\n\
 - If the task asks for specific PDF pages, set `input.page_start` and `input.page_end` so the shell extracts only that page range.\n\
 - For find_files, keep `input.root` as a real directory path and keep `input.pattern` limited to a filename or glob; do not pack path fragments into pattern. Use `input.recursive=false` for top-level file requests on or in a folder unless the user asked for nested contents.\n\
+- For find_files, if a previous result was truncated and you need more of the same match set, continue with `input.offset` instead of restarting the same search from the beginning.\n\
 - For search_text, keep `input.root` as the directory scope and keep `input.query` limited to search terms; do not combine them into one field.\n\
+- For search_text, choose `input.output_mode=content` when you need exact matching lines, `files_with_matches` when you are deciding which files to read next, and `count` when you need prevalence or spread rather than raw excerpts.\n\
+- For search_text, if a previous result was truncated and you still need more of the same result set, continue with `input.offset` instead of rerunning the same search from the beginning.\n\
 - Use agent_spawn only for a bounded delegated subtask whose result you will integrate back into the current task.\n\
 - For agent_spawn, set `input.prompt` to the delegated objective. Use `input.allowed_tools` or `input.denied_tools` only when narrowing the child worker's tool pool is clearly helpful.\n\
 - Set task_complete=true only when the requested work is actually complete, not when you have only found a path or partial evidence.\n\
@@ -250,10 +285,25 @@ fn render_input_schema_for_prompt(schema: &serde_json::Value) -> String {
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("value");
+            let enum_suffix = value
+                .get("enum")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    let values = items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>();
+                    if values.is_empty() {
+                        String::new()
+                    } else {
+                        format!("({})", values.join("|"))
+                    }
+                })
+                .unwrap_or_default();
             if required.contains(name.as_str()) {
-                format!("{name}: {field_type}*")
+                format!("{name}: {field_type}{enum_suffix}*")
             } else {
-                format!("{name}: {field_type}")
+                format!("{name}: {field_type}{enum_suffix}")
             }
         })
         .collect::<Vec<_>>();
@@ -373,6 +423,10 @@ mod tests {
                 recent_context: Some(RecentContext {
                     prior_objective: "list files in texts".to_string(),
                     prior_answer_summary: Some("Watcher.txt is a meeting notes file.".to_string()),
+                    sticky_constraints: vec![
+                        "Reuse the validated local file path before searching elsewhere."
+                            .to_string(),
+                    ],
                     sources: vec![WorkingSource {
                         kind: "file".to_string(),
                         locator: "C:/texts/Watcher.txt".to_string(),
@@ -421,6 +475,12 @@ mod tests {
             objective: request.context.task.clone(),
             current_step: 1,
             max_steps: 50,
+            reasoner_tokens_used: 0,
+            max_output_tokens_recovery_count: 0,
+            has_attempted_prompt_too_long_compaction: false,
+            last_transition: None,
+            read_state_cache: Vec::new(),
+            search_state_cache: Vec::new(),
             transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
                 ordinal: 1,
                 step: 1,
@@ -445,6 +505,18 @@ mod tests {
                 preview_excerpt: "generic_portal".to_string(),
                 persisted_path: "/tmp/result-1-1.json".to_string(),
             }]),
+            content_replacements: ContentReplacementState::from_continuation(
+                &StoredResultLedger::from_entries(vec![StoredResultReference {
+                    result_id: "result-1-1".to_string(),
+                    source_transcript_ordinal: 1,
+                    step: 1,
+                    result_type: "mcp_tool_call".to_string(),
+                    primary_locator: Some("https://example.com/weekend".to_string()),
+                    preview_excerpt: "generic_portal".to_string(),
+                    persisted_path: "/tmp/result-1-1.json".to_string(),
+                }]),
+                &[],
+            ),
             reannounced_sources: Vec::new(),
             reannounced_artifacts: Vec::new(),
             next_step_guidance: None,
@@ -453,13 +525,153 @@ mod tests {
         };
         let rendered = request.context.render();
         assert!(rendered.contains("Active continuation window:"));
+        assert!(rendered.contains("Recent context:"));
+        assert!(rendered.contains("sticky_constraints:"));
         assert!(!rendered.contains("Derived task summary:"));
         assert!(rendered.contains("generic_portal"));
+        assert!(rendered.contains("[stored-result result-1-1]"));
+        assert!(!rendered.contains("carryover:"));
+        assert!(!rendered.contains("content_replacements:"));
+        assert!(!rendered.contains("stored_result_refs:"));
+        assert!(!rendered.contains("reannounced_sources:"));
+        assert!(!rendered.contains("reannounced_artifacts:"));
+        assert!(!rendered.contains("next_step_guidance:"));
+        assert!(!rendered.contains("compaction_boundaries:"));
+        assert!(!rendered.contains("reannounced_compacted_results:"));
         assert!(rendered.contains("Tools:"));
-        assert!(!rendered.contains("Recent conversational context:"));
+        assert!(!rendered.contains("Operator guidance:"));
         assert!(!rendered.contains("Memory:"));
         assert!(!rendered.contains("Recent steps:"));
         assert!(!rendered.contains("Last result summary:"));
+    }
+
+    #[test]
+    fn assembled_context_render_hides_compacted_result_ref_section_when_replacement_exists() {
+        let request = ReasonRequest {
+            context: AssembledContext {
+                identity: "Retina/root".to_string(),
+                task: "summarize compacted result".to_string(),
+                continuation_window: ActiveContinuationWindow {
+                    transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                        ordinal: 1,
+                        step: 1,
+                        kind: TranscriptUnitKind::ToolResult,
+                        summary: "large directory listing".to_string(),
+                        result_ref_id: Some("boundary-3".to_string()),
+                        primary_locator: Some("/tmp".to_string()),
+                        evidence_refs: vec!["/tmp".to_string()],
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    }]),
+                    content_replacements: ContentReplacementState::from_continuation(
+                        &StoredResultLedger::default(),
+                        &[CompactedResultReference {
+                            boundary_id: 3,
+                            result_type: "directory_listing".to_string(),
+                            locator: Some("/tmp".to_string()),
+                            preview_excerpt: "preview".to_string(),
+                            continuation: None,
+                            persisted_path: Some("/tmp/boundary-3.json".to_string()),
+                        }],
+                    ),
+                    reannounced_compacted_results: vec![CompactedResultReference {
+                        boundary_id: 3,
+                        result_type: "directory_listing".to_string(),
+                        locator: Some("/tmp".to_string()),
+                        preview_excerpt: "preview".to_string(),
+                        continuation: None,
+                        persisted_path: Some("/tmp/boundary-3.json".to_string()),
+                    }],
+                    ..ActiveContinuationWindow::default()
+                },
+                recent_context: None,
+                tools: Vec::new(),
+                memory_slice: Vec::new(),
+                operator_guidance: None,
+                current_step: 1,
+                max_steps: 4,
+            },
+            tools: Vec::new(),
+            constraints: Vec::new(),
+            max_tokens: None,
+        };
+
+        let rendered = request.context.render();
+        assert!(rendered.contains("[compacted-result boundary=3]"));
+        assert!(!rendered.contains("carryover:"));
+        assert!(!rendered.contains("content_replacements:"));
+        assert!(!rendered.contains("reannounced_compacted_results:"));
+        assert!(!rendered.contains("Recent context:"));
+        assert!(!rendered.contains("Operator guidance:"));
+    }
+
+    #[test]
+    fn assembled_context_render_uses_compaction_carryover_summary() {
+        let request = ReasonRequest {
+            context: AssembledContext {
+                identity: "Retina/root".to_string(),
+                task: "continue after compaction".to_string(),
+                continuation_window: ActiveContinuationWindow {
+                    transcript: TranscriptLedger::from_entries(vec![TranscriptUnit {
+                        ordinal: 1,
+                        step: 6,
+                        kind: TranscriptUnitKind::CompactSummary,
+                        summary: "compaction carried forward: reason=\"step threshold\" summary=\"Resume from the saved report context\" preserved_locator_count=1 continuation=\"Continue from the saved report\"".to_string(),
+                        result_ref_id: None,
+                        primary_locator: None,
+                        evidence_refs: vec!["report.md".to_string()],
+                        working_sources: Vec::new(),
+                        artifact_references: Vec::new(),
+                        next_step_guidance: None,
+                        repetition_signature: None,
+                        avoid_label: None,
+                        compaction_snapshot: None,
+                    }]),
+                    compaction_boundaries: vec![CompactionSnapshot {
+                        boundary_id: 5,
+                        compacted_at_step: 6,
+                        reason: "step threshold".to_string(),
+                        score_explanations: vec![CompactionScoreExplanation {
+                            item_kind: "source".to_string(),
+                            locator: "report.md".to_string(),
+                            decision: "keep".to_string(),
+                            rationale: "authoritative".to_string(),
+                        }],
+                        preserved_locators: vec!["report.md".to_string()],
+                        active_window_summary: "Resume from the saved report context".to_string(),
+                        last_result_continuation: Some(
+                            "Continue from the saved report".to_string(),
+                        ),
+                        compacted_results: Vec::new(),
+                    }],
+                    ..ActiveContinuationWindow::default()
+                },
+                recent_context: None,
+                tools: Vec::new(),
+                memory_slice: Vec::new(),
+                operator_guidance: None,
+                current_step: 1,
+                max_steps: 4,
+            },
+            tools: Vec::new(),
+            constraints: Vec::new(),
+            max_tokens: None,
+        };
+
+        let rendered = request.context.render();
+        assert!(rendered.contains("compaction carried forward:"));
+        assert!(rendered.contains("[compact_summary]"));
+        assert!(rendered.contains("summary=\"Resume from the saved report context\""));
+        assert!(rendered.contains("preserved_locator_count=1"));
+        assert!(!rendered.contains("carried forward context:"));
+        assert!(!rendered.contains("- carryover:"));
+        assert!(!rendered.contains("compaction_boundaries:"));
+        assert!(!rendered.contains("boundary_id: 5"));
+        assert!(!rendered.contains("ranking:"));
     }
 
     #[test]
@@ -527,5 +739,42 @@ mod tests {
         assert!(instructions.contains("Search family semantics"));
         assert!(instructions.contains("preferred_search_family"));
         assert!(instructions.contains("suggested_query"));
+        assert!(instructions.contains("active follow-up continuity"));
+        assert!(instructions.contains("sticky_constraints"));
+        assert!(instructions.contains("output_mode=content"));
+        assert!(instructions.contains("files_with_matches"));
+        assert!(instructions.contains("count"));
+        assert!(instructions.contains("start_line"));
+        assert!(instructions.contains("limit_lines"));
+        assert!(instructions.contains("input.offset"));
+    }
+
+    #[test]
+    fn tool_catalog_renders_enum_values_for_search_modes() {
+        let instructions = build_stable_instructions(
+            false,
+            &[ToolDescriptor {
+                name: "search_text".to_string(),
+                description: "Search local text.".to_string(),
+                source: ToolSourceKind::BuiltinShell,
+                concurrency: ToolConcurrencyClass::ReadOnly,
+                approval: ToolApprovalPolicy::None,
+                required_authority: Vec::new(),
+                streaming: false,
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "root": { "type": "string" },
+                        "query": { "type": "string" },
+                        "output_mode": {
+                            "type": "string",
+                            "enum": ["content", "files_with_matches", "count"]
+                        }
+                    },
+                    "required": ["root", "query"]
+                }),
+            }],
+        );
+        assert!(instructions.contains("output_mode: string(content|files_with_matches|count)"));
     }
 }

@@ -163,6 +163,7 @@ impl LocalAgentRuntimeService {
         &self,
         manifest: AgentManifest,
         parent_task: &Task,
+        parent_continuation_window: Option<ActiveContinuationWindow>,
         control: Option<&ExecutionControlHandle>,
         route_label: &str,
     ) -> Result<DelegatedTaskResult> {
@@ -173,7 +174,12 @@ impl LocalAgentRuntimeService {
             Some("executing routed task"),
         )?;
 
-        let runtime_task = build_specialist_task(parent_task, &manifest, route_label);
+        let runtime_task = build_specialist_task(
+            parent_task,
+            parent_continuation_window,
+            &manifest,
+            route_label,
+        );
         let runtime_task_id = runtime_task.id.clone();
         let runtime_service = Arc::new(Self::new(
             self.supervisor.clone(),
@@ -362,7 +368,13 @@ impl AgentRuntime for LocalAgentRuntimeService {
             RoutingDecision::RouteToExisting(agent_id) => {
                 let manifest = self.route_existing_manifest(request, agent_id)?;
                 self.ensure_mcp_requirements(&manifest)?;
-                self.run_manifest_task(manifest, &request.parent_task, control, "route_existing")
+                self.run_manifest_task(
+                    manifest,
+                    &request.parent_task,
+                    request.parent_continuation_window.clone(),
+                    control,
+                    "route_existing",
+                )
             }
             RoutingDecision::Reactivate(agent_id) => {
                 let manifest = self.route_existing_manifest(request, agent_id)?;
@@ -373,12 +385,24 @@ impl AgentRuntime for LocalAgentRuntimeService {
                     AgentLifecyclePhase::Ready,
                     Some("reactivated for new task"),
                 )?;
-                self.run_manifest_task(manifest, &request.parent_task, control, "reactivate")
+                self.run_manifest_task(
+                    manifest,
+                    &request.parent_task,
+                    request.parent_continuation_window.clone(),
+                    control,
+                    "reactivate",
+                )
             }
             RoutingDecision::SpawnSpecialist { domain, capability } => {
                 let manifest = self.spawn_specialist_manifest(request, domain, capability)?;
                 self.ensure_mcp_requirements(&manifest)?;
-                self.run_manifest_task(manifest, &request.parent_task, control, "spawn_specialist")
+                self.run_manifest_task(
+                    manifest,
+                    &request.parent_task,
+                    request.parent_continuation_window.clone(),
+                    control,
+                    "spawn_specialist",
+                )
             }
         }
     }
@@ -394,6 +418,15 @@ fn build_child_task(request: &SpawnAgentRequest, child_agent_id: AgentId) -> Tas
         ),
         request.parent_task.recent_context.clone(),
     );
+    if let Some(continuation_window) = request.parent_continuation_window.clone() {
+        task.resume_context = Some(TaskResumeContext {
+            source_task_id: request.parent_task.id.clone(),
+            source_session_id: request.parent_task.session_id.clone(),
+            objective: request.parent_task.description.clone(),
+            continuation_window,
+            resume_reason: "delegated child sidechain".to_string(),
+        });
+    }
     if !request.allowed_tools.is_empty() {
         task.metadata
             .insert("allowed_tools".to_string(), request.allowed_tools.join(","));
@@ -411,7 +444,12 @@ fn build_child_task(request: &SpawnAgentRequest, child_agent_id: AgentId) -> Tas
     task
 }
 
-fn build_specialist_task(parent_task: &Task, manifest: &AgentManifest, route_label: &str) -> Task {
+fn build_specialist_task(
+    parent_task: &Task,
+    parent_continuation_window: Option<ActiveContinuationWindow>,
+    manifest: &AgentManifest,
+    route_label: &str,
+) -> Task {
     let child_description = if let Some(initial_prompt) = manifest.initial_prompt.as_deref() {
         if initial_prompt.trim().is_empty() {
             format!(
@@ -437,6 +475,15 @@ fn build_specialist_task(parent_task: &Task, manifest: &AgentManifest, route_lab
         child_description,
         parent_task.recent_context.clone(),
     );
+    if let Some(continuation_window) = parent_continuation_window {
+        task.resume_context = Some(TaskResumeContext {
+            source_task_id: parent_task.id.clone(),
+            source_session_id: parent_task.session_id.clone(),
+            objective: parent_task.description.clone(),
+            continuation_window,
+            resume_reason: "delegated specialist sidechain".to_string(),
+        });
+    }
     task.metadata.insert(
         "delegated_from_agent".to_string(),
         parent_task.agent_id.0.clone(),
@@ -473,6 +520,14 @@ fn build_specialist_task(parent_task: &Task, manifest: &AgentManifest, route_lab
             manifest.required_mcp_servers.join(","),
         );
     }
+    task.metadata.insert(
+        "max_reasoner_calls_per_task".to_string(),
+        manifest.budget.max_reasoner_calls_per_task.to_string(),
+    );
+    task.metadata.insert(
+        "max_tokens_per_task".to_string(),
+        manifest.budget.max_tokens_per_task.to_string(),
+    );
     task
 }
 
@@ -736,6 +791,36 @@ mod tests {
         result.unwrap_or_else(|error| panic!("test operation failed: {error}"))
     }
 
+    fn sample_parent_continuation(objective: &str) -> ActiveContinuationWindow {
+        ActiveContinuationWindow {
+            objective: objective.to_string(),
+            current_step: 4,
+            max_steps: 12,
+            reasoner_tokens_used: 0,
+            read_state_cache: Vec::new(),
+            search_state_cache: Vec::new(),
+            reannounced_sources: vec![WorkingSource {
+                kind: "tool".to_string(),
+                locator: "/tmp/gabactl".to_string(),
+                role: "validated".to_string(),
+                status: "read".to_string(),
+                why_it_matters: "validated tool path".to_string(),
+                last_used_step: 4,
+                evidence_refs: vec!["/tmp/gabactl".to_string()],
+                page_reference: None,
+                extraction_method: None,
+                structured_summary: None,
+                preview_excerpt: Some("validated gabactl binary".to_string()),
+            }],
+            reannounced_artifacts: vec![ArtifactReference {
+                kind: "file".to_string(),
+                locator: "/tmp/result.json".to_string(),
+                status: "written".to_string(),
+            }],
+            ..ActiveContinuationWindow::default()
+        }
+    }
+
     fn test_service() -> (tempfile::TempDir, LocalAgentRuntimeService) {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("agent.db");
@@ -765,6 +850,7 @@ mod tests {
         let manifest = must(service.spawn_specialist_manifest(
             &RouteAgentRequest {
                 parent_task,
+                parent_continuation_window: None,
                 decision: RoutingDecision::SpawnSpecialist {
                     domain: "research".to_string(),
                     capability: "read and summarize documents".to_string(),
@@ -811,6 +897,7 @@ max_steps = 9
         let manifest = must(service.spawn_specialist_manifest(
             &RouteAgentRequest {
                 parent_task: Task::new(AgentId("root".to_string()), "research startup.md"),
+                parent_continuation_window: None,
                 decision: RoutingDecision::SpawnSpecialist {
                     domain: "research".to_string(),
                     capability: "read and summarize documents".to_string(),
@@ -862,6 +949,7 @@ max_steps = 9
         };
         let task = build_specialist_task(
             &Task::new(AgentId("root".to_string()), "research startup.md"),
+            None,
             &manifest,
             "spawn_specialist",
         );
@@ -904,6 +992,88 @@ max_steps = 9
                 .map(String::as_str),
             Some("Return a concise synthesis.")
         );
+        assert_eq!(
+            task.metadata
+                .get("max_reasoner_calls_per_task")
+                .map(String::as_str),
+            Some("8")
+        );
+        assert_eq!(
+            task.metadata.get("max_tokens_per_task").map(String::as_str),
+            Some("8192")
+        );
+    }
+
+    #[test]
+    fn build_child_task_inherits_parent_continuation_as_resume_context() {
+        let parent_task = Task::new(AgentId("root".to_string()), "inspect gabactl");
+        let parent_task_id = parent_task.id.clone();
+        let parent_session_id = parent_task.session_id.clone();
+        let continuation = sample_parent_continuation(&parent_task.description);
+        let task = build_child_task(
+            &SpawnAgentRequest {
+                parent_task: parent_task.clone(),
+                parent_continuation_window: Some(continuation.clone()),
+                prompt: "use the validated library to open chrome".to_string(),
+                allowed_tools: vec!["run_command".to_string()],
+                denied_tools: Vec::new(),
+            },
+            AgentId("local-child".to_string()),
+        );
+
+        let resume = task.resume_context.expect("child resume context");
+        assert_eq!(resume.source_task_id, parent_task_id);
+        assert_eq!(resume.source_session_id, parent_session_id);
+        assert_eq!(resume.objective, "inspect gabactl");
+        assert_eq!(resume.resume_reason, "delegated child sidechain");
+        assert_eq!(resume.continuation_window.objective, continuation.objective);
+        assert_eq!(resume.continuation_window.reannounced_sources.len(), 1);
+        assert_eq!(
+            task.metadata.get("denied_tools").map(String::as_str),
+            Some("agent_spawn")
+        );
+    }
+
+    #[test]
+    fn specialist_task_inherits_parent_continuation_as_resume_context() {
+        let now = Utc::now();
+        let parent_task = Task::new(AgentId("root".to_string()), "research startup.md");
+        let parent_task_id = parent_task.id.clone();
+        let parent_session_id = parent_task.session_id.clone();
+        let continuation = sample_parent_continuation(&parent_task.description);
+        let manifest = AgentManifest {
+            agent_id: AgentId("specialist-research".to_string()),
+            domain: "research".to_string(),
+            status: AgentStatus::Idle,
+            description: "research specialist".to_string(),
+            role_prompt: None,
+            initial_prompt: None,
+            model_id: None,
+            created_at: now,
+            updated_at: now,
+            parent_agent_id: Some(AgentId("root".to_string())),
+            capabilities: vec!["research".to_string()],
+            allowed_tools: Vec::new(),
+            denied_tools: Vec::new(),
+            required_mcp_servers: Vec::new(),
+            authority: AgentAuthority::default(),
+            lifecycle: AgentLifecycle::ready(),
+            budget: AgentBudget::default(),
+        };
+
+        let task = build_specialist_task(
+            &parent_task,
+            Some(continuation.clone()),
+            &manifest,
+            "spawn_specialist",
+        );
+
+        let resume = task.resume_context.expect("specialist resume context");
+        assert_eq!(resume.source_task_id, parent_task_id);
+        assert_eq!(resume.source_session_id, parent_session_id);
+        assert_eq!(resume.resume_reason, "delegated specialist sidechain");
+        assert_eq!(resume.continuation_window.objective, continuation.objective);
+        assert_eq!(resume.continuation_window.reannounced_artifacts.len(), 1);
     }
 
     #[test]
@@ -991,6 +1161,7 @@ max_steps = 11
         let refreshed = must(service.route_existing_manifest(
             &RouteAgentRequest {
                 parent_task: Task::new(AgentId("root".to_string()), "research startup.md"),
+                parent_continuation_window: None,
                 decision: RoutingDecision::RouteToExisting(AgentId(
                     "specialist-research".to_string(),
                 )),

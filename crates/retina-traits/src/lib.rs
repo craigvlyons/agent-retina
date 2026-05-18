@@ -22,6 +22,10 @@ pub trait Shell: Send + Sync {
         let _ = control;
         self.execute(action)
     }
+    fn restore_read_state_cache(&self, states: &[CachedFileReadState]) -> Result<()> {
+        let _ = states;
+        Ok(())
+    }
     fn constraints(&self) -> &[HardConstraint];
     fn capabilities(&self) -> ShellCapabilities;
     fn request_approval(&self, request: &ApprovalRequest) -> Result<ApprovalResponse>;
@@ -37,6 +41,10 @@ pub trait Reasoner: Send + Sync {
     }
 
     fn capabilities(&self) -> ReasonerCapabilities;
+
+    fn take_recent_transitions(&self) -> Vec<ReasonerTransition> {
+        Vec::new()
+    }
 }
 
 pub trait AgentRuntime: Send + Sync {

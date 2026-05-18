@@ -109,6 +109,9 @@ pub enum TranscriptUnitKind {
     ToolInvocation,
     ToolResult,
     CompactBoundary,
+    CompactSummary,
+    CarryoverMessage,
+    RecoveryContinuation,
     MicroCompactBoundary,
     CompactedResultRef,
     RestoredContinuation,
@@ -129,6 +132,9 @@ impl Display for TranscriptUnitKind {
             Self::ToolInvocation => "tool_invocation",
             Self::ToolResult => "tool_result",
             Self::CompactBoundary => "compact_boundary",
+            Self::CompactSummary => "compact_summary",
+            Self::CarryoverMessage => "carryover_message",
+            Self::RecoveryContinuation => "recovery_continuation",
             Self::MicroCompactBoundary => "microcompact_boundary",
             Self::CompactedResultRef => "compacted_result_ref",
             Self::RestoredContinuation => "restored_continuation",
@@ -162,6 +168,10 @@ pub struct TranscriptUnit {
 
 impl TranscriptUnit {
     pub fn render(&self) -> String {
+        self.render_with_override(&self.summary)
+    }
+
+    pub fn render_with_override(&self, text: &str) -> String {
         let result_ref = self
             .result_ref_id
             .as_ref()
@@ -179,7 +189,7 @@ impl TranscriptUnit {
         };
         format!(
             "- #{} step {} [{}] {}{}{}{}",
-            self.ordinal, self.step, self.kind, self.summary, result_ref, locator, refs
+            self.ordinal, self.step, self.kind, text, result_ref, locator, refs
         )
     }
 }
@@ -278,13 +288,25 @@ impl TranscriptLedger {
     }
 
     pub fn tail_from(&self, start: usize) -> Vec<TranscriptUnit> {
-        self.entries[start..].to_vec()
+        self.entries[start.min(self.entries.len())..].to_vec()
+    }
+
+    pub fn model_facing_tail_from(&self, start: usize) -> Vec<TranscriptUnit> {
+        self.entries[start.min(self.entries.len())..]
+            .iter()
+            .filter(|entry| entry.kind.is_model_facing())
+            .cloned()
+            .collect()
     }
 
     pub fn latest_boundary_start(&self) -> Option<usize> {
         self.entries
             .iter()
             .rposition(|item| matches!(item.kind, TranscriptUnitKind::CompactBoundary))
+    }
+
+    pub fn latest_boundary_tail_start(&self) -> Option<usize> {
+        self.latest_boundary_start().map(|index| index + 1)
     }
 
     pub fn recent_step_summaries(&self, limit: usize) -> Vec<String> {
@@ -374,6 +396,27 @@ impl TranscriptLedger {
             .iter()
             .rev()
             .find_map(|entry| entry.compaction_snapshot.clone())
+    }
+}
+
+impl TranscriptUnitKind {
+    pub fn is_model_facing(&self) -> bool {
+        matches!(
+            self,
+            Self::TaskMessage
+                | Self::ToolInvocation
+                | Self::ToolResult
+                | Self::CompactBoundary
+                | Self::CompactSummary
+                | Self::CarryoverMessage
+                | Self::RecoveryContinuation
+                | Self::MicroCompactBoundary
+                | Self::CompactedResultRef
+                | Self::RestoredContinuation
+                | Self::FinalResponse
+                | Self::TerminalBlocked
+                | Self::TerminalFailure
+        )
     }
 }
 
@@ -762,6 +805,21 @@ impl CompactionSnapshot {
             compacted_results,
             preserved,
             scores
+        )
+    }
+
+    pub fn render_thread_summary(&self) -> String {
+        let continuation = self
+            .last_result_continuation
+            .as_ref()
+            .map(|value| format!(" continuation=\"{}\"", value))
+            .unwrap_or_default();
+        format!(
+            "compaction carried forward: reason=\"{}\" summary=\"{}\" preserved_locator_count={}{}",
+            self.reason,
+            self.active_window_summary,
+            self.preserved_locators.len(),
+            continuation
         )
     }
 }

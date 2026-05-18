@@ -214,16 +214,27 @@ impl ClaudeAction {
                 pattern: self.required_string("pattern")?,
                 recursive: self.optional_bool("recursive")?.unwrap_or(true),
                 max_results: self.optional_usize("max_results")?.unwrap_or(50),
+                offset: self.optional_usize("offset")?.unwrap_or(0),
             },
             "search_text" => Action::SearchText {
                 id: ActionId::new(),
                 root: self.required_string("root")?.into(),
                 query: self.required_string("query")?,
                 max_results: self.optional_usize("max_results")?.unwrap_or(25),
+                offset: self.optional_usize("offset")?.unwrap_or(0),
+                glob: self.optional_string("glob")?,
+                case_insensitive: self.optional_bool("case_insensitive")?.unwrap_or(true),
+                output_mode: match self.optional_string("output_mode")?.as_deref() {
+                    Some("count") => TextSearchOutputMode::Count,
+                    Some("files_with_matches") => TextSearchOutputMode::FilesWithMatches,
+                    _ => TextSearchOutputMode::Content,
+                },
             },
             "read_file" => Action::ReadFile {
                 id: ActionId::new(),
                 path: self.required_string("path")?.into(),
+                start_line: self.optional_usize("start_line")?,
+                limit_lines: self.optional_usize("limit_lines")?,
                 max_bytes: self.optional_usize("max_bytes")?,
             },
             "ingest_structured_data" => Action::IngestStructuredData {

@@ -32,12 +32,24 @@ pub(crate) fn derive_next_step_guidance(
                 suggested_query: None,
             })
         }
-        ActionResult::TextSearch { root, matches, .. } if !matches.is_empty() => {
+        ActionResult::TextSearch {
+            root,
+            matches,
+            filenames,
+            num_matches,
+            ..
+        } if !matches.is_empty() || !filenames.is_empty() || *num_matches > 0 => {
             Some(NextStepGuidance {
                 directive: NextStepDirective::GatherMissingFact,
                 reason: format!(
-                    "{} text match(es) already exist; read one matched file or answer from the observed lines instead of rerunning the same text search",
-                    matches.len()
+                    "{} text search result(s) already exist; read one matched file or answer from the observed evidence instead of rerunning the same text search",
+                    if !matches.is_empty() {
+                        matches.len()
+                    } else if !filenames.is_empty() {
+                        filenames.len()
+                    } else {
+                        *num_matches
+                    }
                 ),
                 based_on_action,
                 evidence_locator: Some(root.display().to_string()),
@@ -97,21 +109,43 @@ pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
             preview_paths(entries.iter().map(|entry| entry.path.clone()).collect())
         ),
         ActionResult::FileMatches {
-            pattern, matches, ..
+            pattern,
+            matches,
+            truncated,
+            applied_offset,
+            ..
         } => format!(
-            "found {} match{} for {} [{}]",
+            "found {} match{} for {}{}{} [{}]",
             matches.len(),
             if matches.len() == 1 { "" } else { "es" },
             pattern,
+            if *truncated { ", truncated" } else { "" },
+            if *applied_offset > 0 {
+                format!(", offset={applied_offset}")
+            } else {
+                String::new()
+            },
             preview_paths(matches.clone())
         ),
         ActionResult::FileRead {
             path,
             content,
             truncated,
+            start_line,
+            line_count,
+            total_lines,
+            ..
         } => format!(
-            "read {} ({} chars{}): {}",
+            "read {} (line {}{}, {} of {} lines, {} chars{}): {}",
             path.display(),
+            start_line,
+            if *line_count > 0 {
+                format!("-{}", start_line + line_count.saturating_sub(1))
+            } else {
+                String::new()
+            },
+            line_count,
+            total_lines,
             content.chars().count(),
             if *truncated { ", truncated" } else { "" },
             preview_text(content, 120)
@@ -157,13 +191,65 @@ pub(crate) fn summarize_action_result(result: &ActionResult) -> String {
             structured_rows_detected,
             preview_text(content, 120)
         ),
-        ActionResult::TextSearch { query, matches, .. } => format!(
-            "found {} text match{} for {} [{}]",
-            matches.len(),
-            if matches.len() == 1 { "" } else { "es" },
+        ActionResult::TextSearch {
             query,
-            preview_search_matches(matches)
-        ),
+            output_mode,
+            matches,
+            filenames,
+            num_files,
+            num_matches,
+            truncated,
+            applied_offset,
+            glob,
+            case_insensitive,
+            ..
+        } => {
+            let core = match output_mode {
+                TextSearchOutputMode::Content => format!(
+                    "found {} text match{} for {}",
+                    matches.len(),
+                    if matches.len() == 1 { "" } else { "es" },
+                    query
+                ),
+                TextSearchOutputMode::FilesWithMatches => format!(
+                    "found {} matching file{} for {}",
+                    num_files,
+                    if *num_files == 1 { "" } else { "s" },
+                    query
+                ),
+                TextSearchOutputMode::Count => format!(
+                    "counted {} text match{} across {} file{} for {}",
+                    num_matches,
+                    if *num_matches == 1 { "" } else { "es" },
+                    num_files,
+                    if *num_files == 1 { "" } else { "s" },
+                    query
+                ),
+            };
+            let preview = match output_mode {
+                TextSearchOutputMode::Content => preview_search_matches(matches),
+                TextSearchOutputMode::FilesWithMatches => preview_paths(filenames.clone()),
+                TextSearchOutputMode::Count => format!("{num_matches} total"),
+            };
+            format!(
+                "{core}{}{}{}{} [{}]",
+                if *truncated { ", truncated" } else { "" },
+                if *applied_offset > 0 {
+                    format!(", offset={applied_offset}")
+                } else {
+                    String::new()
+                },
+                glob.as_ref()
+                    .map(|value| format!(", glob={value}"))
+                    .unwrap_or_default(),
+                if *case_insensitive {
+                    ", case_insensitive"
+                } else {
+                    ""
+                },
+                preview
+            )
+        }
         ActionResult::McpResources { server, resources } => format!(
             "listed {} MCP resource{}{}",
             resources.len(),
@@ -296,21 +382,35 @@ pub(crate) fn compact_action_result_for_context(
             root,
             pattern,
             matches,
+            truncated,
+            applied_offset,
         } => serde_json::json!({
             "type": "file_matches",
             "root": root,
             "pattern": pattern,
             "count": matches.len(),
+            "truncated": truncated,
+            "applied_offset": applied_offset,
             "matches": matches.iter().take(12).collect::<Vec<_>>(),
         }),
         ActionResult::FileRead {
             path,
             content,
             truncated,
+            start_line,
+            line_count,
+            total_lines,
+            total_bytes,
+            read_bytes,
         } => serde_json::json!({
             "type": "file_read",
             "path": path,
             "truncated": truncated,
+            "start_line": start_line,
+            "line_count": line_count,
+            "total_lines": total_lines,
+            "total_bytes": total_bytes,
+            "read_bytes": read_bytes,
             "content": preview_text(content, 8000),
         }),
         ActionResult::StructuredData {
@@ -352,12 +452,30 @@ pub(crate) fn compact_action_result_for_context(
         ActionResult::TextSearch {
             root,
             query,
+            output_mode,
             matches,
+            content,
+            filenames,
+            num_files,
+            num_matches,
+            truncated,
+            applied_offset,
+            glob,
+            case_insensitive,
         } => serde_json::json!({
             "type": "text_search",
             "root": root,
             "query": query,
+            "output_mode": output_mode,
             "count": matches.len(),
+            "content": content.as_ref().map(|value| preview_text(value, 2000)),
+            "filenames": filenames.iter().take(12).collect::<Vec<_>>(),
+            "num_files": num_files,
+            "num_matches": num_matches,
+            "truncated": truncated,
+            "applied_offset": applied_offset,
+            "glob": glob,
+            "case_insensitive": case_insensitive,
             "matches": matches
                 .iter()
                 .take(8)
@@ -484,6 +602,7 @@ pub(crate) fn repeated_step_signature(action: &Action, result: &ActionResult) ->
         root,
         pattern,
         matches,
+        ..
     } = result
     {
         return Some(format!(
@@ -498,14 +617,28 @@ pub(crate) fn repeated_step_signature(action: &Action, result: &ActionResult) ->
         root,
         query,
         matches,
+        filenames,
+        num_matches,
+        ..
     } = result
     {
-        let top_matches = matches
-            .iter()
-            .take(4)
-            .map(|item| format!("{}#L{}", item.path.display(), item.line_number))
-            .collect::<Vec<_>>()
-            .join("|");
+        let top_matches = if !matches.is_empty() {
+            matches
+                .iter()
+                .take(4)
+                .map(|item| format!("{}#L{}", item.path.display(), item.line_number))
+                .collect::<Vec<_>>()
+                .join("|")
+        } else if !filenames.is_empty() {
+            filenames
+                .iter()
+                .take(4)
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("|")
+        } else {
+            format!("count={num_matches}")
+        };
         return Some(format!(
             "text_search:{}:{}::{}",
             root.display(),
@@ -770,6 +903,9 @@ pub(crate) fn compact_last_result_for_compacted_context(
             "type": "file_read",
             "path": value.get("path"),
             "truncated": value.get("truncated"),
+            "start_line": value.get("start_line"),
+            "line_count": value.get("line_count"),
+            "total_lines": value.get("total_lines"),
             "content_preview": value
                 .get("content")
                 .and_then(serde_json::Value::as_str)
@@ -806,6 +942,10 @@ pub(crate) fn compact_last_result_for_compacted_context(
             "root": value.get("root"),
             "query": value.get("query"),
             "count": value.get("count"),
+            "truncated": value.get("truncated"),
+            "applied_offset": value.get("applied_offset"),
+            "glob": value.get("glob"),
+            "case_insensitive": value.get("case_insensitive"),
             "matches": value.get("matches"),
             "continuation": "use continuation working sources and artifact refs for exact evidence"
         }),
@@ -814,6 +954,8 @@ pub(crate) fn compact_last_result_for_compacted_context(
             "root": value.get("root"),
             "pattern": value.get("pattern"),
             "count": value.get("count"),
+            "truncated": value.get("truncated"),
+            "applied_offset": value.get("applied_offset"),
             "matches": value.get("matches"),
             "continuation": "choose from continuation candidate sources instead of re-searching"
         }),
@@ -1033,29 +1175,16 @@ where
     P: Fn(&T) -> bool,
 {
     let mut selected = Vec::new();
+    let is_in_transcript = |value: &str| transcript_locators.iter().any(|item| item == value);
 
     for preserved in preserved_locators {
+        if is_in_transcript(preserved) {
+            continue;
+        }
         if let Some(item) = prioritized.iter().find(|item| locator(item) == *preserved) {
             if !selected
                 .iter()
                 .any(|existing| locator(existing) == *preserved)
-            {
-                selected.push(item.clone());
-            }
-        }
-        if selected.len() >= limit {
-            return selected;
-        }
-    }
-
-    for transcript_locator in transcript_locators {
-        if let Some(item) = prioritized
-            .iter()
-            .find(|item| locator(item) == *transcript_locator)
-        {
-            if !selected
-                .iter()
-                .any(|existing| locator(existing) == *transcript_locator)
             {
                 selected.push(item.clone());
             }
@@ -1070,6 +1199,9 @@ where
             break;
         }
         let item_locator = locator(item);
+        if is_in_transcript(&item_locator) {
+            continue;
+        }
         if selected
             .iter()
             .any(|existing| locator(existing) == item_locator)
@@ -1084,6 +1216,9 @@ where
             break;
         }
         let item_locator = locator(item);
+        if is_in_transcript(&item_locator) {
+            continue;
+        }
         if selected
             .iter()
             .any(|existing| locator(existing) == item_locator)
@@ -1194,15 +1329,27 @@ pub(crate) fn artifact_references_for_result(result: &ActionResult) -> Vec<Artif
             locator: document_locator_with_page_range(path, page_range.as_ref()),
             status: "extracted".to_string(),
         }],
-        ActionResult::TextSearch { matches, .. } => matches
-            .iter()
-            .take(6)
-            .map(|item| ArtifactReference {
-                kind: "file".to_string(),
-                locator: item.path.display().to_string(),
-                status: "searched".to_string(),
-            })
-            .collect(),
+        ActionResult::TextSearch {
+            matches, filenames, ..
+        } => {
+            let paths = if !matches.is_empty() {
+                matches
+                    .iter()
+                    .map(|item| item.path.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                filenames.clone()
+            };
+            paths
+                .into_iter()
+                .take(6)
+                .map(|path| ArtifactReference {
+                    kind: "file".to_string(),
+                    locator: path.display().to_string(),
+                    status: "searched".to_string(),
+                })
+                .collect()
+        }
         ActionResult::McpResources { resources, .. } => resources
             .iter()
             .take(8)
@@ -1348,6 +1495,7 @@ pub(crate) fn working_sources_for_result(
             root,
             pattern,
             matches,
+            ..
         } => matches
             .iter()
             .take(6)
@@ -1425,23 +1573,61 @@ pub(crate) fn working_sources_for_result(
             structured_summary: None,
             preview_excerpt: Some(preview_text(content, 100)),
         }],
-        ActionResult::TextSearch { matches, .. } => matches
-            .iter()
-            .take(6)
-            .map(|item| WorkingSource {
-                kind: "file".to_string(),
-                locator: item.path.display().to_string(),
-                role: "supporting".to_string(),
-                status: "matched_text".to_string(),
-                why_it_matters: "contains text evidence relevant to the task".to_string(),
-                last_used_step: step_index,
-                evidence_refs: vec![format!("{}:{}", item.path.display(), item.line_number)],
-                page_reference: None,
-                extraction_method: None,
-                structured_summary: None,
-                preview_excerpt: Some(preview_text(&item.line, 100)),
-            })
-            .collect(),
+        ActionResult::TextSearch {
+            matches,
+            filenames,
+            num_matches,
+            ..
+        } => {
+            if !matches.is_empty() {
+                matches
+                    .iter()
+                    .take(6)
+                    .map(|item| WorkingSource {
+                        kind: "file".to_string(),
+                        locator: item.path.display().to_string(),
+                        role: "supporting".to_string(),
+                        status: "matched_text".to_string(),
+                        why_it_matters: "contains text evidence relevant to the task".to_string(),
+                        last_used_step: step_index,
+                        evidence_refs: vec![format!(
+                            "{}:{}",
+                            item.path.display(),
+                            item.line_number
+                        )],
+                        page_reference: None,
+                        extraction_method: None,
+                        structured_summary: None,
+                        preview_excerpt: Some(preview_text(&item.line, 100)),
+                    })
+                    .collect()
+            } else {
+                filenames
+                    .iter()
+                    .take(6)
+                    .map(|path| WorkingSource {
+                        kind: "file".to_string(),
+                        locator: path.display().to_string(),
+                        role: "supporting".to_string(),
+                        status: "matched_text".to_string(),
+                        why_it_matters: if *num_matches > 0 {
+                            format!(
+                                "contains counted text evidence relevant to the task ({} total matches)",
+                                num_matches
+                            )
+                        } else {
+                            "contains text evidence relevant to the task".to_string()
+                        },
+                        last_used_step: step_index,
+                        evidence_refs: vec![path.display().to_string()],
+                        page_reference: None,
+                        extraction_method: None,
+                        structured_summary: None,
+                        preview_excerpt: None,
+                    })
+                    .collect()
+            }
+        }
         ActionResult::McpResources { resources, .. } => resources
             .iter()
             .take(8)

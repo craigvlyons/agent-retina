@@ -12,6 +12,13 @@ use std::path::{Path, PathBuf};
 pub(crate) struct TaskLoopState {
     pub(crate) transcript: TranscriptLedger,
     pub(crate) stored_results: StoredResultLedger,
+    pub(crate) content_replacements: ContentReplacementState,
+    pub(crate) read_state_cache: Vec<CachedFileReadState>,
+    pub(crate) search_state_cache: Vec<CachedSearchState>,
+    pub(crate) reasoner_tokens_used: u32,
+    pub(crate) max_output_tokens_recovery_count: usize,
+    pub(crate) has_attempted_prompt_too_long_compaction: bool,
+    pub(crate) last_transition: Option<ContinuationTransition>,
 }
 
 impl TaskLoopState {
@@ -19,6 +26,13 @@ impl TaskLoopState {
         Self {
             transcript: TranscriptLedger::default(),
             stored_results: StoredResultLedger::default(),
+            content_replacements: ContentReplacementState::default(),
+            read_state_cache: Vec::new(),
+            search_state_cache: Vec::new(),
+            reasoner_tokens_used: 0,
+            max_output_tokens_recovery_count: 0,
+            has_attempted_prompt_too_long_compaction: false,
+            last_transition: None,
         }
     }
 
@@ -26,6 +40,16 @@ impl TaskLoopState {
         let mut state = Self::new(context.continuation_window.max_steps);
         state.transcript = context.continuation_window.transcript.clone();
         state.stored_results = context.continuation_window.stored_results.clone();
+        state.content_replacements = context.continuation_window.content_replacements.clone();
+        state.read_state_cache = context.continuation_window.read_state_cache.clone();
+        state.search_state_cache = context.continuation_window.search_state_cache.clone();
+        state.reasoner_tokens_used = context.continuation_window.reasoner_tokens_used;
+        state.max_output_tokens_recovery_count =
+            context.continuation_window.max_output_tokens_recovery_count;
+        state.has_attempted_prompt_too_long_compaction = context
+            .continuation_window
+            .has_attempted_prompt_too_long_compaction;
+        state.last_transition = context.continuation_window.last_transition.clone();
         state.push_transcript_unit(
             context.continuation_window.current_step,
             TranscriptUnitKind::RestoredContinuation,
@@ -50,6 +74,47 @@ impl TaskLoopState {
             None,
         );
         state
+    }
+
+    pub(crate) fn record_reasoner_usage(&mut self, tokens: &TokenUsage) -> u32 {
+        let delta = tokens.input_tokens
+            + tokens.output_tokens
+            + tokens.cache_creation_input_tokens
+            + tokens.cache_read_input_tokens;
+        self.reasoner_tokens_used = self.reasoner_tokens_used.saturating_add(delta);
+        self.reasoner_tokens_used
+    }
+
+    pub(crate) fn reasoner_tokens_used(&self) -> u32 {
+        self.reasoner_tokens_used
+    }
+
+    pub(crate) fn read_state_cache(&self) -> &[CachedFileReadState] {
+        &self.read_state_cache
+    }
+
+    pub(crate) fn search_state_cache(&self) -> &[CachedSearchState] {
+        &self.search_state_cache
+    }
+
+    pub(crate) fn record_transition(
+        &mut self,
+        reason: impl Into<String>,
+        attempt: Option<u64>,
+        message: Option<String>,
+        metadata: serde_json::Value,
+    ) {
+        self.last_transition = Some(ContinuationTransition {
+            reason: reason.into(),
+            attempt,
+            message,
+            metadata,
+        });
+    }
+
+    pub(crate) fn reset_recovery_state(&mut self) {
+        self.max_output_tokens_recovery_count = 0;
+        self.has_attempted_prompt_too_long_compaction = false;
     }
 
     pub(crate) fn record_task_message(&mut self, objective: &str) {
@@ -149,6 +214,28 @@ impl TaskLoopState {
         );
     }
 
+    pub(crate) fn record_recovery_continuation(
+        &mut self,
+        summary: impl Into<String>,
+        repetition_signature: impl Into<String>,
+    ) {
+        let step = self.current_step().max(1);
+        self.push_transcript_unit(
+            step,
+            TranscriptUnitKind::RecoveryContinuation,
+            summary.into(),
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(repetition_signature.into()),
+            None,
+            None,
+        );
+    }
+
     pub(crate) fn record_model_decision(
         &mut self,
         step: usize,
@@ -188,6 +275,7 @@ impl TaskLoopState {
     ) -> Result<StepProgress> {
         let step_index = self.current_step() + 1;
         let mut repeated_without_progress = false;
+        let mut new_content_replacements = Vec::new();
         self.push_transcript_unit(
             step_index,
             TranscriptUnitKind::ToolInvocation,
@@ -204,6 +292,8 @@ impl TaskLoopState {
         );
         match outcome {
             Outcome::Success(result) if !matches!(action, Action::Respond { .. }) => {
+                self.record_read_state_from_result(result);
+                self.record_search_state_from_result(result);
                 let summary = summarize_action_result(result);
                 let artifact_refs = artifact_references_for_result(result);
                 let transcript_locator = artifact_refs.first().map(|item| item.locator.clone());
@@ -233,6 +323,7 @@ impl TaskLoopState {
                     &compacted_result,
                     transcript_locator.as_deref(),
                     self.transcript.next_ordinal(),
+                    &mut new_content_replacements,
                 )?;
                 self.push_transcript_unit(
                     step_index,
@@ -318,7 +409,53 @@ impl TaskLoopState {
         };
         Ok(StepProgress {
             repeated_without_progress,
+            new_content_replacements,
         })
+    }
+
+    fn record_read_state_from_result(&mut self, result: &ActionResult) {
+        const MAX_READ_STATE_CACHE: usize = 8;
+        let Some(next_state) = read_state_from_action_result(result) else {
+            return;
+        };
+        if let Some(existing) = self
+            .read_state_cache
+            .iter_mut()
+            .find(|state| state.path == next_state.path)
+        {
+            *existing = next_state;
+        } else {
+            self.read_state_cache.push(next_state);
+        }
+        self.read_state_cache
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        if self.read_state_cache.len() > MAX_READ_STATE_CACHE {
+            let excess = self.read_state_cache.len() - MAX_READ_STATE_CACHE;
+            self.read_state_cache.drain(0..excess);
+        }
+    }
+
+    fn record_search_state_from_result(&mut self, result: &ActionResult) {
+        const MAX_SEARCH_STATE_CACHE: usize = 8;
+        let Some(next_state) = CachedSearchState::from_action_result(result) else {
+            return;
+        };
+        let next_key = next_state.cache_key();
+        if let Some(existing) = self
+            .search_state_cache
+            .iter_mut()
+            .find(|state| state.cache_key() == next_key)
+        {
+            *existing = next_state;
+        } else {
+            self.search_state_cache.push(next_state);
+        }
+        self.search_state_cache
+            .sort_by(|left, right| left.cache_key().cmp(&right.cache_key()));
+        if self.search_state_cache.len() > MAX_SEARCH_STATE_CACHE {
+            let excess = self.search_state_cache.len() - MAX_SEARCH_STATE_CACHE;
+            self.search_state_cache.drain(0..excess);
+        }
     }
 
     pub(crate) fn apply_live_compaction(&mut self, task_id: &TaskId) -> Option<CompactionDecision> {
@@ -403,10 +540,38 @@ impl TaskLoopState {
             Some(snapshot),
         );
         self.trim_compaction_history(existing_boundary_count + 1);
+        if let Some(snapshot) = self.latest_compaction_snapshot() {
+            self.push_transcript_unit(
+                step_index,
+                TranscriptUnitKind::CompactSummary,
+                snapshot.render_thread_summary(),
+                None,
+                None,
+                snapshot
+                    .preserved_locators
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect(),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+        let mut new_content_replacements = Vec::new();
         if let Some(reference) = self
             .latest_compaction_snapshot()
             .and_then(|snapshot| snapshot.compacted_results.last().cloned())
         {
+            if let Some(record) = self
+                .content_replacements
+                .record_compacted_result(&reference)
+            {
+                new_content_replacements.push(record);
+            }
             self.push_transcript_unit(
                 step_index,
                 TranscriptUnitKind::CompactedResultRef,
@@ -473,6 +638,7 @@ impl TaskLoopState {
         Some(CompactionDecision {
             reason,
             score_explanations,
+            new_content_replacements,
         })
     }
 }
@@ -519,11 +685,13 @@ impl TaskLoopState {
 #[derive(Default)]
 pub(crate) struct StepProgress {
     pub(crate) repeated_without_progress: bool,
+    pub(crate) new_content_replacements: Vec<ContentReplacementRecord>,
 }
 
 pub(crate) struct CompactionDecision {
     pub(crate) reason: String,
     pub(crate) score_explanations: Vec<CompactionScoreExplanation>,
+    pub(crate) new_content_replacements: Vec<ContentReplacementRecord>,
 }
 
 fn preview_transcript_text(value: &str, max_chars: usize) -> String {
@@ -546,6 +714,7 @@ impl TaskLoopState {
                     TranscriptUnitKind::ToolInvocation
                         | TranscriptUnitKind::ToolResult
                         | TranscriptUnitKind::CompactBoundary
+                        | TranscriptUnitKind::CompactSummary
                         | TranscriptUnitKind::MicroCompactBoundary
                         | TranscriptUnitKind::CompactedResultRef
                         | TranscriptUnitKind::RestoredContinuation
@@ -603,6 +772,14 @@ impl TaskLoopState {
     pub(crate) fn next_step_guidance(&self) -> Option<NextStepGuidance> {
         self.active_projection_transcript()
             .latest_next_step_guidance()
+    }
+
+    pub(crate) fn model_decision_count(&self) -> usize {
+        self.active_projection_transcript()
+            .entries()
+            .iter()
+            .filter(|entry| matches!(entry.kind, TranscriptUnitKind::ModelDecision))
+            .count()
     }
 
     pub(crate) fn circuit_breaker_failure_count(&self) -> usize {
@@ -669,6 +846,7 @@ impl TaskLoopState {
         compacted_result: &str,
         primary_locator: Option<&str>,
         source_transcript_ordinal: usize,
+        new_content_replacements: &mut Vec<ContentReplacementRecord>,
     ) -> Result<Option<StoredResultReference>> {
         if matches!(result, ActionResult::Response { .. }) {
             return Ok(None);
@@ -685,6 +863,9 @@ impl TaskLoopState {
             persisted_path: path.display().to_string(),
         };
         self.stored_results.append(reference.clone());
+        if let Some(record) = self.content_replacements.record_stored_result(&reference) {
+            new_content_replacements.push(record);
+        }
         Ok(Some(reference))
     }
 }
@@ -1047,6 +1228,10 @@ fn stored_result_type(result: &ActionResult) -> &'static str {
         ActionResult::NoteRecorded { .. } => "note_recorded",
         ActionResult::Response { .. } => "response",
     }
+}
+
+fn read_state_from_action_result(result: &ActionResult) -> Option<CachedFileReadState> {
+    CachedFileReadState::from_action_result(result)
 }
 
 pub(crate) fn action_label(action: &Action) -> String {

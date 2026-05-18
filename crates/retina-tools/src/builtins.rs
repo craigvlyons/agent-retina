@@ -59,7 +59,7 @@ pub fn shell_builtin_tools(
         ));
         tools.push(builtin_tool(
             "find_files",
-            "Find files by filename or path fragment.",
+            "Find files by filename or glob-like pattern, with paged results. Use offset to continue the same match set.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_search"],
             json!({
@@ -68,14 +68,15 @@ pub fn shell_builtin_tools(
                     "root": { "type": "string" },
                     "pattern": { "type": "string" },
                     "recursive": { "type": "boolean" },
-                    "max_results": { "type": "integer" }
+                    "max_results": { "type": "integer" },
+                    "offset": { "type": "integer" }
                 },
                 "required": ["root", "pattern"]
             }),
         ));
         tools.push(builtin_tool(
             "search_text",
-            "Search text content across files in the current workspace.",
+            "Search file contents across a project using source-style grep semantics. Use output_mode=content for matching lines, files_with_matches for file discovery, and count for prevalence, with optional glob filtering and paged results.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_search"],
             json!({
@@ -83,7 +84,11 @@ pub fn shell_builtin_tools(
                 "properties": {
                     "root": { "type": "string" },
                     "query": { "type": "string" },
-                    "max_results": { "type": "integer" }
+                    "max_results": { "type": "integer" },
+                    "offset": { "type": "integer" },
+                    "glob": { "type": "string" },
+                    "case_insensitive": { "type": "boolean" },
+                    "output_mode": { "type": "string", "enum": ["content", "files_with_matches", "count"] }
                 },
                 "required": ["root", "query"]
             }),
@@ -93,13 +98,15 @@ pub fn shell_builtin_tools(
     if capabilities.can_read_files {
         tools.push(builtin_tool(
             "read_file",
-            "Read text-like files such as markdown, code, config, and plaintext with truncation protection.",
+            "Read text-like files such as markdown, code, config, and plaintext with line-range and truncation protection. Use start_line and limit_lines for targeted inspection.",
             ToolConcurrencyClass::ReadOnly,
             vec!["file_read"],
             json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "start_line": { "type": "integer" },
+                    "limit_lines": { "type": "integer" },
                     "max_bytes": { "type": "integer" }
                 },
                 "required": ["path"]
